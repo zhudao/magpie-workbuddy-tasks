@@ -59,7 +59,12 @@ export const CLAIM_POLL_ATTEMPTS = 6;
 // 夜猫子上报后的轮询次数（run_night_growth 的 range(4)）。
 export const NIGHT_POLL_ATTEMPTS = 4;
 // 403 / code 11140 账号级风控限制的冷却毫秒（wb_accounts.
-// RESTRICTED_ACCOUNT_COOLDOWN = 7200.0 秒，持久化口径由 runner 的 holds 承担）。
+// RESTRICTED_ACCOUNT_COOLDOWN = 7200.0 秒）。
+// **@deprecated（0.3.3，CONTRACT §10.5）**：403/11140 不再走「2 小时自动冷却」
+// —— hub v2.1.0 口径：它不是可自动恢复的风控冷却，继续重试只会让同设备账号
+// 连坐。现在任何腿收到 restricted 都**立即冻结**该账号（engine/runner.freeze +
+// state/frozen.json 持久化），只有 /api/account/unfreeze 能解冻，绝不自动恢复。
+// 常量保留只为兼容既有 import（避免引用悬空），不再有任何运行时语义。
 export const RESTRICTED_COOLDOWN_MS = 7200_000;
 // access token 距到期还剩多久就先刷新（对齐 magpie 插件 LEAD_MS）。
 export const REFRESH_LEAD_MS = 5 * 60 * 1000;
@@ -104,12 +109,44 @@ export const TASK_SPECS = {
   // PC 灵感功能（web 侧的 Sequential_Tasks 系列成员）：playbook 双事件链
   //（cta_click + prompt_send，见 tasks.buildEvent 的 "playbook" 分支）。
   Sequential_Tasks_7: { kind: "playbook", target: 1, reward: 100, name: "PC灵感功能" },
+  // 专家活动任务 ×4（CONTRACT §10.6，hub TASK_SPECS 新增项）：expert 钉死**上游
+  // 真实 id** —— 上游按 (eventCode, id) 去重，id 不对进度永远不动。上游没下发
+  // 这些 code 时零副作用（只多四条 spec 表项）。
+  expert_use_maidehao: {
+    kind: "expert", target: 1, reward: 100,
+    expert: ["ex_GDl31WahyIH0", "中国电商运营专家"],
+    name: "中国电商运营专家",
+  },
+  expert_use_douyinyin: {
+    kind: "expert", target: 1, reward: 100,
+    expert: ["ex_FbY5nlWTqDod", "抖音策略师"],
+    name: "抖音策略师",
+  },
+  expert_use_shangjia_xuanchuan: {
+    kind: "expert", target: 1, reward: 100,
+    expert: ["ex_Weo3x2EZuSDm", "商家宣传页与海报设计师"],
+    name: "商家宣传页与海报设计师",
+  },
+  expert_use_bowangwang: {
+    kind: "expert", target: 1, reward: 100,
+    expert: ["ex_WZY136wV5aMt", "直播电商教练"],
+    name: "直播电商教练",
+  },
   wb_wechat_oa_subscribe_task: {
     unforgeable: true, reward: 100,
     reason: "需在微信关注「腾讯 WorkBuddy」公众号满 24 小时",
     name: "关注官方公众号",
   },
   Expert_Philanthropy: { unforgeable: true, reason: "真实捐款动作", reward: 0, name: "公益爱心捐赠" },
+  // 分享一个技能给好友（2026-11-11 上游 task_desc 原文：升级到电脑端 5.9.0+，
+  // 前往「技能」列表点击任意技能，进详情页通过「分享」发送给好友；valid_end
+  // 2026-11-18）。**真实分享动作 + 新客户端**：桌面端 asar（实测 5.6.2 / 9-21
+  // 构建）与 web 入口包都没有 skill_share 事件，hub 也未支持 —— 不猜事件名、
+  // 不伪造，如实列为不可自动化并给深链（workbuddy://skill）。
+  skill_share: {
+    unforgeable: true, reward: 100, name: "分享一个技能给好友",
+    reason: "需电脑端 5.9.0+ 的技能详情页用「分享」发给好友（真实分享动作，无事件可伪造）",
+  },
 };
 
 // ---- 逆向修复常量（2026-09 实测校准）----------------------------------------

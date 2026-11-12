@@ -335,3 +335,64 @@ test("流水线：MP 任务混进 web 清单 → progressTask 防御性跳过（
     "除清单外零上游调用（无 report/claim/accept）",
   );
 });
+
+test("流水线：web 清单 locked:true 的任务整条跳过（不接取/不上报/不领奖），解锁后照常", async () => {
+  // 2026-11-11 生产实测：Sequential_Tasks_7（PC 灵感功能，web playbook）在 web
+  // 清单带 locked:true + unlock_at —— 锁定期间不进接取批次（避免必败的 accept
+  // error）、不上报、不领奖，「仍有 N 个任务处于未接取状态」不再被它误报；
+  // 解锁（locked:false）后照常接取/点亮/领奖。
+  const seed = () => [
+    task("Sequential_Tasks_7", {
+      title: "体验灵感功能", jump_url: "workbuddy://playbook",
+      reward: 500, reward_energy: 5, target: 1,
+      locked: true, unlock_at: "2026-11-12T00:00:00+08:00",
+    }),
+  ];
+  const litRules = { playbook_prompt_send: "Sequential_Tasks_7" };
+
+  // 锁定：跳过日志一行、零 accept/零 report/零 claim、状态原封不动
+  const clock = fakeClock(localTime(2026, 11, 11, 10, 0));
+  const lockedBackend = wbBackend({ clock, tasks: seed(), litRules });
+  const lockedLogs = [];
+  const lockedRes = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: lockedBackend.fetchImpl,
+    log: (l) => typeof l === "string" && lockedLogs.push(l),
+    gap: GAP, mpTasks: false, travel: false,
+  });
+  const lockedText = lockedLogs.join("\n");
+  assert.equal(lockedRes.ok, true, lockedText);
+  assert.equal(lockedRes.earnedCredit, 0);
+  assert.ok(lockedText.includes("⏳ 任务 [体验灵感功能] 到第二天才能接取任务，跳过"), lockedText);
+  assert.equal(
+    lockedBackend.calls.some((c) => c.path === "/v2/activity/growth/tasks/accept"),
+    false,
+    "锁定任务不进接取批次（批次为空 → 连 accept 请求都不发）",
+  );
+  assert.equal(lockedBackend.state.reports.length, 0, "锁定不上报");
+  assert.equal(lockedBackend.state.claims.length, 0, "锁定不领奖");
+  assert.ok(!lockedText.includes("未接取状态"), "锁定任务不算「未接取」误报（needsAccept 已排除）");
+  const lockedTask = lockedBackend.state.tasks[0];
+  assert.equal(lockedTask.accept_status, "not_accepted", "锁定任务状态原封不动");
+
+  // 解锁：同一任务 locked:false（unlock_at 清空，模拟上游次日解锁形态）→
+  // 照常接取/点亮/领奖（playbook 双事件推进）
+  const clock2 = fakeClock(localTime(2026, 11, 12, 10, 0));
+  const unlockedBackend = wbBackend({
+    clock: clock2,
+    tasks: seed().map((t) => ({ ...t, locked: false, unlock_at: undefined })),
+    litRules,
+  });
+  const unlockedLogs = [];
+  const unlockedRes = await runGrowthTasks(makeAcct(), {
+    now: clock2.now, sleep: clock2.sleep, fetch: unlockedBackend.fetchImpl,
+    log: (l) => typeof l === "string" && unlockedLogs.push(l),
+    gap: GAP, mpTasks: false, travel: false,
+  });
+  const unlockedText = unlockedLogs.join("\n");
+  assert.equal(unlockedRes.ok, true, unlockedText);
+  assert.ok(!unlockedText.includes("到第二天才能接取任务"), unlockedText);
+  assert.ok(unlockedText.includes("✓ 任务 [PC灵感功能] 点亮并领奖成功: +500 积分"), unlockedText);
+  assert.equal(unlockedRes.earnedCredit, 500);
+  const unlockedTask = unlockedBackend.state.tasks[0];
+  assert.equal(unlockedTask.accept_status, "claimed", "解锁后接取→点亮→领奖全链路照常");
+});

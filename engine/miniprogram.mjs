@@ -18,14 +18,14 @@
 // code 以 web 清单为准）；/api/task/accept|claim 按 isMPCode 分流到本模块的
 // acceptMPTasks / claimMPTask。批量执行链路不变：runGrowthTasks 在普通任务处理
 // 完、猫猫旅行之前调用这里（opts.mpTasks === false 可整体关闭），日志与收益并入
-// growth 腿。taskkind.resolveTaskKind 对 MP code（本表命中或 Sequential_Tasks_
-// 前缀）返回 source:"mp"/kind:"mp"，tasks.progressTask 据此防御性跳过 web 事件
-// 构造 —— 本模块是 MP 任务唯一的执行出口。
+// growth 腿。taskkind.resolveTaskKind 对 MP code（本表命中或未被 TASK_SPECS
+// 收录的 Sequential_Tasks_ 前缀）返回 source:"mp"/kind:"mp"，tasks.progressTask
+// 据此防御性跳过 web 事件构造 —— 本模块是 MP 任务唯一的执行出口。
 //
 // 防风控：所有上游调用走 callJSON（重试/退避/403-11140 restricted 透传/chat 主机
 // 回退 + opts.spacer 全局节流）与 ctx.breathe，任意两次调用间隔 ≥ gap。
 
-import { ACCEPT_CHUNK, REPORT_SETTLE_MS, WEB_BASE } from "./constants.mjs";
+import { ACCEPT_CHUNK, REPORT_SETTLE_MS, TASK_SPECS, WEB_BASE } from "./constants.mjs";
 import { defaultNow } from "./identity.mjs";
 import { callJSON, ctxOf, growthBase as _growthBase } from "./upstream.mjs";
 
@@ -47,8 +47,9 @@ export const MP_REPORT_HEADERS = {
 
 // ---- 小程序任务规格（wb_tasks.MP_TASK_SPECS 逐字拷贝）-------------------------
 // 注意 Sequential_Tasks_7 是 web 侧的 playbook 任务（constants.TASK_SPECS），
-// 不在本表：MP 清单里出现它时走下面的 Sequential_Tasks_ 前缀兼容分支，但生成
-// 不出任何事件（无对应分支）→ 诚实跳过。
+// 不在本表：MP 清单里出现它时 isMPCode（前缀兼容分支排除 TASK_SPECS 命中）
+// 判它不算 MP → 本模块的清单过滤直接无视，执行权完全归 web 流水线（playbook
+// 双事件链在 tasks.buildEvent 的 "playbook" 分支）。
 export const MP_TASK_SPECS = {
   Sequential_Tasks_1: { name: "小程序对话", target: 1, reward: 100 },
   Sequential_Tasks_2: { name: "小程序专家对话", target: 1, reward: 200 },
@@ -63,11 +64,17 @@ export const MP_TASK_SPECS = {
 // 警告用它过滤：MP 任务永远不出现在 web 清单里，不能因为勾选了它们就误报。
 export const MP_TASK_CODES = new Set(Object.keys(MP_TASK_SPECS));
 
-// 支持的小程序 code：MP_TASK_SPECS 命中，或 Sequential_Tasks_ 前缀（hub 口径，
-// 给未来同系列任务留兼容缝）。
+// 支持的小程序 code：MP_TASK_SPECS 命中，或 Sequential_Tasks_ 前缀且**不在
+// TASK_SPECS**（hub 口径，给未来同系列任务留兼容缝）。
+// 2026-11-11 生产只读实测：web 清单也下发 Sequential_Tasks_7（体验灵感功能，
+// constants.TASK_SPECS 的 PC/playbook 任务）——前缀兼容分支绝不吃掉它：否则
+// runMiniProgramTasks 把它当 MP 任务「诚实跳过」（MP 头族生成不出 playbook
+// 事件），web 流水线却还用 web 头去 acceptTasks 接它 → 上游必败 error。
+// Sequential_Tasks_99 这类未收录前缀仍算 MP（兼容缝保留）。
 export function isMPCode(code) {
   const c = String(code ?? "");
-  return MP_TASK_CODES.has(c) || c.startsWith("Sequential_Tasks_");
+  if (MP_TASK_CODES.has(c)) return true;
+  return c.startsWith("Sequential_Tasks_") && !Object.hasOwn(TASK_SPECS, c);
 }
 
 // ---- 埋点指纹（wb_tasks.mp_base 逐字拷贝）-------------------------------------
@@ -439,7 +446,7 @@ export async function runMiniProgramTasks(acct, opts = {}) {
       const ev = mpEventForCode(code, i, cid, rid, now);
       if (ev) events.push(ev);
     }
-    if (!events.length) continue; // 无事件构造方式（如 Sequential_Tasks_7 在 MP 清单）→ 跳过
+    if (!events.length) continue; // 无事件构造方式（未来未收录的 MP-only code）→ 跳过
 
     logs.push(`正在点亮小程序任务 [${name}] (需上报 ${need} 次)...`);
     await reportMPEvents(acct, events, opts);

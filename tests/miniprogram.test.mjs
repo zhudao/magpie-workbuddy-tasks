@@ -601,9 +601,13 @@ test("runGrowthTasks 集成：mpTasks=false 关闭小程序链路；MP code 不�
   assert.equal(r2.earnedCredit, 100);
 });
 
-test("isMPCode：MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀", () => {
+test("isMPCode：MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀（TASK_SPECS 命中除外）", () => {
   for (const code of Object.keys(MP_TASK_SPECS)) assert.equal(isMPCode(code), true, code);
-  assert.equal(isMPCode("Sequential_Tasks_99"), true, "前缀兼容");
+  assert.equal(isMPCode("Sequential_Tasks_99"), true, "未收录前缀仍算 MP（兼容缝保留）");
+  // 2026-11-11 实测：Sequential_Tasks_7 在 TASK_SPECS（web playbook/PC 灵感功能）
+  // —— 前缀兼容分支绝不吃掉它：否则 MP 链路把它当 MP 任务跳过（生成不出
+  // playbook 事件），web 流水线又用 web 头去接 → 上游必败 error
+  assert.equal(isMPCode("Sequential_Tasks_7"), false, "TASK_SPECS 命中 → 不是 MP 任务");
   assert.equal(isMPCode("create_canvas"), false);
   assert.equal(isMPCode(""), false);
 });

@@ -158,13 +158,13 @@ function engineWithMP({ mpImpl } = {}) {
 }
 
 const SNAP_KEYS = [
-  "acceptStatus", "canAccept", "canLight", "code", "desktopOnly", "jumpUrl",
+  "acceptStatus", "canAccept", "canLight", "code", "description", "desktopOnly", "jumpUrl",
   "lockHint", "locked", "lockedUntil", "pinnedExpertId", "progress", "reason",
   "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
 ]
 
 describe("MP 任务并入 /api/state 快照（refreshSnapshots 合并）", () => {
-  test("MP-only 任务进快照：17 键完整、canAccept/canLight 按状态、重复 code 不并入", async () => {
+  test("MP-only 任务进快照：18 键完整、canAccept/canLight 按状态、重复 code 不并入", async () => {
     const sb = makeSandbox("wb-tasks-mp-snap-")
     const h = await startDaemon({
       key: KEY,
@@ -190,7 +190,7 @@ describe("MP 任务并入 /api/state 快照（refreshSnapshots 合并）", () =>
       const byCode = new Map(snap.tasks.map((t) => [t.code, t]))
       const mp1 = byCode.get("Sequential_Tasks_1")
       assert.ok(mp1, "Sequential_Tasks_1 进快照")
-      assert.deepEqual(Object.keys(mp1).sort(), SNAP_KEYS, "MP 任务 17 键完整（判断字段 + 次日锁字段不得 undefined）")
+      assert.deepEqual(Object.keys(mp1).sort(), SNAP_KEYS, "MP 任务 18 键完整（判断字段 + 次日锁字段不得 undefined）")
       assert.equal(mp1.desktopOnly, false)
       assert.equal(mp1.unforgeable, false)
       assert.equal(mp1.reason, "")

@@ -71,6 +71,12 @@ export async function fetchTasks(acct, opts = {}) {
       description: t.description || t.task_desc || "",
       jumpUrl: t.jump_url || "",
       acceptStatus: t.accept_status || "not_accepted",
+      // 次日锁（0.3.2/2026-11-11 实测）：web 清单也带上游锁字段（Sequential_
+      // Tasks_7 实测 locked:true + unlock_at:"…+08:00"），与 fetchMPTasks 同口径
+      // 归一 —— daemon.snapTask 以上游字段为锁的主依据，流水线用它整条跳过
+      // 锁定任务（不接取/不上报/不领奖）
+      locked: t.locked === true,
+      unlockAt: String(t.unlock_at ?? ""),
       taskType: t.task_type || "",
       progress: {
         current: prog.current ?? 0,
@@ -715,21 +721,34 @@ export async function runGrowthTasks(acct, opts = {}) {
   }
   tasks = scope(tasks);
 
+  // 次日锁（0.3.2/2026-11-11 实测：web 清单也带 locked/unlock_at，如 ST7）：
+  // 锁定任务整条跳过 —— 不进接取批次（needsAccept 已排除，避免必败的 accept
+  // error）、不上报、不领奖；claimed 优先（已领奖不被陈旧锁字段挡住，与小程序
+  // 链路同口径）；解锁（上游 locked:false）后照常处理。
+  const isLockedTask = (t) => t.locked === true && t.acceptStatus !== "claimed";
+  const lockSkip = (t) => {
+    if (!isLockedTask(t)) return false;
+    emit(`⏳ 任务 [${t.title || t.code}] 到第二天才能接取任务，跳过`);
+    return true;
+  };
+
   // 0. auto 类任务（如 first_buddy）不需要接取，且可能是其他任务与猫猫旅行
   //    的前置：必须先把它们点亮并领奖（first_buddy 的奖励就是 Buddy 实例），
   //    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
   //    只有选中的任务才进这一步（tasks 已按勾选过滤）。
   for (const t of tasks) {
     if (t.taskType === "auto") {
+      if (lockSkip(t)) continue; // 锁定的 auto 前置同样不动（解锁后下轮补做）
       if (collect(await progressTask(acct, t, logsOut, run))) {
         return { ok: false, restricted: true, logs, earnedCredit: totals.credit, ...totals };
       }
     }
   }
 
-  // 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化）
+  // 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化，锁定任务
+  //    接取必被上游拒 —— 都不进批次）
   const needsAccept = (x) =>
-    x.acceptStatus === "not_accepted" && !x.unforgeable && x.taskType !== "auto";
+    x.acceptStatus === "not_accepted" && !x.unforgeable && x.taskType !== "auto" && x.locked !== true;
 
   const unaccepted = tasks.filter(needsAccept).map((t) => t.code);
   if (unaccepted.length) {
@@ -779,9 +798,12 @@ export async function runGrowthTasks(acct, opts = {}) {
     }
   }
 
-  // 2. 处理每个任务（auto 已在第 0 步处理过；tasks 仍是选中集合的投影）
+  // 2. 处理每个任务（auto 已在第 0 步处理过；tasks 仍是选中集合的投影；
+  //    锁定任务整条跳过 —— 复核/重试的 needsAccept 已自动排除它们，
+  //    「仍有 N 个任务处于未接取状态」不再被锁定任务误报）
   for (const t of tasks) {
     if (t.taskType === "auto") continue;
+    if (lockSkip(t)) continue;
     if (collect(await progressTask(acct, t, logsOut, run))) {
       return { ok: false, restricted: true, logs, earnedCredit: totals.credit, ...totals };
     }

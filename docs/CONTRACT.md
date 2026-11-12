@@ -81,7 +81,7 @@ webHeaders(acct) -> Record<string,string>          // 领奖回退用，Origin/R
 // upstream.mjs
 callJSON(acct, kind, url, init, opts) -> {ok, status, code, data, msg, raw}
   // kind: 'chat'|'billing'|'web'；统一 {code,msg,data} 信封；code===0 为成功
-  // 3 次线性退避重试；403/11140 → {restricted:true}（由 runner 记冷却）
+  // 3 次线性退避重试；403/11140 → {restricted:true}（由 runner 冻结账号，§10.5）
   // chat 主机失败（TLS reset）→ 回退到 https://www.workbuddy.cn，X-Domain 不变
   // 重试/回退也是「两次上游调用」：任意相邻两次 HTTP 尝试间隔 ≥ gap（铁律 4）
 makeSpacer({now, sleep, gap}) -> {run(fn), peekLast()}
@@ -100,6 +100,9 @@ fetchTasks(acct) -> Task[]
   // 绝不做双拼写回退链。raw 为非枚举字段（不进 JSON），保留上游原始对象调试用。
   // Task = { code, title, description, jumpUrl,
   //          acceptStatus /*"not_accepted"|"accepted"|"completed"|"claimed"*/,
+  //          locked /*上游清单自带，缺失归一 false；2026-11-11 实测 web 清单也带
+  //                  （Sequential_Tasks_7 locked:true + unlock_at）*/,
+  //          unlockAt /*上游 unlock_at 原样透传，缺失归一 ""*/,
   //          taskType /*""|"single"|"auto"|…*/, progress:{current,target},
   //          rewardCredit, rewardEnergy, unforgeable, reason, raw?(非枚举) }
 acceptTasks(acct, codes) -> {accepted[], already[], failed[]}   // 20 个一批
@@ -126,12 +129,20 @@ runGrowthTasks(acct, opts) -> GrowsResult
   // opts.travel?: boolean —— 显式 false 关闭第 3 步的猫猫旅行检查（缺省开启；
   // runner 批量编排里旅行只由 travel 腿负责，growth 腿显式传 false —— 只勾
   // growth 绝不跑旅行、growth+travel 也只跑一次）
+  // 次日锁（0.3.2/2026-11-11 实测）：web 清单也带 locked/unlock_at —— locked:true
+  // 的任务整条跳过（不进接取批次、不上报、不领奖，日志「⏳ 任务 [title] 到第二天
+  // 才能接取任务，跳过」；claimed 优先不被陈旧锁挡住）；needsAccept 排除锁定项，
+  // 复查/重试/「仍有 N 个未接取」不再被锁定任务误报；解锁（locked:false）后照常
 
 // miniprogram.mjs —— 微信小程序链式任务（runGrowthTasks 2b 自动调用，普通任务
 // 处理完、猫猫旅行之前；0.3.0 起 MP 专属任务还经 refreshSnapshots 并入快照/看板、
 // 经 /api/task/accept|claim 的 isMPCode 分流被单账号操作；0.3.2 起也是独立 mp 腿）
 MP_HEADERS / MP_REPORT_HEADERS / MP_TASK_SPECS / MP_TASK_CODES  // 常量（§7）
-isMPCode(code) -> boolean            // MP_TASK_SPECS 命中或 Sequential_Tasks_ 前缀
+isMPCode(code) -> boolean            // MP_TASK_SPECS 命中，或 Sequential_Tasks_ 前缀
+                                     // 且不在 TASK_SPECS —— Sequential_Tasks_7 在
+                                     // TASK_SPECS（web playbook/PC 灵感功能）绝不算
+                                     // MP（否则 MP 链路吃掉它、web 流水线接取必败）；
+                                     // Sequential_Tasks_99 等未收录前缀仍算 MP
 mpBase(uid, nick, nowMs) -> object   // WorkBuddy_MP 埋点指纹（每条 MP 事件都要合并）
 fetchMPTasks(acct, opts) -> MP Task[]        // GET growth/tasks，MP_HEADERS，规范 camelCase
                                      // 0.3.2 起含上游锁字段：locked（布尔，缺失归一 false）、
@@ -260,7 +271,11 @@ class JobRunner {
                             //       （start() 归一后写两处，永远一致；消费方直接读顶层即可）
                             //       totals:{credit,energy,tasksLit,tasksClaimed}, steps:Step[], log:string[]}
   current() -> Job|null     // 同一时刻只允许 1 个 job（全局闸门）
-  holds() -> [{uid, releasedAt}] // 风控冷却（403/11140）中的账号；releasedAt = 解除时刻 epoch ms
+  // 0.3.3 起 holds() 已被冻结表取代（§10.5）：
+  freeze(uid, {code, message}) -> boolean // 首次冻结生效 + onFrozen 落盘；重复不覆盖
+  unfreeze(uid) -> boolean                // 解冻（只有它能解除，绝不自动恢复）
+  frozen() -> [{uid, at, code, message}]  // /api/state 顶层 frozen 的数据源（at 为 ISO 串）
+  isFrozen(uid) -> boolean
                                  //（/api/state 的 scheduler.holds 数据源，daemon 负责拼昵称）
   // 构造 opts 另认：dailySentMap（uid→北京日键的幂等账本，daemon 从
   // state/daily-activity.json 读入同一份对象）与 onDailySent(uid,key)（成功落盘
@@ -306,6 +321,21 @@ accessToken/refreshToken 的导出并关停守护进程（README 安全段如实
 下沉进 store 层**。诊断计数：`/api/state` 顶层 `intlSkipped:{count,note}` 只给数量与说明，
 绝不列出国际版账号内容（uid/昵称/域名都不给）。
 
+**企业版同口径（issue #3）**：`acct.enterpriseId` 非空的企业版账号（provider 仍是 `workbuddy`）
+没有成长任务与签到，与国际版完全同口径处理 —— 不进 `/api/state` 的 `accounts[]`（statePayload
+的 accounts 过滤点追加企业版排除）、不进 `eligibleNow()`（`eligibleAccounts` 本就排除
+`enterpriseId`）/ `/api/run` 缺省 uids / 排程选号 / 快照刷新 / 任何 job；单账号操作
+（claim/accept/checkin/streak/run/toggle/快照点名 uid）经 `accountByUid()` 一律「找不到」，
+显式点名如实失败（/api/run 混选时企业版被剔除、只点企业版回 400；单账号操作回
+「找不到账号」）、绝不静默、零上游。诊断计数：`/api/state` 顶层 `enterpriseSkipped:{count,note}`
+（与 `intlSkipped` 同形状，count=0 时字段保留；账号「不存在」/引擎未就绪时同为
+`{count:0,note}`），note 只给数量与去向说明（「已忽略 N 个企业版账号：企业版没有成长任务与
+签到，本插件只服务个人版」，N 为实际数量），绝不列出企业版账号内容（uid/昵称/域名/
+enterpriseId 都不给）。两个计数按 provider 分域、各自独立：国际版只进 `intlSkipped`，
+企业版只统计 `provider==="workbuddy"` 的条目，绝不互相重复计数。过滤同样只发生在 daemon
+使用侧：导入/导出（§9，导出行本就带 `enterpriseId` 字段）与 `engine/store.loadAccounts`
+仍可见企业版条目——**数据面不拦，使用面全拦**。
+
 绑定：`127.0.0.1` 默认；链路 `options.listenAddress → WB_DAEMON_ADDR → --addr`，设 `0.0.0.0`/`::` 才对外
 （**免密钥口径下这就是唯一的安全边界**：对外绑定 = 同一局域网内任何主机都能执行上文全部路由，
 包括写入凭据与下载 token；README 安全段如实写明风险与建议；真实绑定 host 由 daemon 心跳写进
@@ -318,13 +348,21 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 的数量与去向说明（note="本插件只服务国内版 workbuddy，
                                     // 国际版账号不列出、不参与任务、不默认导出"）；绝不列出
                                     // 国际版账号内容（uid/昵称/域名都不给）
+                                    enterpriseSkipped:{count,note},
+                                    // 只读诊断计数（issue #3）：企业版账号（provider===
+                                    // "workbuddy" 且 enterpriseId 非空）的数量与去向说明
+                                    //（note="已忽略 N 个企业版账号：企业版没有成长任务与
+                                    // 签到，本插件只服务个人版"，N=实际数量；count=0 时
+                                    // 字段保留）。与 intlSkipped 同形状同口径、各自独立
+                                    // 计数；绝不列出企业版账号内容（uid/昵称/域名/
+                                    // enterpriseId 都不给）
                                     accounts:[{uid,nickname,masked,domain,expiresInMs,expiresInDays,tasksEnabled,
                                              imported,eligible,
                                              credits,   // 该账号的积分缓存（state/credits.json 投影，
                                                         // engine/credits.fetchCredits 的 credits 形状，
                                                         // §2）；没拉过/缓存损坏 → null。只读投影：
                                                         // /api/state 绝不为此打上游
-                                             snapshot:{tasks:[{code,title,acceptStatus,progress:{current,target},
+                                             snapshot:{tasks:[{code,title,description,acceptStatus,progress:{current,target},
                                              rewardCredit,rewardEnergy,jumpUrl,taskType,
                                              desktopOnly,unforgeable,reason,canAccept,canLight,pinnedExpertId,
                                              locked,lockedUntil,lockHint}],
@@ -343,8 +381,10 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                              // 仅旧缓存（无自身锁字段）回退 state/mp-locks.json
                                              //（§7；锁过期即解锁，until 当天即可用）
                                              energy,streak,days,updatedISO}}],
-                                    // accounts[] 只含 provider==="workbuddy"（国内版）条目；
-                                    // 国际版 workbuddy-ai 一律不出现（见上方纯国内版口径）
+                                    // accounts[] 只含 provider==="workbuddy" 的国内个人版
+                                    // 条目；国际版 workbuddy-ai 一律不出现（见上方纯国内版
+                                    // 口径），企业版（enterpriseId 非空）同样不出现
+                                    //（见上方企业版同口径）
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
                                     job:Job|null, stats:{creditsToday,energyToday,runs},
@@ -384,6 +424,10 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     // 或任何查询串**，也绝不返回含 0.0.0.0/::/* 的地址（daemon 的 key
                                     // 字段绝不出现在任何响应、页面或日志里，它只在 state/daemon.json，
                                     // 0600，向后兼容保留、不是访问凭据——API 全部免密钥）。
+                                    // description = 上游原文说明（`description || task_desc`，截断 300 字，
+                                    // 0.3.3 起投影）：不可自动化 / 需桌面端的行靠它说清「到底要做什么」
+                                    //（例：skill_share「升级到电脑端 5.9.0+…」），此前被投影丢掉、看板只剩
+                                    // 「未收录任务」一句。普通可自动化任务不展示它。
                                     // snapshot.tasks 的字段名 = §2 的规范 Task（daemon 只做投影，不猜第二种拼写）；
                                     // acceptStatus 是上游字符串状态（"not_accepted"|"accepted"|"completed"|"claimed"）
                                     // P0-2 判断字段（六个都出自 engine/taskkind.resolveTaskKind，
@@ -422,8 +466,9 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     //（GET /v2/activity/growth/energy），streak/days = data.streak.days
                                     //（GET /activity/growth/streak）；daemon 只认这一种拼写，
                                     // 不做多拼写回退链。
-                                    // scheduler.holds = 真正的风控冷却名单（403/11140），不是「没进 job 的账号」；
-                                    // releasedAt 为 ISO 8601 字符串（epoch ms 由 runner.holds() 给出，这里转 ISO）
+                                    // 0.3.3 起 scheduler.holds 已移除：403/11140 账号改为顶层
+                                    // frozen:[{uid,nickname,at,code,message}]（§10.3/§10.5），
+                                    // 不再有 releasedAt —— 冻结不会自动恢复
                                     // tasksEnabled 为生效值：accounts.json 显式条目 > engine/store 的
                                     // tasks-accounts.json > 缺省 true
                                     // imported = 该账号行来自 JSON 导入（§9）：importedFrom 标记 ||
@@ -469,8 +514,16 @@ GET  /api/jobs/:id              -> Job
 GET  /api/credits?uid=<uid>&refresh=0|1
                                     -> 200 {ok:true, uid, nickname, credits}
                                     | 200 {ok:false, uid, nickname, error, needRelogin?, credits?旧缓存}
-                                    | 404 {error}   // uid 找不到 / API key / 企业号 / 已停用
-                                                    //（可参与口径与 eligibleAccounts 一致）
+                                    | 404 {error}   // uid 找不到 / API key / 已停用 →
+                                                    //   "找不到可参与任务的国内版账号：<uid>"
+                                                    //   （可参与口径与 eligibleAccounts 一致；
+                                                    //   intl 与企业版账号在 accountByUid 里就已经
+                                                    //   是「找不到」）；
+                                                    //   企业版（enterpriseId 非空，issue #3）→ 专属
+                                                    //   文案 "企业版账号没有成长体系（无任务与积分
+                                                    //   查询），已从看板隐藏；如需查看请在 magpie 里
+                                                    //   切换个人版账号"（说清「为什么看不到」与
+                                                    //   「去哪里看」，绝不泄露昵称/域名等额外信息）
                                     | 409 {error:"busy"}  // 要拉取时 job 在跑（或已在拉取中）
                                     | 503 {error}   // 引擎不可用
                                     // 国内版「积分余额 + 套餐权益包明细」（看板 剩余/总额 与明细
@@ -495,6 +548,14 @@ GET  /api/history?limit=200     -> 每次尝试一行（对齐 hub 的 /activity
                                     // 的 trigger，非法值/缺失一律按 "manual"，绝不透出第三种拼写。
                                     // 已写入的旧行不迁移（无法可靠回溯）。
 GET  /api/events                -> SSE：{kind:'job'|'step'|'log'|'scheduler', ...}
+其余未知 /api/* 路由            -> 404 {error:"未知 API：<METHOD> <path>", hint}
+                                    // error 原文逐字不变（既有测试与前端按原文断言/匹配），
+                                    // 只追加 hint 指路重启（issue #3 的真实症状：看板比
+                                    // 守护进程新时，旧进程没有新路由如 GET /api/streak，
+                                    // 用户看到「未知 API」一头雾水）—— hint =
+                                    // "守护进程可能还在跑更新前的旧代码：在 magpie 里关掉
+                                    // 再开启本插件即可重启（看板顶栏「停止守护进程」后
+                                    // 重开也行）"
 其余 GET /                      -> dashboard/index.html（静态，同源，无构建）
 ```
 
@@ -563,7 +624,7 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   Buddy 盲盒」，**绝不发 open**。`count = min(affordable, max(1, max_open_count))`，
   `POST {chat}/v2/activity/growth/buddy/open` body `{count, client_token:<randomUUID>}`；
   成功解析 `data.buddy || data.name || data.buddies`（数组 join）。**不领积分、不加
-  credit**——本腿的产物只有 logs/opened。403/11140 → restricted 透传（runner 记冷却）。
+  credit**——本腿的产物只有 logs/opened。403/11140 → restricted 透传（runner 冻结账号，§10.5）。
   腿顺序在 travel 之前（开出的 Buddy 可被旅行使用）；排程窗口可配但默认
   `hours.buddy=[]`（不给明确授权绝不自动花能量）。
 - **微信小程序链式任务（engine/miniprogram.mjs，Sequential_Tasks_1–6 + school_season）**：
@@ -583,6 +644,11 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   + `requestModelId:"glm-5.2"`/`requestModelName:"GLM-5.2"`。整个 need 的事件一次
   report 发完（不逐条轮询进度），等 1.5s 直接领，领不到顺延下轮。web 侧的
   `Sequential_Tasks_7`（PC灵感功能，playbook 双事件）在 TASK_SPECS，不在 MP_TASK_SPECS。
+  **2026-11-11 生产实测：ST7 同时出现在 web 清单与 MP 清单**（两份原始 JSON 均带
+  `accept_status`/`locked`/`unlock_at`，MP 侧 jump_url 是 settings 桌面下载页）——
+  `isMPCode` 的前缀兼容分支**排除 TASK_SPECS 命中**，ST7 在两条链路里都只按 web
+  playbook 任务处理：MP 清单过滤直接无视它（不进「发现 N 个小程序任务」），daemon
+  doAccept/doClaim 分流归 web 组，执行走 tasks.buildEvent 的 playbook 双事件链。
   **小程序任务进任务快照/看板（0.3.0 起，生产实测 MP 清单 12 项含
   Sequential_Tasks_1）**：daemon.refreshSnapshots 在 web fetchTasks 之后用
   `fetchMPTasks`（MP_HEADERS）再拉一份 MP 清单，**只合并 web 清单里没有的 code**
@@ -598,15 +664,18 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   之前调用，`opts.mpTasks===false` 可关，`opts.codes` 勾选只
   处理 MP 交集（交集为空连清单都不拉），缺失警告用 `MP_TASK_CODES` 过滤防误报。
   **mp 独立腿（0.3.2）**：JobRunner 的 LEG_ORDER 增至 growth→mp→buddy→travel→night，
+**0.3.3 再增至 growth→mp→streak→buddy→travel→night（`streak` 见 §10.1）**，
   mp 腿直接调 `runMiniProgramTasks`（codes 勾选、restricted、收益/lit/claimed 计入
   totals 与 growth 腿同口径，step detail 取最后一条日志）；同一次 job 同时含
   growth 与 mp 腿时，growth 腿传 `mpTasks:false`（2b 关闭）—— 小程序任务只由 mp
   腿跑一遍；只有 growth 腿时保持原 2b 行为。
   **次日锁（0.3.2 修订：2026-11-07 只读实测——上游清单本身就带锁字段，实测账号 B 的
   Sequential_Tasks_3 为 `"locked": true, "unlock_at": "2026-11-08T00:00:00+08:00"`、
-  实测账号的 Sequential_Tasks_2 为 `"locked": false`（not_accepted，当天已解锁））**：
-  - **主依据 = 任务自身字段**：fetchMPTasks 把 locked/unlock_at 原样归一进规范
-    Task（缺失归一 false/""）并随 cacheTask 落盘；snapTask 投影时任务带自身锁
+  实测账号的 Sequential_Tasks_2 为 `"locked": false`（not_accepted，当天已解锁）；
+  2026-11-11 再实测：**web 清单任务同样带锁字段**——Sequential_Tasks_7 为
+  `"locked": true, "unlock_at": "2026-11-12T00:00:00+08:00"`）**：
+  - **主依据 = 任务自身字段**：fetchMPTasks 与 fetchTasks 都把 locked/unlock_at
+    原样归一进规范 Task（缺失归一 false/""）并随 cacheTask 落盘；snapTask 投影时任务带自身锁
     信息（locked 是布尔或 unlockAt 非空）→ **以上游为准**，locked 仅在
     not_accepted 时为 true（accepted/claimed 绝不标锁），lockedUntil 由 unlock_at
     解析为北京日（Date.parse + 北京日，绝不 slice），解析失败回退 mp-locks 的
@@ -648,7 +717,9 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   处理规则（engine/taskkind.resolveTaskKind，优先级从高到低）：
   1. TASK_SPECS 命中 → 沿用 spec（`Expert_lighthouse`/`WorkBuddy_Valorant` 的 jump_url
      只有 `workbuddy://expert`，不含 expertId —— 钉死常量仍是唯一来源，绝不被 jump_url 覆盖）；
-  2. MP_TASK_SPECS 命中或 `Sequential_Tasks_` 前缀 → 小程序链式任务（0.3.0 起进快照/
+  2. MP_TASK_SPECS 命中或 `Sequential_Tasks_` 前缀（**不在 TASK_SPECS**——
+     Sequential_Tasks_7 在 TASK_SPECS，是 web playbook 任务，绝不被本条吃掉，
+     2026-11-11 实测它同时出现在两份清单）→ 小程序链式任务（0.3.0 起进快照/
      看板）：`source:"mp"`、`kind:"mp"`，desktopOnly/unforgeable=false，接取/点亮结论
      按状态收敛；执行与领奖在 miniprogram 模块的小程序头族链路（见下）；
   3. 未命中但 `jump_url` 解出 `expertId=ex_…`（`expert_use_*` 一族：URL 编码的 deeplink
@@ -787,7 +858,7 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
 - Buddy 盲盒（engine/buddy.mjs）：quota/open 两跳的批量口径（count=min）、能量
-  不足零开盒请求、restricted 透传、不领积分；runner 腿顺序 growth→mp→buddy→travel→night
+  不足零开盒请求、restricted 透传、不领积分；runner 腿顺序 growth→mp→streak→buddy→travel→night（0.3.3 起含 streak）
   （乱序入参归一、未知腿剔除）、buddy 步骤 detail=最后一条日志且 credit=0；
 - 小程序链式任务（engine/miniprogram.mjs）：MP 头族与 mpBase 逐字断言、per-code
   事件族（1/3/6/school/2/4/5；Sequential_Tasks_7 无事件）、claimed/completed/
@@ -798,6 +869,12 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   mp-locks 陈旧锁、Z 时区 unlock_at 按北京日取、accepted/claimed 不标锁、
   accept 失败落盘 + doClaim 即时锁下一环→刷新后被上游覆盖、snapTask 17 键含
   locked/lockedUntil/lockHint）、
+  isMPCode 的 TASK_SPECS 排除（Sequential_Tasks_7=false、Sequential_Tasks_99=true、
+  MP_TASK_SPECS 全 true；taskkind 对 ST7 仍 source:"spec"/kind:"playbook"）、
+  web 清单锁字段（fetchTasks 透传 locked/unlock_at，缺失归一 false/""）、
+  web 流水线锁定跳过（locked:true 不进 accept 批次、不 report、不 claim，
+  日志「⏳ …到第二天才能接取任务，跳过」，needsAccept 复查不再误报「仍有 N 个
+  未接取」；locked:false 解锁后照常接取/点亮/领奖）、
   旅行只由 travel 腿触发（legs=[growth] 零 travel/status、legs=[growth,travel]
   恰好一次）、mp 腿（单独 legs=[mp] 不发 web 接取；growth+mp 只执行一遍 MP）；
 - 沙箱卫生：测试 temp 沙箱一律走 `tests/helpers.mjs` 的 `makeSandbox()`（用完即删 + after/exit 兜底），跑完套件 temp 不残留 `wb-*` 沙箱（`tests/sandbox-hygiene.test.mjs` 钉死）。
@@ -894,3 +971,183 @@ enterpriseId?, accountId(=可读昵称，magpie 用它显示账号名), imported
 `importedFrom` 是**易失标记**：magpie 下次整体覆写可能抹掉——因此 `/api/state` 的
 `imported` 布尔 = `importedFrom==="hub-json"` || 本插件台账 `state/hub-imports.json` 有该 key，
 两者都只是**尽力而为的展示标记，不作为任何逻辑判断依据**。
+
+## 10. 0.3.3 新增：连登管家 / 新专家任务 / 签到回执 / 11140 冻结
+
+来源：hub `wb_tasks.run_streak_bonus`（2026-10-10）、`wb_accounts.checkin_state`（#596）、
+hub `v2.1.0`「11140 命中后直接封禁账号」、hub `TASK_SPECS` 新增 4 条专家活动任务。
+本次**不**移植 hub 的 i18n / 面板布局 / Rust 版 / TLS 桥 / 号池分区等与本项目无关的部分。
+
+### 10.1 连登管家（leg `streak`，新模块 `engine/streak.mjs`）
+
+端点（**一律经 `engine/upstream.callJSON`**，`chat = chatUrl(opts)`、`bill = billBase()`；
+调用前 `breathe`、经全局 spacer 排队，铁律 4 对它们同样生效）：
+
+| 用途 | 方法 | 路径 | body |
+| --- | --- | --- | --- |
+| 连登日历 | GET | `{chat}/activity/growth/heatmap` | — （**真实外壳 `data.cells:[{date,score}]`**，2026-11-11 实测） |
+| 连登状态 | GET | `{chat}/activity/growth/streak` | — （**`data.streak.days` / `data.makeup_cards.balance` / `data.redemption_status`**，实测） |
+| 补签昨日 | POST | `{chat}/activity/growth/makeup-cards/use` | `{target_date:"YYYY-MM-DD"}` |
+| 档位兑换 | POST | `{chat}/activity/growth/redeem` | `{tier:"7d"\|"14d"\|"28d", client_token:<uuid>}` |
+| 抽奖次数 | GET | `{chat}/activity/growth/lottery/summary` | — |
+| 抽奖 | POST | `{chat}/activity/growth/lottery/draw` | `{client_token:<uuid>}` |
+| 新手礼包 | POST | `{bill}/billing/meter/claim-gift` | `{}` |
+| 活动补偿 | POST | `{bill}/billing/meter/claim-compensation` | `{}` |
+
+`client_token` 用 `node:crypto` 的 `randomUUID()`（与 `engine/buddy.mjs` 同款）。
+`target_date` = **北京昨日** = `beijingDayKey(now - 86400000)`（复用 `engine/daily.mjs`）。
+
+执行顺序（每次调用之间自然受 ≥1s 全局节流约束）：**补签 → 礼包/补偿 → 档位兑换 → 抽奖**。
+
+```js
+// 只读：连登天数 / 补签卡 / 抽奖次数 / 连登日历（上游给一整年）/ 档位状态
+export async function fetchStreakState(acct, opts = {})
+// -> {ok:true, days:number, makeupCards:number, lotteryChances:number,
+//     heatmap:[{date:"YYYY-MM-DD", score:number}],   // 上游一次回一整年（365 格，实测）
+//     tiers:[{tier:"7d"|"14d"|"28d", status:string}],
+//     updatedISO:string}
+//    任一子请求失败不影响其余字段（缺省 0 / []），全部失败 -> {ok:false, error}
+export async function runStreakSteward(acct, opts = {})
+// -> {ok:boolean, earned:number, restricted?:true, streak:<fetchStreakState 结果>,
+//     logs:string[],
+//     actions:{makeup:{used:boolean, date:string},
+//              gifts:[{key:"claim-gift"|"claim-compensation", name:string, credit:number}],
+//              redeemed:["7d"|"14d"|"28d"], drawn:number}}
+```
+
+幂等与静默跳过（hub 逐字口径，**全部不报错、只写一行说明**）：
+- 昨日 `heatmap` 格 `score === 0` 且 `makeup_cards.balance > 0` 才补签；否则不碰。
+- 档位 `status` 为 `locked` / `claimed` 跳过；其余（如 `available`）才兑换。
+- `lottery/summary` 的 `chances` 为 0 不抽；每次抽奖之间仍走全局节流，不额外 sleep。
+- 礼包/补偿业务拒绝（「已领取过」等）静默，只有 `code === 0` 且 `credit > 0` 才计入 `actions.gifts`。
+- 企业版账号（`acct.enterpriseId` 非空）/ API key 账号：直接 `{ok:true, logs:["企业版账号无成长体系，跳过"]}`，一个上游请求都不发。
+- **绝不抛**；`restricted`（HTTP 403 / code 11140）透传，由调用方走 §10.5 冻结。
+
+### 10.2 HTTP API 新增（`daemon.mjs`）
+
+```
+GET  /api/streak?uid=<uid>[&refresh=1]
+     -> {uid, cached:bool, streak:<10.1 state 形状>|null, error?}
+        · 缓存 state/streak.json（uid -> streak），新鲜期 10 分钟（与 /api/credits 同口径）；
+        · 未 refresh 且缓存新鲜 -> 直接回缓存，不打上游；refresh=1 强制拉；
+        · job 在跑时 refresh=1 -> 409 busy（与 credits 同款）；非 refresh 回缓存。
+        · **/api/state 绝不为此打上游**（只读投影缓存）。
+
+POST /api/streak/run   {"uids":["…"]}
+     -> {results:[{uid, outcome:"ok"|"skipped"|"failed", earned, message,
+                   detail:{days,makeupCards,lotteryChances,
+                           makeupUsed:bool, makeupDate:"YYYY-MM-DD",
+                           gifts:[{name,credit}], redeemed:["7d"], drawn:number}}]}
+        · 缺省/空 uids = 全部「未冻结 + tasksEnabled」账号（同 /api/checkin 的 eligibleNow）；
+        · 账号之间间隔 1500 ms（手动手感，同 /api/checkin）；
+        · 冻结账号 -> outcome "failed" + message "账号已冻结（11140）：…；确认无风险后在账号行点「恢复」"。
+
+POST /api/account/unfreeze  {"uid":"…"} 或 {"uids":["…"]}
+     -> {ok:true, unfrozen:[uid…], missing:[uid…]}   // missing = 本来就没冻结
+```
+
+三条路由**必须登记进 `API_ROUTE_AUTH`**（`tests-shell/account-routes.test.mjs` 遍历全表）。
+
+### 10.3 `/api/state` 新增字段（前端唯一依赖）
+
+- `accounts[i].streak`：`10.1 的 state 形状` | `null`（只读投影 `state/streak.json`）。
+- `accounts[i].frozen`：`{at:ISO, code:number|string, message:string}` | `null`。
+- 顶层 `frozen`：`[{uid, nickname, at, code, message}]`（冻结总览，替代原 `scheduler.holds`）。
+- `settings.hours.streak`：`number[]`，**默认 `[]`（留空 = 不排程）**，与 mp/buddy/travel/night 同规则；
+  `normalizeScheduleHours` 的键集合随之扩为 `mp|buddy|streak|travel|night`。
+- `settings.legs` / `scheduler.nextRuns` / `job.legs` 均可含 `streak`。
+- `LEGS = ["growth","mp","streak","buddy","travel","night"]`，`LEG_NAMES.streak = "连登管家"`
+  （runner 的 `LEG_ORDER` 同序）。**手动默认腿新增 `streak`**：`DEFAULT_SETTINGS.legs = ["growth","streak","travel"]`
+  （连登管家是纯收益且幂等，默认做；已在 settings.json 里存过 legs 的实例不受影响）。
+
+### 10.4 `/api/checkin` 回执细分（hub #596）
+
+`outcome` 取值扩为 `"claimed" | "done" | "pending" | "failed"`（旧两值语义不变）：
+
+- `msg` 含 `处理中` / `请勿重复操作` / `系统繁忙` / `稍后再试` → **`pending`**：
+  **不算成功、不落账、当天可重试**（原实现把 `code=0` 一律当成功，会把「请求处理中，请勿重复操作」
+  记成已领 → 当天再也不重试）。
+- `code === 0`：`msg` 含 `失败` → `failed`；否则 `claimed`。
+- `code === 10001`：`msg` 含 `已签到` → `done`；否则 `failed`。
+- 其他 code → `failed`。
+- 「失败」是唯一硬词，`不足`（如「距离 7 天奖励还不足」）**不得**判失败。
+
+### 10.5 403 / 11140：冻结账号（替换原 2 小时自动冷却）
+
+hub `v2.1.0` 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却，继续重试会让同设备账号连坐。
+
+- 任何腿收到 `restricted` → **立即冻结**该账号，持久化 `state/frozen.json`
+  （`{uid:{at:ISO, code, message}}`，tmp+rename 原子写，与 `state/daily-activity.json` 同目录）。
+- 冻结账号**不进** `eligibleNow()`、不进排程选号、不进 `/api/run` 缺省 uids、
+  不进 `/api/checkin` 与 `/api/streak/run` 的缺省目标。
+- **不再自动恢复**：只有 `POST /api/account/unfreeze`（或看板「恢复」按钮）能解冻。
+  冻结不影响其他账号（不做全池熔断）。
+- 显式指定冻结账号的单账号操作（`/api/task/accept`、`/api/task/claim`、`/api/checkin`、
+  `/api/streak/run`）如实失败并给出上句提示，不静默跳过。
+- `engine/runner.mjs`：`hold(uid)` → `freeze(uid, {code, message})`；
+  新增 `unfreeze(uid)` / `frozen()`；`RESTRICTED_COOLDOWN_MS` 不再用于 403/11140
+  （常量保留但标注废弃，避免其它引用悬空）。daemon 从 runner 读冻结表并原子落盘。
+
+### 10.6 新增专家活动任务 spec（`engine/constants.mjs`）
+
+`kind:"expert"`，`expert` 钉死**上游真实 id**（上游按 `(eventCode, id)` 去重，id 不对进度永远不动）：
+
+| code | expert id | 名称 | 奖励 |
+| --- | --- | --- | --- |
+| `expert_use_maidehao` | `ex_GDl31WahyIH0` | 中国电商运营专家 | 100 |
+| `expert_use_douyinyin` | `ex_FbY5nlWTqDod` | 抖音策略师 | 100 |
+| `expert_use_shangjia_xuanchuan` | `ex_Weo3x2EZuSDm` | 商家宣传页与海报设计师 | 100 |
+| `expert_use_bowangwang` | `ex_WZY136wV5aMt` | 直播电商教练 | 100 |
+
+上游没下发这些 code 时零副作用（只多四条 spec 表项）。
+
+### 10.7 MCP 工具新增（`index.mjs`，契约 §6）
+
+- `workbuddy_tasks_streak`：参数 `{uids?}` → `POST /api/streak/run`，回一句人话摘要
+  （每个账号「连登 N 天 / 补签 / 兑换 / 抽奖 +N 积分」）。
+- `workbuddy_tasks_unfreeze`：参数 `{uid?, uids?}` → `POST /api/account/unfreeze`。
+- `workbuddy_tasks_status` 输出补一段「已冻结账号」（uid/昵称/时间/原因），没有则省略。
+- `workbuddy_tasks_run` 的 legs 说明补 `streak（连登管家：补签/档位兑换/抽奖/礼包）`。
+
+### 10.8 实现口径收尾（实现时钉死的细节，后续修订以本节为准）
+
+- **`fetchStreakState` 的跳过口径**：国际版（`provider !== "workbuddy"`）/ API key / 企业版账号
+  返回 `{ok:true, skipped:true, ...零值}`（`days/makeupCards/lotteryChances=0`、`heatmap=[]`、
+  `tiers` 三档 `status:""`），**一个上游请求都不发**；`runStreakSteward` 对同一批账号返回
+  `{ok:true}` + 一行「企业版账号无成长体系，跳过」，同样零上游。
+- **`updatedISO` 固定 ISO 8601**（`new Date(now).toISOString()`）：`GET /api/streak` 的 10 分钟
+  新鲜期由它算出，别改成别的格式（改了就没有 TTL）。
+- **`redemption_status` 真实形状（2026-11-11 生产实测钉死）**：`{tiers:[…], tier_7d_status, tier_14d_status,
+  tier_28d_status}` —— 状态在**平铺的 `tier_<档>_status`** 键上，不在 `tiers` 数组项里；另兼容
+  `tiers:[{tier,status}]` 与 `{7d:"…"}`（后两种是早先的猜测形状，仅为容错保留）。第一版按猜测形状
+  解析，结果是「days/makeupCards 正常、三档状态全空、日历 0 格」——档位兑换永远不会发生，只有拿真实
+  响应回来看才露馅。`heatmap` 的真实外壳同理：**`data.cells`**（不是 `data.days`）。
+  两条已由 `tests/streak.test.mjs` 的「真实报文形状」用例与 `tests/helpers.mjs` 的假后端钉住。
+- **`tiers[].status` 未知值语义**：只认 `locked`（未达成）/ `claimed`（已兑换）为「不动」；
+  `available` 之类的**已知非锁定值**才兑换；**空串 = 上游没给这一档 = 状态未知 → 不兑换**。
+  看板对未知值原样展示，**不得**当成功或以它触发动作。
+- **奖励字段名**：礼包/补偿认 `data.credit ?? data.points ?? data.point`；兑换/抽奖认
+  `data.credit ?? data.points`（容错解析，尚未拿到真实到账报文 —— 2026-11-11 该账号
+  `tier_*_status` 全为未达成、`chances=0`，所以还没验证过兑换/抽奖的到账字段）。
+- **`GET /api/streak` 的错误口径**（镜像 `/api/credits`）：缺 `uid` → 400；uid 找不到 /
+  API key / `tasksEnabled:false` → 404（「找不到可参与任务的国内版账号：<uid>」）；
+  企业版（`enterpriseId` 非空，issue #3）→ 404 且给与 `/api/credits` 同一段的专属文案
+  （「企业版账号没有成长体系……切换个人版账号」，§3 企业版同口径）；引擎缺文件 → 503。
+  上游查询失败 → **200 +
+  `error`**（有旧缓存时一并带回 `streak`），HTTP 状态不表示上游结果。
+- **`GET /api/state` 不打上游**：`accounts[].streak` 只是 `state/streak.json` 的只读投影
+  （没有缓存 = `null`，看板显示「未查询」）。
+- **`/api/checkin` 的 `pending`**：`outcome:"pending"` 时**不带** `credit`/`streak`
+  （daemon 明确置 `0`/`undefined`），看板必须渲染成「处理中，可重试」而不是成功/已领。
+- **`/api/streak/run` 撞 restricted**：由 daemon 路由当场 `freezeAccount(uid)` 并落盘
+  （不经过 runner），结果里 `outcome:"failed"` + 「已冻结…恢复」提示。
+- **`results[]` 不含昵称**：只有 `uid`（与 `/api/checkin` 一致）；看板自己拿 `accounts[]`
+  的昵称兜底（账号在跑的过程中被移除时退化成显示 uid）。
+- **`settings.legs = []` 的语义**：= 「没设置」→ 用默认腿（`["growth","streak","travel"]`）；
+  前端与 daemon 同口径，不做「空 = 一条腿都不跑」（要「都不跑」就别触发批量任务）。
+- **`heatmap` 覆盖范围**：上游一次回**一整年**（实测 365 格，含上线前的 0 分格）。**看板只画最近 28 天**
+  （`dashboard/app.js` 的 `HEAT_WINDOW_DAYS`）：整年全铺是 53 行、807px 高的细长条，而且只有近期那几天有分，
+  打开看像布局坏了（2026-11-11 实测确认网格与配色本身没问题，纯粹是窗口太大）。全年有记录天数只放在汇总
+  文案里（「· 全年 N 天」）。
+- **`heatmap[].score` 量纲**：当天连登分（0 = 当天没连登；实测活跃日是个位到两位数，不是 0/1 布尔）。**只用于展示与「昨日是否为 0」的
+  补签判断**，看板的分档着色是纯视觉（0 / 1–2 / 3–5 / 6+），不得参与任何逻辑判断。

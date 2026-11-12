@@ -39,7 +39,7 @@ import {
   writeControl,
 } from "./lifecycle.mjs"
 
-const VERSION = "0.3.2"
+const VERSION = "0.3.4"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）
@@ -102,6 +102,17 @@ function fmtState(s) {
   }
   if (accts.length > 10) lines.push(`  … 其余 ${accts.length - 10} 个略`)
   if (s.notice) lines.push(`提示：${s.notice}`)
+  // 已冻结账号（0.3.3，403/11140）：冻结的账号不参与任务，必须知道它们的存在
+  // —— 没有冻结账号时整段省略。
+  const frozen = s.frozen ?? []
+  if (frozen.length) {
+    lines.push(`已冻结账号：${frozen.length} 个（403/11140，不参与任务；确认无风险后可解冻）`)
+    for (const f of frozen.slice(0, 10)) {
+      const at = f.at ? String(f.at).replace("T", " ").slice(0, 16) : "时间未知"
+      lines.push(`  · ${f.nickname || f.uid}（${at}）${f.message ? `：${f.message}` : ""}`)
+    }
+    if (frozen.length > 10) lines.push(`  … 其余 ${frozen.length - 10} 个略`)
+  }
   const sc = s.scheduler ?? {}
   const next = (sc.nextRuns ?? [])
     .map(([leg, h]) => `${leg}@${String(h).padStart(2, "0")}:00`)
@@ -132,6 +143,7 @@ function fmtJob(j) {
     const leg =
       s.leg === "growth" ? "成长"
       : s.leg === "mp" ? "小程序"
+      : s.leg === "streak" ? "连登"
       : s.leg === "buddy" ? "盲盒"
       : s.leg === "travel" ? "旅行"
       : s.leg === "night" ? "夜猫"
@@ -142,6 +154,17 @@ function fmtJob(j) {
   const logs = j.log ?? []
   if (logs.length) lines.push(`最近日志：${logs.slice(-3).join(" | ")}`)
   return lines.join("\n")
+}
+
+// 连登管家一轮的回执摘要（workbuddy_tasks_streak 的每个账号一行）
+function fmtStreakResult(r) {
+  const d = r.detail ?? {}
+  const bits = [`连登 ${d.days ?? 0} 天`]
+  if (d.makeupUsed) bits.push(`补签 ${d.makeupDate || "昨日"}`)
+  if (Array.isArray(d.gifts) && d.gifts.length) bits.push(`礼包 ×${d.gifts.length}`)
+  if (Array.isArray(d.redeemed) && d.redeemed.length) bits.push(`兑换 ${d.redeemed.join("/")}`)
+  if (d.drawn) bits.push(`抽奖 ${d.drawn} 次`)
+  return `  · ${r.uid}：${r.outcome === "ok" ? bits.join(" / ") : r.outcome === "skipped" ? "无可做的连登动作" : `失败（${r.message || "未知原因"}）`}${r.earned ? `，+${r.earned} 积分` : ""}`
 }
 
 function fmtTasks(acct) {
@@ -261,7 +284,7 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
           args: {
             uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号"),
             legs: optArr().describe(
-              "任务腿：growth（成长）、mp（小程序链式任务，次日解锁）、buddy（Buddy 盲盒，消耗成长能量）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认。growth 与 mp 同时指定时小程序任务只由 mp 腿跑一遍",
+              "任务腿：growth（成长）、mp（小程序链式任务 Sequential_Tasks_1–6 + school_season，次日解锁；Sequential_Tasks_7=PC灵感功能是 web playbook 任务，走 growth 腿，不走小程序链路）、streak（连登管家：补签/档位兑换/抽奖/礼包）、buddy（Buddy 盲盒，消耗成长能量）、travel（猫猫旅行）、night（夜猫子）；不填 = 设置里的默认。growth 与 mp 同时指定时小程序任务只由 mp 腿跑一遍",
             ),
             claim: optBool().describe("完成后自动领奖，默认跟随设置"),
             codes: optArr().describe(
@@ -360,6 +383,53 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
             return `领取成功${got ? `：${got}` : ""}${d.via ? `（经 ${d.via === "web" ? "网页回退" : "聊天接口"}）` : ""}`
           },
         }),
+
+        // 连登管家（0.3.3，CONTRACT §10.7）：补签昨日 / 领礼包补偿 / 档位兑换 / 抽奖
+        [`${TOOL_PREFIX}_streak`]: runTool({
+          description:
+            "跑一轮 WorkBuddy 连登管家：用补签卡补签昨日、领取新手礼包/活动补偿、兑换 7d/14d/28d 档位奖励、用完抽奖次数。纯收益且幂等，已做过的事自动跳过。",
+          args: {
+            uids: optArr().describe("要跑的账号 uid 列表；不填 = 全部可参与账号（已冻结的除外）"),
+          },
+          run: async (args, ctx) => {
+            const body = {}
+            if (Array.isArray(args?.uids)) body.uids = args.uids
+            const r = await client.call("POST", "/api/streak/run", body, 55000, ctx?.abort)
+            if (r.status === 409) return "批量任务运行中，稍后再跑连登管家。"
+            if (r.status === 503) return `执行失败：${r.data?.error ?? "任务引擎不可用"}`
+            if (!r.ok) return `执行失败（HTTP ${r.status}）：${r.data?.error ?? ""}`
+            const results = r.data ?? []
+            if (!results.length) return "没有可参与任务的账号（或全部已冻结）。"
+            const lines = results.slice(0, 10).map(fmtStreakResult)
+            if (results.length > 10) lines.push(`  … 其余 ${results.length - 10} 个略`)
+            const earned = results.reduce((s, x) => s + (Number(x?.earned) || 0), 0)
+            lines.unshift(`连登管家完成：${results.length} 个账号，共 +${earned} 积分`)
+            return lines.join("\n")
+          },
+        }),
+
+        // 解冻（0.3.3，CONTRACT §10.7）：403/11140 冻结只有这里能解除
+        [`${TOOL_PREFIX}_unfreeze`]: runTool({
+          description:
+            "解冻被 403/11140 风控冻结的 WorkBuddy 账号（冻结的账号不参与任何任务，且不会自动恢复；确认无风险后再解冻）。",
+          args: {
+            uid: optStr().describe("要解冻的账号 uid（与 uids 二选一）"),
+            uids: optArr().describe("要解冻的账号 uid 列表（与 uid 二选一）"),
+          },
+          run: async (args, ctx) => {
+            const body = {}
+            if (args?.uid) body.uid = String(args.uid)
+            if (Array.isArray(args?.uids)) body.uids = args.uids
+            if (!body.uid && !body.uids) return "需要 uid 或 uids"
+            const r = await client.call("POST", "/api/account/unfreeze", body, 15000, ctx?.abort)
+            if (!r.ok) return `解冻失败（HTTP ${r.status}）：${r.data?.error ?? ""}`
+            const d = r.data ?? {}
+            const parts = []
+            if (d.unfrozen?.length) parts.push(`已解冻 ${d.unfrozen.length} 个：${d.unfrozen.join(", ")}`)
+            if (d.missing?.length) parts.push(`以下账号本来就没冻结：${d.missing.join(", ")}`)
+            return parts.length ? parts.join("；") : "没有可解冻的账号。"
+          },
+        }),
       }
     } else {
       log("未找到 @opencode-ai/plugin 的 tool 导出，工具未注册（守护进程生命周期不受影响）")
@@ -415,6 +485,7 @@ export const _internal = {
   fmtState,
   fmtJob,
   fmtTasks,
+  fmtStreakResult,
   makeDaemonClient,
   hereDir,
   bindHint,

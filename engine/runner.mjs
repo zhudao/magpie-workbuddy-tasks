@@ -1,30 +1,37 @@
-// runner.mjs —— 跨账号批量编排：job 状态与日志、全局并发闸门、风控冷却
-//（holds）、token 临期刷新 + 原子回写（CONTRACT §2 runner 部分、铁律 3/4）。
+// runner.mjs —— 跨账号批量编排：job 状态与日志、全局并发闸门、403/11140 冻结
+//（freeze/frozen/unfreeze）、token 临期刷新 + 原子回写（CONTRACT §2/§10.5、铁律 3/4）。
 // 每个账号开跑之前先做一次「每日活跃」上报（engine/daily.mjs，点亮成长中心
 // 连登；幂等键 uid→北京日，失败只记日志不阻断腿）。
 //
 // 同一时刻只允许 1 个 job（current() 全局闸门；第二个 start() 抛 409）。
 // 账号与账号之间按 trigger 间隔（manual 1.5 s / schedule 2–5 s 抖动，见
-// schedule.accountGapMs）；腿的顺序固定 growth → mp → buddy → travel → night
-// （mp 在 growth 后：小程序链式任务也是成长体系的一部分；buddy 在 travel 前：
-// 开出的 Buddy 可被随后一轮旅行使用），spec.legs 是这个顺序的子集。
+// schedule.accountGapMs）；腿的顺序固定 growth → mp → streak → buddy → travel →
+// night（mp 在 growth 后：小程序链式任务也是成长体系的一部分；streak 在 buddy
+// 前：连登管家是纯收益且幂等，先收；buddy 在 travel 前：开出的 Buddy 可被随后
+// 一轮旅行使用），spec.legs 是这个顺序的子集。
 // spec.taskCodes（{uid: string[]} | null，任务级勾选）只在 growth/mp 腿生效。
 // 旅行只由 travel 腿触发（growth 腿显式 travel:false）；growth+mp 同跑时 growth
 // 腿传 mpTasks:false（2b 关闭），避免小程序任务被两条腿各跑一遍。
 // stop() 只在步骤边界生效（abort 信号在腿/账号之间检查）。
+//
+// 403/11140 冻结（0.3.3，hub v2.1.0 口径）：不是可自动恢复的冷却 —— 任何腿收到
+// restricted 都立即 freeze(uid) 并经 onFrozen 回调持久化（daemon 落盘
+// state/frozen.json），冻结账号在后续 job 里整账号跳过，只有 unfreeze(uid)
+//（POST /api/account/unfreeze）能解除，绝不自动恢复。
 
 import { runBuddyOpen } from "./buddy.mjs";
-import { DEFAULT_GAP_MS, REFRESH_LEAD_MS, RESTRICTED_COOLDOWN_MS } from "./constants.mjs";
+import { DEFAULT_GAP_MS, REFRESH_LEAD_MS } from "./constants.mjs";
 import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
 import { runMiniProgramTasks } from "./miniprogram.mjs"; // 小程序链式任务腿（CONTRACT §7）
+import { runStreakSteward } from "./streak.mjs"; // 连登管家腿（CONTRACT §10.1）
 import { accountGapMs } from "./schedule.mjs";
 import { eligibleAccounts } from "./store.mjs";
 import { runGrowthTasks } from "./tasks.mjs";
 import { runCatTravel, runNightTask } from "./travel.mjs";
 import { clock, refreshAccount } from "./upstream.mjs";
 
-const LEG_ORDER = ["growth", "mp", "buddy", "travel", "night"];
+const LEG_ORDER = ["growth", "mp", "streak", "buddy", "travel", "night"];
 
 // 任务级勾选（CONTRACT §2/§3）每个账号清单的上限与 daemon.startJob 同款。
 const TASK_CODES_CAP = 500;
@@ -53,7 +60,7 @@ function normalizeTaskCodes(raw) {
 function normalizeSpec(spec = {}) {
   const legs = (Array.isArray(spec.legs) && spec.legs.length ? spec.legs : [...LEG_ORDER])
     .filter((l) => LEG_ORDER.includes(l))
-    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→mp→buddy→travel→night
+    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→mp→streak→buddy→travel→night
   return {
     uids: Array.isArray(spec.uids) && spec.uids.length ? [...spec.uids] : null,
     legs: legs.length ? legs : [...LEG_ORDER],
@@ -67,13 +74,25 @@ function normalizeSpec(spec = {}) {
 
 export class JobRunner {
   // opts: {accounts?, loadAccounts?, saveRefresh?, fetch?, now?, sleep?, rand?,
-  //        gap?, base?, bases?, env?, spacer?, dailySentMap?, onDailySent?}
+  //        gap?, base?, bases?, env?, spacer?, dailySentMap?, onDailySent?,
+  //        frozenMap?, onFrozen?, onUnfrozen?}
   constructor(opts = {}) {
     this.opts = opts;
     this.jobs = new Map();
     this._currentId = null;
     this._ctrls = new Map();
-    this._holds = new Map(); // uid -> 解除时刻 ms
+    // 403/11140 冻结表（CONTRACT §10.5）：uid -> {at:ISO, code, message}。
+    // 不再有过期语义 —— 只有 unfreeze() 能解除。初始数据来自 opts.frozenMap
+    //（daemon 从 state/frozen.json 读入的同一份对象），新冻结经 onFrozen 回调
+    // 原子落盘；未注入时用实例内存表（同一 runner 的多个 job 之间仍然生效），
+    // 跨进程重启的持久化由 daemon 负责。
+    this._frozen = new Map(
+      Object.entries(
+        opts.frozenMap && typeof opts.frozenMap === "object" && !Array.isArray(opts.frozenMap)
+          ? opts.frozenMap
+          : {},
+      ),
+    );
     this._seq = 0;
     // 每日活跃的幂等账本（uid -> 北京日键）：daemon 从 state/daily-activity.json
     // 读入同一份对象并经 onDailySent 原子写回；未注入时用实例内存账本（同一
@@ -104,20 +123,54 @@ export class JobRunner {
     return job;
   }
 
-  // 当前处于风控冷却（403/11140）的账号列表（/api/state 的 scheduler.holds 数据源）。
-  // 返回 [{uid, releasedAt}]：releasedAt 是解除时刻的 epoch 毫秒（注入时钟口径），
-  // daemon 负责拼上昵称并转成 ISO 串给看板展示「解除时间」。
-  holds() {
-    const now = this._now();
-    const out = [];
-    for (const [uid, until] of this._holds) if (until > now) out.push({ uid, releasedAt: until });
-    return out;
+  // ---- 403/11140 冻结（CONTRACT §10.5，替换原 2 小时自动冷却） --------------
+  //
+  // hub v2.1.0 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却，继续重试
+  // 会让同设备账号连坐 —— 任何腿收到 restricted 立即冻结，**绝不自动恢复**，
+  // 只有 unfreeze(uid)（daemon 的 POST /api/account/unfreeze / 看板「恢复」按钮）
+  // 能解除。冻结不影响其他账号（不做全池熔断）。
+  //
+  // freeze(uid, {code, message})：首次冻结生效并回调 onFrozen（daemon 原子落盘
+  // state/frozen.json）；重复 restricted 不覆盖记录（第一次的现场最真实）。
+  freeze(uid, info = {}) {
+    const key = String(uid ?? "");
+    if (!key || this._frozen.has(key)) return false;
+    const entry = {
+      at: new Date(this._now()).toISOString(),
+      code: info?.code ?? 11140,
+      message: String(info?.message ?? ""),
+    };
+    this._frozen.set(key, entry);
+    try {
+      this.opts.onFrozen?.(key, entry); // daemon 落盘；回调异常不影响冻结本身
+    } catch {}
+    return true;
   }
 
-  hold(uid, ms = RESTRICTED_COOLDOWN_MS) {
-    const until = this._now() + ms;
-    const prev = this._holds.get(uid) ?? 0;
-    if (until > prev) this._holds.set(uid, until); // 第一次命中才起算，不往后推
+  // unfreeze(uid)：解除冻结。返回是否真的解了一个（没冻结过 → false）。
+  unfreeze(uid) {
+    const key = String(uid ?? "");
+    if (!key || !this._frozen.delete(key)) return false;
+    try {
+      this.opts.onUnfrozen?.(key); // daemon 同步删 state/frozen.json 里的条目
+    } catch {}
+    return true;
+  }
+
+  // frozen() -> [{uid, at, code, message}]（/api/state 顶层 frozen 的数据源，
+  // daemon 负责拼昵称）。at 为冻结时刻的 ISO 串（注入时钟口径）。
+  frozen() {
+    return [...this._frozen].map(([uid, e]) => ({
+      uid,
+      at: e?.at ?? null,
+      code: e?.code ?? 11140,
+      message: String(e?.message ?? ""),
+    }));
+  }
+
+  // isFrozen(uid)：冻结与否的同步查询（daemon 排除缺省目标时用）。
+  isFrozen(uid) {
+    return this._frozen.has(String(uid ?? ""));
   }
 
   // start(spec) -> job；已在跑时抛 {status:409}。
@@ -267,9 +320,10 @@ export class JobRunner {
       if (ctrl.signal.aborted) break;
       const acct = accounts[ai];
 
-      const holdUntil = this._holds.get(acct.uid) ?? 0;
-      if (holdUntil > this._now()) {
-        this._step(job, acct, job.spec.legs[0], "skip", `账号风控冷却中（403/11140，至 ${new Date(holdUntil).toISOString()}），本轮跳过`);
+      // 已冻结账号（403/11140，CONTRACT §10.5）：整账号跳过（照实给一行 skip），
+      // 绝不重试 —— 冻结只有 unfreeze 能解除。
+      if (this._frozen.has(acct.uid)) {
+        this._step(job, acct, job.spec.legs[0], "skip", "账号已冻结（403/11140），本轮跳过；确认无风险后可在账号行点「恢复」");
         continue;
       }
 
@@ -281,8 +335,9 @@ export class JobRunner {
         // 上游结构化步进：{uid, leg, state, detail}（token 一律不进日志）
         const { uid, leg, state, detail } = line;
         if (state === "restricted") {
-          this.hold(uid || acct.uid);
-          job.log.push(`! [${uid || acct.uid}/${leg}] 触发风控限制 (403/11140)，冷却 ${Math.round(RESTRICTED_COOLDOWN_MS / 60000)} 分钟`);
+          // 立即冻结（onFrozen → daemon 落盘 state/frozen.json），不再有冷却期
+          this.freeze(uid || acct.uid, { code: 11140, message: detail || "restricted (403/11140)" });
+          job.log.push(`! [${uid || acct.uid}/${leg}] 触发风控限制 (403/11140)，已冻结账号（不再自动恢复）`);
         } else if (state === "fail" || state === "retry") {
           job.log.push(`· [${uid || acct.uid}/${leg}] ${state}: ${detail}`);
         }
@@ -358,6 +413,7 @@ export class JobRunner {
           };
           if (leg === "growth") res = await runGrowthTasks(acct, legOpts);
           else if (leg === "mp") res = await runMiniProgramTasks(acct, legOpts);
+          else if (leg === "streak") res = await runStreakSteward(acct, legOpts);
           else if (leg === "buddy") res = await runBuddyOpen(acct, legOpts);
           else if (leg === "travel") res = await runCatTravel(acct, legOpts);
           else res = await runNightTask(acct, legOpts);
@@ -367,11 +423,12 @@ export class JobRunner {
         }
 
         if (res?.restricted) {
-          this.hold(acct.uid);
-          this._finishStep(job, step, "fail", `触发风控限制 (403/11140): ${res.msg || ""}`);
+          // 冻结（不再自动恢复）：onFrozen → daemon 落盘 state/frozen.json
+          this.freeze(acct.uid, { code: res.code ?? 11140, message: res.msg || "restricted (403/11140)" });
+          this._finishStep(job, step, "fail", `触发风控限制 (403/11140)，账号已冻结: ${res.msg || ""}`);
           continue;
         }
-        const credit = Number(res?.credit ?? res?.earnedCredit ?? 0) || 0;
+        const credit = Number(res?.credit ?? res?.earnedCredit ?? res?.earned ?? 0) || 0;
         const energy = Number(res?.energy ?? 0) || 0;
         const ok = res?.ok !== false;
         let detail = "";
@@ -380,7 +437,7 @@ export class JobRunner {
         } else if (leg === "travel") {
           detail = res?.msg || (ok ? "完成" : "失败");
         } else {
-          // mp / buddy / night 腿返回 logs：步骤 detail 取最后一条人读日志
+          // mp / streak / buddy / night 腿返回 logs：步骤 detail 取最后一条人读日志
           detail = (res?.logs ?? []).slice(-1)[0] || (ok ? "完成" : "失败");
         }
         this._finishStep(job, step, ok ? "ok" : "fail", detail, credit, energy);

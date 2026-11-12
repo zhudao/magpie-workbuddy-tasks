@@ -62,6 +62,32 @@ function cloneTask(t) {
 // - mpOnly: 这批 task_code 只出现在小程序标头的清单里（X-Client-Platform:
 //   miniprogram 的 GET /v2/activity/growth/tasks 只回它们；web 清单不回）——
 //   模拟真实环境「web 清单与 MP 清单是两份」的口径。
+// - streak（0.3.3 连登管家腿）：{days, makeupBalance, chances, heatmap:[{date,score}],
+//   redemption_status:{...}} —— 三个 GET（streak/heatmap/lottery summary）的响应；
+//   makeupResponse / redeemResponse / lotteryDrawResponse：对应 POST 的信封
+//   （缺省 code 0）；giftResponses: {"claim-gift"| "claim-compensation": 信封}
+//   （缺省 code 0 + credit）。streakMakeups/streakRedeems/streakDraws/giftClaims
+//   记录每次 POST 请求体。
+// redemptionBody(raw)：把测试里好写的档位写法转成**上游真实形状**（见上面 streak 分支
+// 的注释）：
+//   {"7d":"available","14d":"locked"} -> {tiers:[{tier:"7d"},{tier:"14d"}],
+//                                         tier_7d_status:"available", tier_14d_status:"locked"}
+//   已经是真实形状（带 tier_*_status / tiers）-> 原样透传，供「照真实报文钉死解析」的用例用。
+function redemptionBody(raw) {
+  if (Array.isArray(raw)) return raw; // 数组形态 [{tier,status}]：原样透传（引擎也认）
+  const rs = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  if (Object.keys(rs).some((k) => /^tier_\d+d_status$/.test(k))) return rs; // 真实形状：原样
+  const out = { tiers: [] };
+  for (const tier of ["7d", "14d", "28d"]) {
+    if (rs[tier] != null && rs[tier] !== "") {
+      out.tiers.push({ tier });
+      out[`tier_${tier}_status`] = rs[tier];
+    }
+  }
+  if (Array.isArray(rs.tiers)) out.tiers = rs.tiers;
+  return out;
+}
+
 export function wbBackend(opts = {}) {
   const clock = opts.clock;
   const calls = [];
@@ -83,6 +109,17 @@ export function wbBackend(opts = {}) {
     buddyOpenResponse: opts.buddyOpenResponse ?? { code: 0, data: { buddies: ["布丁猫"] } },
     buddyOpens: [],
     mpOnly: new Set(opts.mpOnly ?? []),
+    checkinResponse: opts.checkinResponse ?? null,
+    // 连登管家（0.3.3）：GET 三件套的固定快照 + POST 的响应/台账
+    streak: opts.streak ?? null,
+    makeupResponse: opts.makeupResponse ?? { code: 0, data: {} },
+    redeemResponse: opts.redeemResponse ?? { code: 0, data: {} },
+    lotteryDrawResponse: opts.lotteryDrawResponse ?? { code: 0, data: { name: "5 积分" } },
+    giftResponses: opts.giftResponses ?? {},
+    streakMakeups: [],
+    streakRedeems: [],
+    streakDraws: [],
+    giftClaims: [],
   };
   const find = (code) => state.tasks.find((t) => t.task_code === code);
   const respond = (status, body) => ({ status, text: async () => JSON.stringify(body) });
@@ -191,6 +228,62 @@ export function wbBackend(opts = {}) {
 
     if (u.pathname === "/v2/activity/growth/energy") {
       return respond(200, { code: 0, data: { balance: 42 } });
+    }
+
+    // ---- 连登管家（0.3.3，engine/streak.mjs）------------------------------------
+    // 三个 GET 一律按**上游真实外壳**回（不然引擎按真实字段解析的回归测不出来）：
+    //   streak  → data.streak.days / data.makeup_cards.balance / data.redemption_status
+    //             （状态是**平铺的 tier_7d_status / tier_14d_status / tier_28d_status**，
+    //              另带 tiers 清单；2026-11-11 生产实测）
+    //   heatmap → data.cells:[{date,score}]（同上；0.3.3 第一版按 data.days 解析，
+    //             真实环境一直 0 格 —— 假后端照真实形状回才能钉住这类错）
+    //   lottery → data.chances
+    if (u.pathname === "/activity/growth/streak") {
+      const s = state.streak;
+      return respond(200, {
+        code: 0,
+        data: {
+          streak: { days: s?.days ?? 0 },
+          makeup_cards: { balance: s?.makeupBalance ?? 0 },
+          redemption_status: redemptionBody(s?.redemption_status),
+        },
+      });
+    }
+
+    if (u.pathname === "/activity/growth/heatmap") {
+      return respond(200, { code: 0, data: { cells: state.streak?.heatmap ?? [] } });
+    }
+
+    if (u.pathname === "/activity/growth/lottery/summary") {
+      return respond(200, { code: 0, data: { chances: state.streak?.chances ?? 0 } });
+    }
+
+    if (u.pathname === "/activity/growth/makeup-cards/use") {
+      state.streakMakeups.push(body);
+      return respond(200, state.makeupResponse);
+    }
+
+    if (u.pathname === "/activity/growth/redeem") {
+      state.streakRedeems.push(body);
+      return respond(200, state.redeemResponse);
+    }
+
+    if (u.pathname === "/activity/growth/lottery/draw") {
+      state.streakDraws.push(body);
+      return respond(200, state.lotteryDrawResponse);
+    }
+
+    if (u.pathname === "/billing/meter/claim-gift" || u.pathname === "/billing/meter/claim-compensation") {
+      const key = u.pathname.endsWith("claim-gift") ? "claim-gift" : "claim-compensation";
+      state.giftClaims.push({ key, body });
+      const override = state.giftResponses[key];
+      return respond(200, override ?? { code: 0, data: { name: key === "claim-gift" ? "新手礼包" : "活动补偿", credit: 50 } });
+    }
+
+    if (u.pathname === "/billing/meter/daily-checkin") {
+      // 手动签到（daemon.doCheckin）：响应形状由 checkinResponse 控制（0.3.3 回执
+      // 细分用），缺省 = 签到成功 +5
+      return respond(200, state.checkinResponse ?? { code: 0, data: { credit: 5, streak: 3 } });
     }
 
     if (u.pathname === "/v2/activity/growth/buddy/quota") {

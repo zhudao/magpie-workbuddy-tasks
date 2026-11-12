@@ -672,6 +672,12 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
 
 .acct-table {
   --acct-cols: 26px minmax(0, 1.4fr) 118px minmax(120px, 1fr) 118px 54px 100px;
+  /* 凭据列共轴参数：--cred-w = 共轴盒子宽度（取最宽项「已登录」徽章的实宽），
+     --cred-x = 整组左移量。表头「凭据」与内容块用同一个盒子宽度、同一左移量，
+     各自在盒内居中 ⇒ 三者中心线重合；左移量取「让『凭据』二字回到它原来的左缘」。
+     注意：共轴必然以最宽项（徽章）为准，因此徽章会比列线略向左探出（落在列间空隙里）。 */
+  --cred-w: 52px;
+  --cred-x: -12px;
   min-width: 0;
 }
 
@@ -693,6 +699,8 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
   white-space: nowrap;
 }
 .head-label.center { text-align: center; }
+/* 凭据列表头：与内容块同一左锚定宽度 + 该宽度内居中 ⇒ 与下方两行共轴 */
+.head-label.cred { width: var(--cred-w); min-width: var(--cred-w); margin-left: var(--cred-x); text-align: center; }
 .head-label.right { text-align: right; }
 
 .acct { border-bottom: 1px solid var(--line); }
@@ -711,8 +719,13 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
 .acct-cell { min-width: 0; }
 .acct-pick { display: flex; align-items: center; }
 
-.acct-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* 账号单元格（0.3.4）：横向一行 —— 左边昵称，右边紧跟两行连登信息（.acct-streak）。
+   昵称下面原来那行「www.workbuddy.cn · <uid>」整行取消（.acct-sub 已删），两项并进昵称
+   title。昵称给个下限宽度（6ch）兜底：列再窄也先压连登信息，不把昵称截成「几…」。 */
+.acct-id { display: flex; flex-direction: row; align-items: center; gap: 3px 10px; min-width: 0; }
 .acct-name {
+  flex: 0 1 auto;
+  min-width: 6ch;
   font-size: 13.5px;
   font-weight: 600;
   color: var(--ink);
@@ -720,16 +733,14 @@ input[type="radio"] { accent-color: var(--accent); width: 14px; height: 14px; ma
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.acct-sub {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--ink-3);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
+/* 凭据列：表头「凭据」+ 徽章「已登录」+ 文案「剩 N 天」共用同一条中线，
+   且整组停在**列左缘**（不右移）。做法：两者都用同一个左锚定宽度 --cred-w，
+   在这个宽度里各自居中 —— 中心线必然重合，整组也不会被推到列中间。
+   注：徽章异常变宽时（如冻结徽章「已冻结（11140）」）内容块会被撑宽、中心线略右移，
+   这是宁可错位也不截断的选择。 */
 .acct-status { display: flex; }
+.acct-status .cell-stack { align-items: center; text-align: center; width: var(--cred-w); min-width: var(--cred-w); margin-left: var(--cred-x); }
 .cell-stack { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; }
 .acct-note { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
 .acct-note.warn-text { color: var(--warn); }
@@ -974,6 +985,17 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
   color: var(--ink-3);
   word-break: break-word;
 }
+/* 上游原文说明（只出现在「不可自动化 / 需桌面端」的任务行）：左侧竖线标成引用，
+   最多 2 行、悬停看全文 —— skill_share 这类任务的「要做什么」全在这句里。 */
+.row-desc {
+  max-width: 460px;
+  padding-left: 6px;
+  border-left: 2px solid var(--line);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
 .row-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .snap-stale { padding: 8px 20px 0; font-size: 11.5px; color: var(--warn); }
 
@@ -1039,7 +1061,12 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 .sel-count { font-size: 11.5px; color: var(--ink-3); white-space: nowrap; }
 .accept-note { font-size: 11px; color: var(--ink-3); max-width: 280px; text-align: right; line-height: 1.5; }
 .accept-note[hidden] { display: none; }
-.batch-buttons { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.batch-buttons { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 一行装得下（2026-11-11）：批量条 1190 宽里「任务腿 + 自动领奖 + 提示 + 5 个按钮」
+   原本差约 27px，被 .batchbar 的 flex-wrap 挤到第二行 —— 左侧任务腿与右侧按钮不在
+   同一行了。收窄条内间距与按钮内边距把这 27px 找回来；窄屏仍由 flex-wrap 正常换行。 */
+.batchbar { gap: 10px 14px; }
+.batch-buttons .ghost-btn, .batch-buttons .btn { padding-left: 9px; padding-right: 9px; }
 
 .batch-status {
   flex-basis: 100%;
@@ -1159,9 +1186,10 @@ details[open] > .acct-tasks-summary { color: var(--ink-2); border-bottom: 1px so
 }
 .hour-row .input { flex: 1; width: auto; max-width: none; min-width: 0; }
 .hour-row .hint { display: none; }
+/* 保存窗口按钮所在的网格格：靠右对齐，视觉上贴着左边那几个输入框 */
+.hour-actions { justify-content: flex-end; }
 .hours-note { margin-top: -4px; }
 
-.form-actions { display: flex; justify-content: flex-end; }
 
 .sched-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .sched-block {
@@ -1618,6 +1646,145 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 }
 .foot p + p { margin-top: 3px; }
 
+/* ---- 连登管家 / 28 天日历 / 冻结账号（0.3.3 起，契约 §10） ----
+   0.3.4 起连登信息只出现在账号单元格里（昵称右侧两行）：一行数字 + 一行三档状态徽章；
+   原有的整行连登条（含「查询 / 连登管家」按钮）取消，连登日历搬进「任务明细」详情。 */
+
+/* 危险语义（冻结 11140）：红色徽章与红色按钮。--danger/--danger-soft 两种主题都有值。 */
+.badge-danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: transparent;
+  font-weight: 600;
+}
+/* .mini-btn:hover 在样式表更后面，会盖掉 .ghost-danger 的红色 —— 这里显式保住红色 */
+.danger-btn { color: var(--danger); }
+.danger-btn:hover { color: var(--danger); background: var(--danger-soft); border-color: var(--danger); }
+
+/* 冻结行：左侧红色标尺（明确「它在，但不会被调度」），不动参与开关与任务按钮 */
+.acct-frozen { box-shadow: inset 3px 0 0 var(--danger); }
+
+/* 账号单元格里的连登两行（0.3.4）。锚点 [data-streak-cell] 挂在它上面：updateStreakArea()
+   用它 replaceWith 局部重绘，所以一个账号只能有一个。
+   flex:1 1 auto + min-width:0 = 占满昵称右侧剩余宽度并在必要时收缩（收缩优先落在连登信息上，
+   昵称有 6ch 下限保护）；三档徽章行允许换行，窄列也不会把徽章截半。 */
+.acct-streak {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.streak-line { display: block; max-width: 100%; min-width: 0; }
+/* 第 1 行数字：一行到底，超出就省略号（不换行、不撑破账号列） */
+.streak-line:not(.streak-tiers) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.streak-item { white-space: nowrap; }
+.streak-v {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+/* 第 2 行三档徽章：允许换行（窄列时 2+1 两行，绝不出现横向滚动条） */
+.streak-tiers { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.streak-tiers .badge { padding: 0 6px; font-size: 10px; line-height: 1.7; }
+.streak-empty { color: var(--ink-3); }
+
+/* 三档状态必须一眼分得开：可兑换 = 实心主色（可用态，白/暗字压在主色上）；
+   已兑换 = 成功色 + ✓；未达成 = 中性灰弱化（透明底 + 灰边灰字）。
+   未知状态 .tier-unknown 走中性虚线 —— 原样显示，绝不落进成功色。 */
+.badge.tier-available { color: var(--accent-ink); background: var(--accent); border-color: transparent; font-weight: 650; }
+.badge.tier-claimed { color: var(--ok); background: var(--ok-soft); border-color: var(--ok); font-weight: 600; }
+.badge.tier-locked { color: var(--ink-3); background: transparent; border-color: var(--line); font-weight: 500; }
+.badge.tier-unknown { color: var(--ink-2); background: var(--surface-2); border-color: var(--line-strong); border-style: dashed; }
+
+/* 连登区里的说明行（冻结 / 最近一次连登管家结果 / 连登查询失败）：有内容才出现，
+   正常情况账号行就只有干净的两行。账号单元格窄，限两行 + 省略号（全文在 title 里），
+   一句话不会把账号行顶高。 */
+.streak-note {
+  max-width: 100%;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  line-height: 1.55;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.streak-err { font-size: 10.5px; }
+/* .streak-note 在本表更后面，会把 .warn-text 的颜色盖回去 —— 这两条显式保住警示色 */
+.streak-note.warn-text { color: var(--warn); }
+.streak-run { color: var(--ink-2); }
+.streak-run.warn-text { color: var(--warn); }
+
+/* 连登日历：7 列小格子（周一…周日），只画最近 28 天（4–5 行、约 75px 高）。
+   每格 12px，score=0 用中性色，>0 用强调色 + 透明度分 3 档
+   （用 opacity 而不是 color-mix：老 WebView 不一定支持后者）。
+   0.3.4 起挂在「任务明细」详情里（任务表上方）：整幅宽度的一条带，水平内边距与任务表
+   （.acct-tasks .tbl-wrap 的 20px）对齐，不会出现横向滚动条。 */
+.heat-panel {
+  padding: 9px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+}
+.heat { margin-top: 0; }
+.heat-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--ink-3);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.heat-summary::-webkit-details-marker { display: none; }
+.heat-summary::marker { content: ""; }
+.heat-summary::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform .15s ease;
+  margin-top: -2px;
+}
+details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0; }
+.heat-summary:hover { color: var(--ink); }
+.heat-label { font-weight: 600; color: var(--ink-2); }
+.heat-meta { font-family: var(--font-mono); font-size: 10.5px; }
+.heat-body { padding-top: 6px; overflow-x: auto; }
+.heat-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 12px);
+  gap: 3px;
+  width: max-content;
+}
+.heat-w { font-size: 9px; line-height: 12px; text-align: center; color: var(--ink-3); }
+.heat-cell { width: 12px; height: 12px; border-radius: 3px; background: var(--surface-3); }
+.heat-pad { width: 12px; height: 12px; }
+.heat-l0 { background: var(--surface-3); }
+.heat-l1 { background: var(--accent); opacity: .28; }
+.heat-l2 { background: var(--accent); opacity: .55; }
+.heat-l3 { background: var(--accent); opacity: .9; }
+.heat-none { grid-column: 1 / -1; font-size: 11px; color: var(--ink-3); }
+
+/* 批量区冻结提示条（N 个账号已冻结 + 全部恢复） */
+.frozen-note { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; }
+.frozen-note[hidden] { display: none; }
+.frozen-text { font-weight: 600; }
+
+/* 账号「操作」列：冻结时「恢复」+「刷新快照」并排（窄列里换行） */
+.side-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+
 /* ---- 响应式 ------------------------------------------------------------------------ */
 
 @media (max-width: 1100px) {
@@ -1662,6 +1829,8 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
   .acct-side { grid-area: side; }
 
   .acct-status, .acct-progress { flex-direction: row; align-items: center; gap: 8px; flex-wrap: wrap; }
+  /* 卡片化后是「凭据 / 内容」单行：整块居中会与其它行不一致，这里退回靠左 */
+  .acct-status { justify-content: flex-start; }
   .cell-stack { flex-direction: row; align-items: center; gap: 8px; }
   .acct-progress {
     display: grid;
@@ -1681,6 +1850,10 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
   .acct-intl { padding: 8px 16px 0; }
   .acct-tasks .tbl-wrap { padding: 2px 16px 10px; }
   .task-sel-bar { padding-left: 16px; padding-right: 16px; }
+  /* 窄屏：连登信息在昵称右边放不下时就整块落到下一行（账号列只有一列宽） */
+  .acct-id { flex-wrap: wrap; }
+  .heat-panel { padding: 9px 16px; }
+  .acct-frozen { box-shadow: inset 2px 0 0 var(--danger); }
   /* 窄屏：小时窗口降为单列，避免两列时输入框过窄 */
   .hours { grid-template-columns: minmax(0, 1fr); }
   .acct-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }

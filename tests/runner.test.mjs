@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { RESTRICTED_COOLDOWN_MS } from "../engine/constants.mjs";
 import { JobRunner } from "../engine/runner.mjs";
 import { fakeClock, localTime, makeAcct, task, wbBackend } from "./helpers.mjs";
 
@@ -174,14 +173,16 @@ test("runner：stop() 在步骤边界中止", async () => {
   assert.ok(done.log.some((l) => l.includes("取消")));
 });
 
-test("runner：403/11140 → 记入 holds，本轮跳过该账号", async () => {
+test("runner：403/11140 → 冻结账号（不再自动恢复），本轮跳过该账号", async () => {
   const clock = fakeClock(DAY);
   const backend = simpleBackend(clock, { restrictedUids: ["uid-A"] });
+  const onFrozen = [];
   const runner = new JobRunner({
     accounts: twoAccounts(),
     now: clock.now,
     sleep: clock.sleep,
     fetch: backend.fetchImpl,
+    onFrozen: (uid, entry) => onFrozen.push([uid, entry]), // daemon 据此落盘 state/frozen.json
   });
   const job = runner.start({ legs: ["growth"] });
   const done = await runner.wait(job.id);
@@ -190,34 +191,59 @@ test("runner：403/11140 → 记入 holds，本轮跳过该账号", async () => 
   assert.equal(aStep.state, "fail");
   assert.match(aStep.detail, /未能获取到任务清单|风控|restricted|失败/);
   assert.equal(bStep.state, "ok");
-  // holds 形状（CONTRACT §2/§3）：[{uid, releasedAt}]，releasedAt = 解除时刻 epoch ms
-  const holds = runner.holds();
-  assert.equal(holds.length, 1);
-  assert.equal(holds[0].uid, "uid-A");
-  assert.ok(Number.isFinite(holds[0].releasedAt), "releasedAt 必须是 epoch ms");
-  assert.ok(holds[0].releasedAt > clock.time, "解除时刻在未来");
-  assert.ok(holds[0].releasedAt - clock.time <= RESTRICTED_COOLDOWN_MS, "解除时刻不超过完整冷却窗");
-  assert.deepEqual(job.log.filter((l) => l.includes("风控限制")).length >= 1, true);
+  // frozen 形状（CONTRACT §10.5）：[{uid, at:ISO, code, message}] —— 不再有
+  // releasedAt/自动恢复，冻结只有 unfreeze 能解除。
+  const frozen = runner.frozen();
+  assert.equal(frozen.length, 1);
+  assert.equal(frozen[0].uid, "uid-A");
+  assert.equal(frozen[0].code, 11140);
+  assert.ok(!Number.isNaN(Date.parse(frozen[0].at)), "at 是冻结时刻的 ISO 串");
+  assert.ok(typeof frozen[0].message === "string");
+  // onFrozen 回调（daemon 落盘 state/frozen.json 的接线）收到同一条记录
+  assert.deepEqual(onFrozen.map(([uid]) => uid), ["uid-A"]);
+  assert.ok(done.log.some((l) => l.includes("风控限制")));
 
-  // 冷却中的账号下一轮直接 skip
+  // 冻结中的账号下一轮直接 skip（绝不重试 —— 冷却期语义已废弃）
   const job2 = runner.start({ legs: ["growth"], uids: ["uid-A"] });
   const done2 = await runner.wait(job2.id);
   assert.equal(done2.steps.length, 1);
   assert.equal(done2.steps[0].state, "skip");
-  assert.match(done2.steps[0].detail, /风控冷却/);
+  assert.match(done2.steps[0].detail, /已冻结/);
+  // 多次 restricted 不覆盖第一次的记录（第一现场的 at/message 保留）
+  const atBefore = runner.frozen()[0].at;
+  runner.freeze("uid-A", { code: 11140, message: "again" });
+  assert.equal(runner.frozen()[0].at, atBefore, "重复冻结不覆盖记录");
 });
 
-test("runner：holds() 精确形状与到期（注入时钟）", async () => {
+test("runner：freeze/unfreeze/frozen 的精确形状（注入时钟）", async () => {
   const clock = fakeClock(DAY);
   const runner = new JobRunner({ accounts: [], now: clock.now, sleep: clock.sleep });
-  assert.deepEqual(runner.holds(), [], "初始无冷却");
-  runner.hold("uid-X", 5000);
-  assert.deepEqual(runner.holds(), [{ uid: "uid-X", releasedAt: DAY + 5000 }]);
-  clock.advance(5000);
-  assert.deepEqual(runner.holds(), [], "过了 releasedAt 就不再算冷却");
-  // 默认冷却时长 = RESTRICTED_COOLDOWN_MS（2 小时）
-  runner.hold("uid-Y");
-  assert.equal(runner.holds()[0].releasedAt - clock.time, RESTRICTED_COOLDOWN_MS);
+  assert.deepEqual(runner.frozen(), [], "初始无冻结");
+  assert.equal(runner.isFrozen("uid-X"), false);
+  runner.freeze("uid-X", { code: 11140, message: "request illegal" });
+  assert.deepEqual(runner.frozen(), [
+    { uid: "uid-X", at: new Date(DAY).toISOString(), code: 11140, message: "request illegal" },
+  ]);
+  assert.equal(runner.isFrozen("uid-X"), true);
+  // 没有 unfreeze 之前永远冻结（hub v2.1.0：绝不自动恢复）
+  clock.advance(30 * 86400000);
+  assert.equal(runner.isFrozen("uid-X"), true, "冻结没有过期语义");
+  // 解除后再冻结 → 新记录
+  assert.equal(runner.unfreeze("uid-X"), true);
+  assert.deepEqual(runner.frozen(), []);
+  assert.equal(runner.unfreeze("uid-X"), false, "没冻结的 unfreeze 返回 false");
+  runner.freeze("uid-X", { code: 403, message: "HTTP 403" });
+  assert.equal(runner.frozen()[0].code, 403, "code 可为 403（HTTP 层）");
+  // frozenMap 初始数据（daemon 从 state/frozen.json 读入同一份对象）
+  const seeded = new JobRunner({
+    accounts: [],
+    now: clock.now,
+    sleep: clock.sleep,
+    frozenMap: { "uid-Y": { at: new Date(DAY).toISOString(), code: 11140, message: "seeded" } },
+  });
+  assert.deepEqual(seeded.frozen(), [
+    { uid: "uid-Y", at: new Date(DAY).toISOString(), code: 11140, message: "seeded" },
+  ]);
 });
 
 test("runner：token 临期 → 刷新 + 原子回写 + 内存合并", async () => {

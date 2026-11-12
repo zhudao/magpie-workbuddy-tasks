@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
+  <!-- 静态文件版本：必须与 package.json 的 version 一致（后端测试比对四处：
+       package.json / index.mjs 的 VERSION / page 页脚 / 这个 meta）。app.js 读它做版本一致性检查。 -->
+  <meta name="wb-version" content="0.3.4">
   <title>WorkBuddy 任务 · 看板</title>
   <link rel="icon" href="logo-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
@@ -27,6 +30,9 @@
       <div class="status-group" role="group" aria-label="连接状态">
         <span class="pill pill-quiet" id="daemonPill" role="status" aria-live="polite">检查中…</span>
         <span class="pill pill-quiet" id="feedPill">未连接</span>
+        <!-- 版本不一致提示（0.3.3）：插件文件更新了、守护进程还在跑旧代码时挂在这里
+             （「实时 · SSE」右边）。可见文案取短句，完整解释放 title。 -->
+        <span class="pill pill-warn" id="verPill" hidden></span>
       </div>
 
       <div class="appbar-actions">
@@ -148,7 +154,8 @@
             </label>
           </span>
           <span class="acct-cell head-label">账号</span>
-          <span class="acct-cell head-label">凭据</span>
+          <!-- 凭据列：表头与内容（已登录 / 剩 N 天）共用同一条中线（左锚定，不右移） -->
+          <span class="acct-cell head-label cred">凭据</span>
           <span class="acct-cell head-label">任务</span>
           <span class="acct-cell head-label">积分</span>
           <span class="acct-cell head-label center">参与</span>
@@ -157,12 +164,17 @@
         <div id="accountsList" class="accounts-list"></div>
       </div>
       <p class="acct-intl" id="intlNote" hidden></p>
+      <!-- 企业版说明行：与 #intlNote 同款样式与位置。后端把企业版账号（acct.enterpriseId
+           非空）从 accounts[] 过滤掉，并在 /api/state 顶层给 enterpriseSkipped:{count,note}。
+           有 count>0 才显示；绝不列出任何企业版账号的 uid / 昵称 / 域名。 -->
+      <p class="acct-intl" id="enterpriseNote" hidden></p>
 
       <div class="batchbar">
         <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->
         <fieldset class="segments" id="legsBox">
           <legend class="sr-only">任务腿</legend>
           <label class="segment" title="成长任务（含微信小程序链式任务 Sequential_Tasks_1–6；小程序任务随成长任务一起跑）"><input type="checkbox" class="leg-check" value="growth"><span>成长任务</span></label>
+          <label class="segment" title="连登管家：补签昨日 → 领新手礼包/活动补偿 → 兑换可用连登档位 → 抽奖（幂等、纯收益，已领的静默跳过）"><input type="checkbox" class="leg-check" value="streak"><span>连登管家</span></label>
           <label class="segment" title="Buddy 盲盒：消耗成长能量开盲盒（不是领奖）；无能量时后端会跳过"><input type="checkbox" class="leg-check" value="buddy"><span>Buddy 盲盒</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="night"><span>夜猫子</span></label>
@@ -183,11 +195,19 @@
             <!-- 批量接取只提交后端判定 canAccept 的任务；不可自动接取的项数在这里说明，
                  而不是静默少接（数字来自 snapshot.tasks[].canAccept，见 app.js acceptPlan）。 -->
             <span class="accept-note" id="acceptNote" hidden></span>
+            <!-- 冻结账号总览（0.3.3，契约 §10.5）：有冻结账号时显示「N 个账号已冻结」+ 批量恢复。
+                 冻结账号不进排程 / 批量缺省目标，显式点到会如实失败 —— 所以必须显式说出来。 -->
+            <span class="frozen-note" id="frozenNote" hidden></span>
           </div>
           <div class="batch-buttons">
             <button type="button" class="ghost-btn" id="btnAccept">批量接任务</button>
             <button type="button" class="ghost-btn" id="btnClaim">只领奖</button>
-            <button type="button" class="ghost-btn" id="btnCheckin">每日签到</button>
+            <!-- 签到回执（契约 §10.4）：claimed=已签到 / done=今天已签 / pending=处理中可重试（不算成功）/
+                 failed=失败。按钮/结果都走同一套文案，不把「处理中」显示成已签。 -->
+            <button type="button" class="ghost-btn" id="btnCheckin"
+              title="手动每日签到（POST /api/checkin）。回执分四种：已签到 / 今日已签 / 处理中，可重试（上游未处理完，不算已签、当天可重试）/ 失败。">每日签到</button>
+            <button type="button" class="ghost-btn" id="btnStreak"
+              title="连登管家（POST /api/streak/run）：补签昨日 → 领新手礼包/活动补偿 → 兑换可用档位 → 抽奖；作用于勾选账号（未勾选 = 全部可参与账号）。">连登管家</button>
             <button type="button" class="btn" id="btnRun">批量做任务</button>
           </div>
         </div>
@@ -233,6 +253,11 @@
               <span class="hint">北京时间小时；留空 = 不排程；只跑 Sequential_Tasks 系列小程序任务</span>
             </div>
             <div class="hour-row">
+              <span class="field-label">连登管家</span>
+              <input class="input input-mono" id="hoursStreak" inputmode="numeric" placeholder="留空" aria-label="连登管家小时窗口">
+              <span class="hint">北京时间小时；留空 = 不排程；幂等（补签 / 领礼包 / 兑换档位 / 抽奖），重复跑不会重复领</span>
+            </div>
+            <div class="hour-row">
               <span class="field-label">Buddy 盲盒</span>
               <input class="input input-mono" id="hoursBuddy" inputmode="numeric" placeholder="留空" aria-label="Buddy 盲盒小时窗口">
               <span class="hint">北京时间小时；留空 = 不排程；会消耗成长能量</span>
@@ -247,11 +272,13 @@
               <input class="input input-mono" id="hoursNight" inputmode="numeric" placeholder="留空" aria-label="夜猫子小时窗口">
               <span class="hint">北京时间小时；留空 = 不排程；上游只在 23:00–08:00 计数</span>
             </div>
+            <!-- 保存按钮放在 hours 网格里：第 3 行第 2 列 = 「夜猫子」右边、「猫猫旅行」下面，
+                 紧贴它要保存的那几个输入框（原先在说明文案下方，离得远）。 -->
+            <div class="hour-row hour-actions">
+              <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
+            </div>
           </div>
-          <p class="hint hours-note">北京时间（UTC+8）小时；留空 = 不排程。小程序任务按天解锁，Buddy 盲盒消耗成长能量，夜猫子仅 23:00–08:00 计数。</p>
-          <div class="form-actions">
-            <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
-          </div>
+          <p class="hint hours-note">北京时间（UTC+8）小时；留空 = 不排程。小程序任务按天解锁，连登管家幂等（不会重复领），Buddy 盲盒消耗成长能量，夜猫子仅 23:00–08:00 计数。</p>
 
           <div class="sched-cols">
             <div class="sched-block">

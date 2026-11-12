@@ -40,9 +40,9 @@ function fakeEngine() {
   const jobs = new Map()
   let seq = 0
   let current = null
-  // 风控冷却名单（CONTRACT §2/§3：runner.holds() -> [{uid, releasedAt}]），
-  // 测试可用 engine.__setHolds 调整
-  let holdList = [{ uid: "u1", releasedAt: Date.now() + 7200_000 }]
+  // 403/11140 冻结名单（CONTRACT §10.5：runner.frozen() -> [{uid, at, code, message}]），
+  // 测试可用 engine.__setFrozen 调整；默认为空（冻结账号会被缺省目标排除）
+  let frozenList = []
 
   const makeJob = (spec) => {
     const id = `job-${++seq}`
@@ -90,7 +90,18 @@ function fakeEngine() {
         return current && current.state === "running" ? current : null
       }
       holds() {
-        return holdList
+        return []
+      }
+      frozen() {
+        return frozenList
+      }
+      isFrozen(uid) {
+        return frozenList.some((f) => f.uid === uid)
+      }
+      unfreeze(uid) {
+        const had = frozenList.some((f) => f.uid === uid)
+        frozenList = frozenList.filter((f) => f.uid !== uid)
+        return had
       }
       stop(id) {
         const job = jobs.get(id)
@@ -142,9 +153,9 @@ function fakeEngine() {
     },
     errors: [],
     ok: true,
-    // 测试钩子：调整风控冷却名单
-    __setHolds: (list) => {
-      holdList = list
+    // 测试钩子：调整 403/11140 冻结名单
+    __setFrozen: (list) => {
+      frozenList = list
     },
   }
   return eng
@@ -435,6 +446,7 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
             "canAccept",
             "canLight",
             "code",
+            "description",
             "desktopOnly",
             "jumpUrl",
             "lockHint",
@@ -549,22 +561,39 @@ describe("快照投影 · 参与任务开关 · 风控冷却", () => {
     }
   })
 
-  test("scheduler.holds：runner.holds() 的真实风控名单 + 昵称 + ISO 解除时间", async () => {
+  test("顶层 frozen：runner.frozen() 的 403/11140 冻结名单 + 昵称 + 解冻路由", async () => {
     const { h, engine } = await boot()
     try {
+      engine.__setFrozen([
+        { uid: "u1", at: new Date(Date.now() - 3600_000).toISOString(), code: 11140, message: "request illegal" },
+      ])
       const st = await (await get(h.port, "/api/state", KEY)).json()
-      assert.equal(st.scheduler.holds.length, 1)
-      const hold = st.scheduler.holds[0]
-      assert.deepEqual(Object.keys(hold).sort(), ["nickname", "releasedAt", "uid"])
-      assert.equal(hold.uid, "u1")
-      assert.equal(hold.nickname, "阿猫", "daemon 用账号昵称补全 holds")
-      const t = Date.parse(hold.releasedAt)
-      assert.ok(!Number.isNaN(t) && t > Date.now(), "releasedAt 是未来时刻的 ISO 串")
+      assert.equal(st.frozen.length, 1)
+      const f = st.frozen[0]
+      assert.deepEqual(Object.keys(f).sort(), ["at", "code", "message", "nickname", "uid"])
+      assert.equal(f.uid, "u1")
+      assert.equal(f.nickname, "阿猫", "daemon 用账号昵称补全 frozen")
+      assert.equal(f.code, 11140)
+      assert.ok(!Number.isNaN(Date.parse(f.at)), "at 是 ISO 串")
+      // accounts[].frozen 投影同一条记录（形状 {at, code, message}，不带 uid）
+      assert.deepEqual(
+        Object.keys(st.accounts[0].frozen).sort(),
+        ["at", "code", "message"],
+      )
+      assert.equal(st.accounts[0].frozen.code, 11140)
+      // 旧的 scheduler.holds 已被顶层 frozen 替代（CONTRACT §10.3）
+      assert.ok(!("holds" in st.scheduler))
 
-      // 冷却清空 → holds 为空数组（不再是「没进 job 的账号」）
-      engine.__setHolds([])
+      // 冻结清空 → frozen 为空数组
+      engine.__setFrozen([])
       const st2 = await (await get(h.port, "/api/state", KEY)).json()
-      assert.deepEqual(st2.scheduler.holds, [])
+      assert.deepEqual(st2.frozen, [])
+      assert.equal(st2.accounts[0].frozen, null)
+
+      // unfreeze 路由：missing = 本来就没冻结
+      const uf = await post(h.port, "/api/account/unfreeze", { uid: "u-never" }, KEY)
+      assert.equal(uf.status, 200)
+      assert.deepEqual(await uf.json(), { ok: true, unfrozen: [], missing: ["u-never"] })
     } finally {
       await h.stop()
     }

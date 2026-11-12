@@ -75,43 +75,51 @@ import { beijingDateKey, beijingHour } from "./engine/constants.mjs"
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.2")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.4")
   } catch {
-    return "0.3.2"
+    return "0.3.4"
   }
 })()
 
-const LEGS = ["growth", "mp", "buddy", "travel", "night"]
-const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" }
+const LEGS = ["growth", "mp", "streak", "buddy", "travel", "night"]
+const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" }
+// 未知路由 404 的 hint（issue #3 的真实症状）：看板比守护进程新时，旧进程没有
+// 新路由（如 GET /api/streak），用户只看到「未知 API」一头雾水 —— hint 指路重启。
+// 只追加字段，error 原文不变（既有测试与前端按原文断言/匹配）。
+const UNKNOWN_API_HINT =
+  "守护进程可能还在跑更新前的旧代码：在 magpie 里关掉再开启本插件即可重启（看板顶栏「停止守护进程」后重开也行）"
 const HISTORY_CAP = 2000
 
 // 积分缓存的有效期（GET /api/credits，CONTRACT §3）：缓存年龄小于它且未要求
 // refresh 时直接返回缓存，绝不发上游。导出供测试对齐。
+// GET /api/streak 的连登缓存（CONTRACT §10.2）与它同口径（10 分钟新鲜期）。
 export const CREDITS_TTL_MS = 10 * 60 * 1000
 
-// 排程小时窗口只认这四条腿（契约 §7/§8）：到点自动跑的都是无任务码的腿；
+// 排程小时窗口只认这五条腿（契约 §7/§8/§10.3）：到点自动跑的都是无任务码的腿；
 // growth 刻意不在排程里（engine/schedule.SCHEDULE_WINDOWS 同口径），只能手动
 // 发起（看板「立即运行」/ POST /api/run / 工具，可配合 codes 勾选）。
 // 手动运行不受此限制——LEGS 仍含 growth，settings.legs 默认也仍含 growth。
-const SCHEDULE_HOURS_LEGS = ["mp", "buddy", "travel", "night"]
+const SCHEDULE_HOURS_LEGS = ["mp", "buddy", "streak", "travel", "night"]
 
 const DEFAULT_SETTINGS = {
   scheduler: false, // 小时窗口排程总开关：默认停用，须由用户在看板里显式点一次「启用排程」才生效
   claim: true, // 完成后自动领奖
-  legs: ["growth", "travel"], // 手动运行未指定 legs 时的默认腿（growth 仍可手动勾选）
+  // 手动运行未指定 legs 时的默认腿（0.3.3 起新增 streak：连登管家是纯收益且
+  // 幂等，默认做；已在 settings.json 里存过 legs 的实例不受影响）。
+  legs: ["growth", "streak", "travel"],
   gapMs: 1500, // 账号之间的基础间隔（手动）；排程时 runner 另加 2–5s 抖动
   jitterMs: [2000, 5000], // 排程运行的账号间抖动（交给 runner，见契约 §0.4）
-  // 北京小时窗口 UTC+8（只有 mp|buddy|travel|night 可配窗口，growth 无窗口；与
-  // 容器时区无关）。**默认全部空 = 默认不排任何腿，留空即不排**：到点自动跑
-  // 意味着自动消耗成长能量/自动接取任务，不给明确授权（显式配小时）就绝不自动
-  // 做；用户在看板/设置里为某条腿配了小时窗口，那条腿才会自动跑。
-  hours: { mp: [], buddy: [], travel: [], night: [] },
+  // 北京小时窗口 UTC+8（只有 mp|buddy|streak|travel|night 可配窗口，growth 无
+  // 窗口；与容器时区无关）。**默认全部空 = 默认不排任何腿，留空即不排**：到点
+  // 自动跑意味着自动消耗成长能量/自动接取任务，不给明确授权（显式配小时）就
+  // 绝不自动做；用户在看板/设置里为某条腿配了小时窗口，那条腿才会自动跑。
+  hours: { mp: [], buddy: [], streak: [], travel: [], night: [] },
   host: { chat: "", bill: "", web: "" }, // 留空 = 用 engine/upstream 的默认
 }
 
-// normalizeScheduleHours(raw) -> {mp:number[], buddy:number[], travel:number[], night:number[]}
-//（导出供测试）键限制为 mp|buddy|travel|night（growth/未知键丢弃），每条腿只留
-// 0–23 的整数并去重升序。输入不是对象时返回空腿表（调用方先与
+// normalizeScheduleHours(raw) -> {mp:number[], buddy:number[], streak:number[], travel:number[], night:number[]}
+//（导出供测试）键限制为 mp|buddy|streak|travel|night（growth/未知键丢弃），每条
+// 腿只留 0–23 的整数并去重升序。输入不是对象时返回空腿表（调用方先与
 // DEFAULT_SETTINGS.hours 合并，缺键由此兜底；用户显式写空的腿保持空，不会被
 // 默认值复活——默认值本身也全是空）。
 export function normalizeScheduleHours(raw) {
@@ -216,6 +224,7 @@ const API_ROUTE_AUTH = [
   { method: "GET", re: /^\/api\/state$/, path: "/api/state", note: "看板状态快照" },
   { method: "GET", re: /^\/api\/history$/, path: "/api/history", note: "历史记录" },
   { method: "GET", re: /^\/api\/credits$/, path: "/api/credits", note: "积分余额与套餐权益包明细（?uid=，?refresh=1 强制拉取）" },
+  { method: "GET", re: /^\/api\/streak$/, path: "/api/streak", note: "连登状态查询（?uid=，?refresh=1 强制拉取）" },
   { method: "GET", re: /^\/api\/jobs\/[A-Za-z0-9_-]+$/, path: "/api/jobs/job-1", note: "job 查询" },
   { method: "GET", re: /^\/api\/events$/, path: "/api/events", note: "SSE 实时事件" },
   { method: "POST", re: /^\/api\/accounts$/, path: "/api/accounts", note: "重扫本地账号文件，无副作用" },
@@ -226,6 +235,8 @@ const API_ROUTE_AUTH = [
   { method: "POST", re: /^\/api\/task\/claim$/, path: "/api/task/claim", note: "单任务领奖" },
   { method: "POST", re: /^\/api\/task\/accept$/, path: "/api/task/accept", note: "单任务接取" },
   { method: "POST", re: /^\/api\/checkin$/, path: "/api/checkin", note: "手动签到" },
+  { method: "POST", re: /^\/api\/streak\/run$/, path: "/api/streak/run", note: "手动跑连登管家（补签/礼包/兑换/抽奖）" },
+  { method: "POST", re: /^\/api\/account\/unfreeze$/, path: "/api/account/unfreeze", note: "解冻 403/11140 冻结的账号" },
   { method: "POST", re: /^\/api\/settings$/, path: "/api/settings", note: "写设置" },
   { method: "POST", re: /^\/api\/account\/toggle$/, path: "/api/account/toggle", note: "参与任务开关" },
   { method: "POST", re: /^\/api\/shutdown$/, path: "/api/shutdown", note: "关停守护进程" },
@@ -296,6 +307,11 @@ export function snapTask(t, lock = null) {
     rewardEnergy: Number(t?.rewardEnergy) || 0,
     jumpUrl: t?.jumpUrl ?? "",
     taskType: t?.taskType ?? "",
+    // 上游原文说明（tasks.normalize 的 description = description || task_desc）。
+    // 「不可自动化 / 需桌面端」的任务只有它能说清「到底要做什么」（例如
+    // skill_share 的「升级到电脑端 5.9.0+…」）—— 以前这层被投影丢掉，看板只剩
+    // 一句「未收录任务」，用户无从判断。截断 300 字，避免异常长的脏数据撑爆。
+    description: String(t?.description ?? "").trim().slice(0, 300),
     // 「需桌面端完成」（DESKTOP_ONLY_TASKS：伪造事件不推进、领奖必 400 的一族）
     desktopOnly: rk.desktopOnly === true,
     // 不可自动化 + 原因（spec.unforgeable 语义沿用；未收录任务也是
@@ -334,8 +350,9 @@ export const SNAP_VERSION = 2
 // 落盘用：规范 Task 的可序列化形状（只挑契约 §2 字段，raw/多余键不落盘）。
 // ?? 兜底保证 v2 条目「字段完备」——哪怕引擎违约给了缺字段的 Task，落盘后
 // 依然是可完整重投影的规范形状（v2 读取端因此可以信任条目）。
-// 次日锁（0.3.2）：locked/unlockAt 是**投影的输入字段**（上游清单自带，MP 任务
-// 专属；web 清单任务恒 false/""），随规范 Task 落盘 —— v2 重投影直接以上游为
+// 次日锁（0.3.2）：locked/unlockAt 是**投影的输入字段**（上游清单自带；MP 任务
+// 与 web 任务都可能带 —— 2026-11-11 实测 web 清单的 Sequential_Tasks_7 也带
+// locked:true + unlock_at），随规范 Task 落盘 —— v2 重投影直接以上游为
 // 准，不依赖 mp-locks 推断。lockedUntil/lockHint 是投影输出，不落盘。
 function cacheTask(t) {
   const p = t?.progress ?? {}
@@ -564,6 +581,10 @@ async function loadEngine(log) {
     ["tasks", "./engine/tasks.mjs"],
     ["upstream", "./engine/upstream.mjs"],
     ["credits", "./engine/credits.mjs"],
+    // 连登管家（0.3.3，CONTRACT §10.1）：GET /api/streak 与 POST /api/streak/run
+    // 的引擎出口（fetchStreakState / runStreakSteward）。缺文件按可选降级处理
+    //（路由报 503 引擎不可用，不影响其余功能）。
+    ["streak", "./engine/streak.mjs"],
     // 小程序链式任务（0.3.0）：tasks.mjs 本就静态 import 它（缺文件时 tasks 也
     // 加载不了），这里单独登记是为了快照合并（fetchMPTasks）与 accept/claim
     // 分流（acceptMPTasks/claimMPTask）能拿到具名模块引用。
@@ -662,6 +683,15 @@ export async function startDaemon(opts = {}) {
   // 读入，损坏/非对象按 {}；成功拉取后原子写回（writeJson tmp+rename）。/api/state
   // 与 /api/credits 的缓存命中路径只读这份缓存，绝不顺手打上游。
   const creditsFile = join(stateDir, "credits.json")
+  // 连登状态缓存（CONTRACT §10.2 streak）：uid -> fetchStreakState 的 state 形状。
+  // 新鲜期 10 分钟（与 credits 同口径）；/api/state 的 accounts[].streak 只读投影
+  // 这份缓存，绝不为它打上游。
+  const streakFile = join(stateDir, "streak.json")
+  // 403/11140 冻结台账（CONTRACT §10.5）：uid -> {at:ISO, code, message}，tmp+
+  // rename 原子写（与 daily-activity.json 同目录同原语）。冻结账号不进
+  // eligibleNow()/排程选号/缺省目标，只有 POST /api/account/unfreeze 能解冻，
+  // 绝不自动恢复；重启后由本文件恢复冻结状态（runner 构造时经 frozenMap 读入）。
+  const frozenFile = join(stateDir, "frozen.json")
 
   let settings = { ...DEFAULT_SETTINGS, ...readJson(settingsFile, {}) }
   // 安全默认（C1）：settings.json 缺失或损坏时 readJson 落 {}，scheduler 按
@@ -690,6 +720,17 @@ export async function startDaemon(opts = {}) {
   // GET /api/credits 重新拉取）。
   let creditsCache = readJson(creditsFile, {})
   if (!creditsCache || typeof creditsCache !== "object" || Array.isArray(creditsCache)) creditsCache = {}
+  // 连登缓存：损坏/形状不对一律按空对象起步（绝不阻断启动；顶多下一次
+  // GET /api/streak 重新拉取）。
+  let streakCache = readJson(streakFile, {})
+  if (!streakCache || typeof streakCache !== "object" || Array.isArray(streakCache)) streakCache = {}
+  // 冻结台账（CONTRACT §10.5）：形状不对按空对象起步；条目逐条归一（at 统一成
+  // ISO 串、message 截断），坏条目丢弃不阻断启动。台账是 daemon 侧冻结状态
+  // 的单一事实：runner 启动时经 frozenMap 读入同一份数据，之后每次 freeze/
+  // unfreeze 经回调双向同步（onFrozen/onUnfrozen 原子写回本文件）。
+  let frozenState = readJson(frozenFile, {})
+  if (!frozenState || typeof frozenState !== "object" || Array.isArray(frozenState)) frozenState = {}
+  frozenState = normalizeFrozenState(frozenState)
   // 小程序链式任务锁（0.3.2）：state/mp-locks.json 记录 次日锁 与
   // 领奖日期（uid -> code -> 北京日）。损坏/形状不对 → 空表起步：顶多丢一层
   // 防御/即时锁（主依据是上游清单的 locked/unlock_at），绝不阻断启动。
@@ -707,7 +748,29 @@ export async function startDaemon(opts = {}) {
   const saveHubImports = () => writeJson(hubImportsFile, hubImports)
   const saveDailyActivity = () => writeJson(dailyActivityFile, dailyActivity)
   const saveCredits = () => writeJson(creditsFile, creditsCache)
+  const saveStreak = () => writeJson(streakFile, streakCache)
+  const saveFrozen = () => writeJson(frozenFile, frozenState)
   const saveMPLocks = () => writeJson(mpLocksFile, mpLocks)
+
+  // normalizeFrozenState(raw)：冻结台账逐条归一（CONTRACT §10.5 的
+  // {uid:{at:ISO, code, message}}）。at 解析不出就记当前时刻（冻结语义不依赖
+  // 精确时刻，宁可补一个也不丢条目）；code 保留原值（number|string 都合法）；
+  // message 截断 200。坏条目（非对象/缺 uid）丢弃 —— 保住还能用的部分比整份
+  // 拒读更接近真实状态（与 mp-locks 的归一口径一致）。
+  function normalizeFrozenState(raw) {
+    const out = {}
+    const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+    for (const [uid, entry] of Object.entries(src)) {
+      if (!uid || !entry || typeof entry !== "object" || Array.isArray(entry)) continue
+      const atMs = Date.parse(String(entry.at ?? ""))
+      out[uid] = {
+        at: Number.isFinite(atMs) ? new Date(atMs).toISOString() : new Date(now()).toISOString(),
+        code: entry.code ?? 11140,
+        message: scrub(String(entry.message ?? "")).slice(0, 200),
+      }
+    }
+    return out
+  }
 
   // ---- 小程序链式任务锁（0.3.2）：落盘 + 查询 -------------------------------
   //
@@ -847,6 +910,21 @@ export async function startDaemon(opts = {}) {
       dailyActivity[uid] = key
       saveDailyActivity()
     },
+    // 403/11140 冻结（CONTRACT §10.5）：初始台账（state/frozen.json 读入的同一份
+    // 对象）交给 runner，之后任何腿收到 restricted 经 onFrozen 原子写回、解冻经
+    // onUnfrozen 删除 —— runner 的内存冻结表与本文件之间永不分叉。写盘失败只少
+    // 一份持久化（重启后该账号顶多再撞一次 403，会再次冻结）。
+    frozenMap: frozenState,
+    onFrozen: (uid, entry) => {
+      frozenState[uid] = entry
+      saveFrozen()
+      log(`[frozen] ${uid} 触发 403/11140，已冻结（${scrub(String(entry?.message ?? "")).slice(0, 120)}）；确认无风险后可解冻`)
+    },
+    onUnfrozen: (uid) => {
+      delete frozenState[uid]
+      saveFrozen()
+      log(`[frozen] ${uid} 已解冻`)
+    },
     // 小程序链式任务锁（需求 2）：runner 在 growth 腿的 2b 与 mp 腿把这些透传给
     // 引擎（engine/runner._mpLockOpts）—— mpLockedCodes 供引擎整条跳过仍锁定的
     // 任务；onLock 落盘上游锁原因（accept 被拒时）；onClaimed 记领奖日期。
@@ -888,6 +966,26 @@ export async function startDaemon(opts = {}) {
     return all.filter((a) => a.provider === "workbuddy-ai").length
   }
 
+  // 企业版账号（社区 issue #3）：acct.enterpriseId 非空 = 企业版，没有成长任务与
+  // 签到。与国际版完全同口径：不进 /api/state 的 accounts[]（statePayload 同一处
+  // 过滤点追加）、不进任何 job 与单账号操作（accountByUid 一律「找不到」，不从
+  // 侧门进引擎）；计数只给数量与去向说明（enterpriseSkipped），绝不列出企业版
+  // 账号内容（uid/昵称/域名/enterpriseId 都不给）。过滤同样只发生在 daemon 使用
+  // 侧：engine/store.loadAccounts 与 accountio 的导入/导出（导出行本就带
+  // enterpriseId 字段，契约 §9）仍可见全量数据 —— 别把过滤下沉进 store 层。
+  const isEnterpriseAcct = (a) => !!a?.enterpriseId
+  function enterpriseSkippedCountOf(all) {
+    // 计数与 intlSkipped 各自独立（provider 分域）：国际版账号只进 intlSkipped，
+    // 企业版只统计 provider==="workbuddy" 的条目，绝不互相重复计数。
+    return all.filter((a) => a.provider === "workbuddy" && isEnterpriseAcct(a)).length
+  }
+  const enterpriseSkippedNote = (n) =>
+    `已忽略 ${n} 个企业版账号：企业版没有成长任务与签到，本插件只服务个人版`
+  // /api/credits 与 /api/streak 对企业版 uid 的 404 专属文案（镜像同一段，§10.8）：
+  // 说清「为什么看不到」与「去哪里看」，绝不泄露昵称/域名/enterpriseId 等额外信息。
+  const ENTERPRISE_NO_GROWTH_MSG =
+    "企业版账号没有成长体系（无任务与积分查询），已从看板隐藏；如需查看请在 magpie 里切换个人版账号"
+
   function cfgEnvLike() {
     const envLike = { ...process.env, WB_CONFIG_DIR: cfgDir, WB_STATE_DIR: stateDir }
     return envLike
@@ -914,16 +1012,108 @@ export async function startDaemon(opts = {}) {
     }
   }
 
+  // ---- 冻结（CONTRACT §10.5）：排除与查询 -----------------------------------
+  // runtime 的单一事实是 runner 的冻结表（frozenState 读入 + 回调同步）；假引擎/
+  // 老 runner 没有 frozen()/isFrozen() 时回退持久化台账（尽力而为口径）。
+  function frozenUidSet() {
+    const fn = runner?.frozen
+    if (typeof fn === "function") {
+      try {
+        const list = fn.call(runner)
+        if (Array.isArray(list)) {
+          return new Set(list.map((x) => String(x?.uid ?? "")).filter(Boolean))
+        }
+      } catch {}
+    }
+    return new Set(Object.keys(frozenState))
+  }
+
+  const isFrozenUid = (uid) => frozenUidSet().has(String(uid ?? ""))
+
+  function frozenMessageOf(uid) {
+    const e = frozenEntryOf(uid)
+    return scrub(String(e?.message ?? "")).slice(0, 160)
+  }
+
+  // 单账号的冻结记录（accounts[].frozen 投影）：优先 runner 的实时冻结表
+  //（onFrozen 已同步进台账，但老 runner/假 runner 只有内存表），回退持久化台账。
+  function frozenEntryOf(uid) {
+    const fn = runner?.frozen
+    if (typeof fn === "function") {
+      try {
+        const hit = fn.call(runner).find((x) => String(x?.uid ?? "") === String(uid))
+        if (hit) {
+          return {
+            at: hit.at ?? null,
+            code: hit.code ?? 11140,
+            message: scrub(String(hit.message ?? "")),
+          }
+        }
+      } catch {}
+    }
+    return frozenState[uid] ?? null
+  }
+
+  // 冻结总览（/api/state 顶层 frozen）：runner 的冻结表拼上昵称；at/code/message
+  // 原样透出（at 为 ISO 串）。老 runner 没有 frozen() 时回退台账。
+  function frozenOverview() {
+    const fn = runner?.frozen
+    let list = null
+    if (typeof fn === "function") {
+      try {
+        list = fn.call(runner)
+      } catch {
+        list = null
+      }
+    }
+    if (!Array.isArray(list)) {
+      list = Object.entries(frozenState).map(([uid, e]) => ({ uid, ...(e ?? {}) }))
+    }
+    const nick = new Map(loadAccountsCn().map((a) => [a.uid, a.nickname || a.uid]))
+    return list
+      .filter((f) => f && typeof f === "object" && f.uid)
+      .map((f) => ({
+        uid: String(f.uid),
+        nickname: nick.get(String(f.uid)) ?? String(f.uid),
+        at: f.at ?? null,
+        code: f.code ?? 11140,
+        message: scrub(String(f.message ?? "")),
+      }))
+  }
+
+  // daemon 侧的显式冻结入口（runner 之外的路由，如 POST /api/streak/run 撞上
+  // restricted）：写台账 + 同步 runner 的内存表。已冻结的账号不覆盖记录。
+  function freezeAccount(uid, info = {}) {
+    const key = String(uid ?? "")
+    if (!key || frozenState[key]) return !!frozenState[key]
+    frozenState[key] = {
+      at: new Date(now()).toISOString(),
+      code: info.code ?? 11140,
+      message: scrub(String(info.message ?? "")).slice(0, 200),
+    }
+    saveFrozen()
+    try {
+      runner?.freeze?.(key, { code: frozenState[key].code, message: frozenState[key].message })
+    } catch {}
+    log(`[frozen] ${key} 触发 403/11140，已冻结；确认无风险后可解冻`)
+    return true
+  }
+
   function eligibleNow() {
     const accts = loadAccountsCn() // 与列表同源：只有国内版账号可能参与任务
     const filter = engine?.store?.eligibleAccounts
-    if (typeof filter !== "function") return []
+    let list = []
     try {
-      return filter(accts) || []
+      list = (typeof filter === "function" ? filter(accts) : []) || []
     } catch {
       // 兜底：按契约 §2 的过滤规则本地再筛一遍
-      return accts.filter((a) => a.provider === "workbuddy" && !a.isApiKey && !a.enterpriseId && a.tasksEnabled !== false)
+      list = accts.filter((a) => a.provider === "workbuddy" && !a.isApiKey && !a.enterpriseId && a.tasksEnabled !== false)
     }
+    // 冻结账号（403/11140，CONTRACT §10.5）不进可参与名单：排程选号、/api/run
+    // 与 /api/checkin、/api/streak/run 的缺省目标都从这里取 —— 缺省口径一律
+    // 绕开冻结账号（显式指定的失败提示由各操作自己负责）。
+    const frozen = frozenUidSet()
+    return frozen.size ? list.filter((a) => !frozen.has(String(a.uid))) : list
   }
 
   // 引擎调用的公共注入（契约 §2 的 opts 形状）：手动操作与快照刷新也必须走同一套
@@ -952,8 +1142,9 @@ export async function startDaemon(opts = {}) {
   }
 
   function accountByUid(uid) {
-    // 与列表同源：只在国内版账号里找（intl uid 一律「找不到」，不会从侧门进引擎）
-    return loadAccountsCn().find((a) => a.uid === uid) || null
+    // 与列表同源：只在国内个人版账号里找（intl 与企业版 uid 一律「找不到」，
+    // 不会从侧门进引擎；企业版口径见上方 enterpriseSkippedCountOf 注释）。
+    return loadAccountsCn().find((a) => a.uid === uid && !isEnterpriseAcct(a)) || null
   }
 
   // ---- 快照（/api/state 的 tasks/energy/streak；只在闲时刷新，限流） ------
@@ -1189,30 +1380,6 @@ export async function startDaemon(opts = {}) {
     return out
   }
 
-  // scheduler.holds = 真正的风控冷却名单（403/11140），不是「没进 job 的账号」。
-  // runner.holds() 是唯一事实来源（[{uid, releasedAt}]，releasedAt 为 epoch ms），
-  // 这里拼上昵称并把时刻转成 ISO 串，看板直接渲染「解除时间」。
-  function schedulerHolds() {
-    const fn = runner?.holds
-    if (typeof fn !== "function") return []
-    let list = null
-    try {
-      list = fn.call(runner)
-    } catch {
-      return []
-    }
-    if (!Array.isArray(list)) return []
-    const nick = new Map(loadAccountsCn().map((a) => [a.uid, a.nickname || a.uid]))
-    return list
-      .filter((h) => h && typeof h === "object" && h.uid)
-      .map((h) => ({
-        uid: String(h.uid),
-        nickname: nick.get(String(h.uid)) ?? String(h.uid),
-        releasedAt:
-          Number.isFinite(h.releasedAt) && h.releasedAt > 0 ? new Date(h.releasedAt).toISOString() : null,
-      }))
-  }
-
   function checkScheduler(nowMs = Date.now()) {
     try {
       if (!settings.scheduler) return null
@@ -1387,6 +1554,16 @@ export async function startDaemon(opts = {}) {
     if (typeof fn !== "function") throw new Error(engineErrorsText())
     const acct = accountByUid(uid)
     if (!acct) throw new Error(`找不到账号 ${uid}（重新扫描账号或检查 plugin-auth.json）`)
+    // 显式指定的冻结账号如实失败（CONTRACT §10.5）：不静默跳过、不碰上游
+    if (isFrozenUid(uid)) {
+      return {
+        ok: false,
+        credit: 0,
+        energy: 0,
+        via: "",
+        reason: `账号已冻结（11140）：${frozenMessageOf(uid)}；确认无风险后在账号行点「恢复」`,
+      }
+    }
     // 小程序任务（0.3.0 起进快照）领奖走小程序头族（MP_HEADERS），web 回退语义
     // 由 claimMPTask 自带；返回形状与 web 领奖一致（MP 模块无 via 字段 → 空串）。
     const r = await fn(acct, c, engineOpts(acct))
@@ -1427,6 +1604,12 @@ export async function startDaemon(opts = {}) {
     const acct = accountByUid(uid)
     if (!acct) throw new Error(`找不到账号 ${uid}`)
     if (!list.length) throw new Error("codes 不能为空")
+    // 显式指定的冻结账号如实失败（CONTRACT §10.5）：所有请求的 code 都进 failed，
+    // reason 统一带「恢复」提示 —— 不静默跳过、不碰上游。
+    if (isFrozenUid(uid)) {
+      const reason = `账号已冻结（11140）：${frozenMessageOf(uid)}；确认无风险后在账号行点「恢复」`
+      return { accepted: [], already: [], failed: list.map((c) => ({ code: c, reason })) }
+    }
     // web 清单任务走 tasks.acceptTasks（chat 头族），小程序任务走
     // miniprogram.acceptMPTasks（MP_HEADERS）；两边结果合并，返回形状不变
     //（accepted/already/failed）。注意 MP 模块把 already_accepted 并进 accepted
@@ -1463,6 +1646,19 @@ export async function startDaemon(opts = {}) {
     return out
   }
 
+  // 签到回执细分（CONTRACT §10.4，hub #596）：outcome ∈ claimed|done|pending|failed。
+  // 「失败」是唯一硬词 —— msg 含「不足」（如「距离 7 天奖励还不足」）不得判失败；
+  // pending 词（处理中/请勿重复操作/系统繁忙/稍后再试）优先于一切 —— 原实现把
+  // code=0 一律当成功，会把「请求处理中，请勿重复操作」记成已领，当天再也不重试。
+  const CHECKIN_PENDING_RE = /处理中|请勿重复操作|系统繁忙|稍后再试/
+  function classifyCheckin(code, msg, alreadyFlag) {
+    const m = String(msg ?? "")
+    if (CHECKIN_PENDING_RE.test(m)) return "pending"
+    if (code === 0) return /失败/.test(m) ? "failed" : alreadyFlag ? "done" : "claimed"
+    if (code === 10001) return /已签到|已签/.test(m) ? "done" : "failed"
+    return "failed"
+  }
+
   async function doCheckin(uids) {
     const up = engine?.upstream
     if (typeof up?.callJSON !== "function" || typeof up?.billBase !== "function") {
@@ -1476,20 +1672,40 @@ export async function startDaemon(opts = {}) {
         out.push({ uid, outcome: "failed", message: "找不到账号" })
         continue
       }
+      // 显式指定的冻结账号如实失败（CONTRACT §10.5），不静默跳过
+      if (isFrozenUid(uid)) {
+        out.push({
+          uid,
+          outcome: "failed",
+          message: `账号已冻结（11140）：${frozenMessageOf(uid)}；确认无风险后在账号行点「恢复」`,
+        })
+        continue
+      }
       try {
         const r = await up.callJSON(acct, "billing", `${up.billBase()}/billing/meter/daily-checkin`, { method: "POST" }, engineOpts())
         if (r?.ok && r?.code === 0) {
           const d = r.data ?? {}
           const already = d.already === true || d.signed === true || /已签/.test(String(r.msg ?? ""))
+          const outcome = classifyCheckin(r.code, r.msg, already)
           out.push({
             uid,
-            outcome: already ? "done" : "claimed",
-            credit: Number(d.credit ?? d.points ?? d.point ?? 0) || 0,
-            streak: d.streak ?? d.days,
+            outcome,
+            // pending 不算成功：积分/连登不可信，一律不记（当天可重试）
+            credit: outcome === "pending" ? 0 : Number(d.credit ?? d.points ?? d.point ?? 0) || 0,
+            streak: outcome === "pending" ? undefined : d.streak ?? d.days,
             message: scrub(r.msg ?? ""),
           })
         } else {
-          out.push({ uid, outcome: "failed", message: scrub(r?.msg || `HTTP ${r?.status ?? "?"} code ${r?.code ?? "?"}`) })
+          const outcome = classifyCheckin(r?.code, r?.msg, false)
+          out.push({
+            uid,
+            outcome,
+            // 10001 +「已签到」在上游可能不带 ok/code===0 信封（r.ok=false 但语义
+            // 是 done）—— 回执细分按 code/msg 判定，不迷信 HTTP 层
+            credit: outcome === "done" ? Number(r?.data?.credit ?? 0) || 0 : 0,
+            streak: outcome === "done" ? r?.data?.streak ?? r?.data?.days : undefined,
+            message: scrub(r?.msg || `HTTP ${r?.status ?? "?"} code ${r?.code ?? "?"}`),
+          })
         }
       } catch (e) {
         out.push({ uid, outcome: "failed", message: shortErr(e) })
@@ -1511,9 +1727,16 @@ export async function startDaemon(opts = {}) {
 
   async function fetchCreditsForUid(uid, force = false) {
     // 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
-    // 一律 404（intl 账号在 accountByUid 里就已经是「找不到」）。
+    // 一律 404（intl 与企业版账号在 accountByUid 里就已经是「找不到」）。
+    // 企业版给专属文案（issue #3）：账号在 magpie 里确实存在，只是企业版没有
+    // 成长体系 —— 404 说清「为什么看不到」与「去哪里看」（ENTERPRISE_NO_GROWTH_MSG），
+    // 绝不泄露昵称/域名/enterpriseId 等额外信息。
+    const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
+    if (raw) {
+      return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
+    }
     const acct = accountByUid(uid)
-    if (!acct || acct.isApiKey || acct.enterpriseId || acct.tasksEnabled === false) {
+    if (!acct || acct.isApiKey || acct.tasksEnabled === false) {
       return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
     }
     const nickname = acct.nickname || acct.accountId || uid
@@ -1555,6 +1778,187 @@ export async function startDaemon(opts = {}) {
     }
   }
 
+  // ---- 连登管家（CONTRACT §10.2）-----------------------------------------------------------
+  // GET /api/streak：engine/streak.fetchStreakState 的只读封装 + state/streak.json
+  // 缓存（uid -> streak state），新鲜期 10 分钟（CREDITS_TTL_MS，与 /api/credits
+  // 同口径）。节流口径与 credits 相同：
+  //   · 缓存新鲜且未强制 refresh → 直接回缓存，一次上游都不发；
+  //   · 要拉取时 job 在跑（或已在拉取中）→ 409 busy；但「有缓存且未 refresh」
+  //     时仍直接回缓存（哪怕已过期）—— 展示优先，绝不硬闯；
+  //   · refresh=1 → 无视 TTL 强制拉取（busy 时仍 409）。
+  // /api/state 的 accounts[].streak 只读投影缓存（cachedStreakOf），绝不为它打上游。
+  let streakBusy = false
+
+  // 连登缓存的单条读取：形状不对（手改坏文件）视作没有，绝不下发垃圾。
+  function cachedStreakOf(uid) {
+    const c = streakCache[uid]
+    return c && typeof c === "object" && !Array.isArray(c) ? c : null
+  }
+
+  async function fetchStreakForUid(uid, force = false) {
+    // 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
+    // 一律 404（intl 与企业版账号在 accountByUid 里就已经是「找不到」）；
+    // 企业版专属文案与 /api/credits 同一段（§10.8 镜像口径）。
+    const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
+    if (raw) {
+      return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
+    }
+    const acct = accountByUid(uid)
+    if (!acct || acct.isApiKey || acct.tasksEnabled === false) {
+      return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
+    }
+    const cached = cachedStreakOf(uid)
+    // 新鲜期依据 state.updatedISO（ISO 8601，fetchStreakState 落的查询时刻）
+    const atMs = Date.parse(String(cached?.updatedISO ?? ""))
+    const fresh = !!cached && Number.isFinite(atMs) && now() - atMs < CREDITS_TTL_MS
+    if (cached && !force && fresh) {
+      return { status: 200, body: { uid, cached: true, streak: cached } }
+    }
+    if (runner?.current() || streakBusy) {
+      if (cached && !force) return { status: 200, body: { uid, cached: true, streak: cached } }
+      return { status: 409, body: { error: "busy" } }
+    }
+    const fn = engine?.streak?.fetchStreakState
+    if (typeof fn !== "function") {
+      return { status: 503, body: { error: engineErrorsText() } }
+    }
+    streakBusy = true
+    try {
+      const state = await fn(acct, engineOpts(acct))
+      if (state?.ok) {
+        streakCache[uid] = state
+        saveStreak()
+        return { status: 200, body: { uid, cached: false, streak: state } }
+      }
+      // 上游失败：200 + error，旧缓存原样保留并一并带回（streak 字段，若有）
+      const body = { uid, cached: false, error: scrub(String(state?.error || state?.msg || "连登状态查询失败")) }
+      if (cached) body.streak = cached
+      return { status: 200, body }
+    } catch (e) {
+      const body = { uid, cached: false, error: shortErr(e) }
+      if (cached) body.streak = cached
+      return { status: 200, body }
+    } finally {
+      streakBusy = false
+    }
+  }
+
+  // POST /api/streak/run：手动跑一轮连登管家（补签 → 礼包/补偿 → 兑换 → 抽奖）。
+  // 缺省/空 uids = 全部「未冻结 + tasksEnabled」账号（eligibleNow 已排除冻结）；
+  // 账号之间 1500 ms（手动手感，同 /api/checkin）；restricted 当场冻结该账号。
+  async function doStreakRun(uids) {
+    const fn = engine?.streak?.runStreakSteward
+    if (typeof fn !== "function") throw new Error(engineErrorsText())
+    const explicit = Array.isArray(uids) && uids.length
+    const targets = (explicit ? uids.map(String) : eligibleNow().map((a) => a.uid)).slice(0, 20)
+    const out = []
+    for (const uid of targets) {
+      const acct = accountByUid(uid)
+      if (!acct) {
+        out.push({ uid, outcome: "failed", earned: 0, message: "找不到账号" })
+        continue
+      }
+      // 显式指定的冻结账号如实失败（CONTRACT §10.5），不静默跳过
+      if (isFrozenUid(uid)) {
+        out.push({
+          uid,
+          outcome: "failed",
+          earned: 0,
+          message: `账号已冻结（11140）：${frozenMessageOf(uid)}；确认无风险后在账号行点「恢复」`,
+        })
+        continue
+      }
+      try {
+        const r = await fn(acct, engineOpts(acct))
+        if (r?.restricted) {
+          freezeAccount(uid, { code: 11140, message: "连登管家触发风控限制 (403/11140)" })
+          out.push({
+            uid,
+            outcome: "failed",
+            earned: Number(r.earned) || 0,
+            message: "触发风控限制（403/11140），账号已冻结；确认无风险后在账号行点「恢复」",
+          })
+          continue
+        }
+        const d = r?.actions ?? {}
+        const detail = {
+          days: Number(r?.streak?.days ?? 0) || 0,
+          makeupCards: Number(r?.streak?.makeupCards ?? 0) || 0,
+          lotteryChances: Number(r?.streak?.lotteryChances ?? 0) || 0,
+          makeupUsed: d.makeup?.used === true,
+          makeupDate: d.makeup?.date ?? "",
+          gifts: (Array.isArray(d.gifts) ? d.gifts : []).map((g) => ({ name: g?.name ?? "", credit: Number(g?.credit) || 0 })),
+          redeemed: Array.isArray(d.redeemed) ? d.redeemed : [],
+          drawn: Number(d.drawn) || 0,
+        }
+        if (r?.ok !== true) {
+          const why = scrub(String(r?.logs?.slice(-1)[0] ?? "连登管家执行失败"))
+          out.push({ uid, outcome: "failed", earned: Number(r?.earned) || 0, message: why, detail })
+          continue
+        }
+        const parts = [`连登 ${detail.days} 天`]
+        if (detail.makeupUsed) parts.push(`已补签 ${detail.makeupDate}`)
+        if (detail.gifts.length) parts.push(`礼包 ×${detail.gifts.length}`)
+        if (detail.redeemed.length) parts.push(`兑换 ${detail.redeemed.join("/")}`)
+        if (detail.drawn) parts.push(`抽奖 ${detail.drawn} 次`)
+        out.push({
+          uid,
+          outcome: r?.logs?.some((l) => l.includes("跳过")) && !detail.makeupUsed && !detail.gifts.length && !detail.redeemed.length && !detail.drawn
+            ? "skipped"
+            : "ok",
+          earned: Number(r.earned) || 0,
+          message: parts.join(" / ") + `，+${Number(r.earned) || 0} 积分`,
+          detail,
+        })
+      } catch (e) {
+        out.push({ uid, outcome: "failed", earned: 0, message: shortErr(e) })
+      }
+      await sleepFn(1500) // 账号间隔（手动节奏，同 /api/checkin）
+    }
+    return out
+  }
+
+  // POST /api/account/unfreeze：解冻（CONTRACT §10.2/§10.5）。{uid} 或 {uids}；
+  // missing = 本来就没冻结的 uid。
+  function doUnfreeze(body) {
+    const wanted = Array.isArray(body?.uids)
+      ? body.uids.map(String).filter(Boolean)
+      : body?.uid
+        ? [String(body.uid)]
+        : []
+    if (!wanted.length) return { status: 400, body: { error: "需要 uid 或 uids" } }
+    const unfrozen = []
+    const missing = []
+    for (const uid of wanted) {
+      // runner 的内存冻结表与台账双向同步（frozenMap/onFrozen），台账判缺失即缺；
+      // runner.unfreeze 仍要调（老 runner 没有该方法时静默略过）。
+      const inRunner =
+        typeof runner?.isFrozen === "function"
+          ? !!runner.isFrozen(uid)
+          : typeof runner?.frozen === "function"
+            ? (() => {
+                try {
+                  return runner.frozen().some((f) => String(f?.uid ?? "") === uid)
+                } catch {
+                  return false
+                }
+              })()
+            : false
+      if (frozenState[uid] || inRunner) {
+        delete frozenState[uid]
+        try {
+          runner?.unfreeze?.(uid)
+        } catch {}
+        unfrozen.push(uid)
+        log(`[frozen] ${uid} 已解冻`)
+      } else {
+        missing.push(uid)
+      }
+    }
+    if (unfrozen.length) saveFrozen()
+    return { status: 200, body: { ok: true, unfrozen, missing } }
+  }
+
   // ---- /api/state ----------------------------------------------------------
 
   // 积分缓存的单条读取：形状不对（手改坏文件）视作没有，绝不下发垃圾。
@@ -1589,12 +1993,21 @@ export async function startDaemon(opts = {}) {
       // 积分缓存只读投影（CONTRACT §3）：绝不在这里打上游 —— 看板渲染 剩余/总额
       // 与明细弹窗的数据源；没拉过就是 null。
       credits: cachedCreditsOf(a.uid),
+      // 连登状态只读投影（CONTRACT §10.3）：state/streak.json 的缓存原样透出，
+      // 绝不为它打上游；没拉过/缓存损坏 → null。
+      streak: cachedStreakOf(a.uid),
+      // 冻结记录（CONTRACT §10.5）：{at:ISO, code, message} | null。冻结账号由
+      // eligibleNow() 排除出缺省目标；显式指定的操作如实失败并提示。
+      frozen: frozenEntryOf(a.uid),
     }
   }
 
   function statePayload(hostHeader) {
     const all = loadAccountsAll()
-    const accts = loadAccountsCn(all)
+    // accounts[] 过滤点（与国际版同一处）：loadAccountsCn 只留国内版，再追加
+    // 企业版排除（issue #3）——企业版没有成长任务与签到，不进看板列表。
+    const accts = loadAccountsCn(all).filter((a) => !isEnterpriseAcct(a))
+    const entSkipped = enterpriseSkippedCountOf(all)
     const cur = runner?.current?.() ?? null
     const payload = {
       // 绑定信息（B）：bindHost 是真实监听 host，绑定 0.0.0.0/:: 时 reachableHint
@@ -1617,11 +2030,20 @@ export async function startDaemon(opts = {}) {
       // 纯国内版诊断计数（只读）：国际版账号的数量与去向说明。绝不列出 intl
       // 账号内容（uid/昵称都不给）—— 用户明确要求国际版账号「彻底不出现」。
       intlSkipped: { count: intlSkippedCountOf(all), note: INTL_SKIPPED_NOTE },
+      // 企业版诊断计数（issue #3，与 intlSkipped 同口径同形状）：count=0 时字段
+      // 保留（{count:0,note:…}）；note 只给数量与去向说明，绝不列出企业版账号
+      // 内容（uid/昵称/域名/enterpriseId 都不给）。账号「不存在」（引擎未就绪/
+      // 读取失败 → all 为空）时取值口径与 intlSkipped 相同 = {count:0,note}。
+      enterpriseSkipped: { count: entSkipped, note: enterpriseSkippedNote(entSkipped) },
+      // 冻结总览（CONTRACT §10.3，替代原 scheduler.holds）：403/11140 冻结名单，
+      // 数据源 = runner.frozen()（初始数据来自 state/frozen.json，经 onFrozen/
+      // onUnfrozen 双向同步）。冻结账号不进缺省目标、绝不自动恢复 —— 「恢复」
+      // 按钮走 POST /api/account/unfreeze。
+      frozen: frozenOverview(),
       scheduler: {
         enabled: !!settings.scheduler,
         nextRuns: schedulerNextRuns(),
         lastCycle,
-        holds: schedulerHolds(),
       },
       job: safeJob(cur),
       stats: computeStats(),
@@ -2005,6 +2427,46 @@ export async function startDaemon(opts = {}) {
       return
     }
 
+    // 连登管家（CONTRACT §10.2）：GET 状态（缓存/refresh/409 同 /api/credits）、
+    // POST 手动跑一轮、POST 解冻。三条路由都在 API_ROUTE_AUTH 登记表里。
+    if (p === "/api/streak" && req.method === "GET") {
+      const uid = String(u.searchParams.get("uid") ?? "").trim()
+      if (!uid) {
+        json(res, 400, { error: "需要 uid" })
+        return
+      }
+      // refresh=1/true/yes：无视 TTL 强制拉取（job 在跑时仍 409，见 fetchStreakForUid）
+      const r = await fetchStreakForUid(uid, isTruthyParam(u.searchParams.get("refresh")))
+      json(res, r.status, r.body)
+      return
+    }
+
+    if (p === "/api/streak/run" && req.method === "POST") {
+      let body = {}
+      try {
+        body = await readBody(req)
+      } catch (e) {
+        json(res, 400, { error: `请求体不是合法 JSON：${shortErr(e)}` })
+        return
+      }
+      const r = await manualOp(() => doStreakRun(body.uids))
+      json(res, r.status, r.body)
+      return
+    }
+
+    if (p === "/api/account/unfreeze" && req.method === "POST") {
+      let body = {}
+      try {
+        body = await readBody(req)
+      } catch (e) {
+        json(res, 400, { error: `请求体不是合法 JSON：${shortErr(e)}` })
+        return
+      }
+      const r = doUnfreeze(body)
+      json(res, r.status, r.body)
+      return
+    }
+
     if (p === "/api/settings" && req.method === "POST") {
       let body
       try {
@@ -2170,7 +2632,10 @@ export async function startDaemon(opts = {}) {
       return
     }
 
-    json(res, 404, { error: `未知 API：${req.method} ${p}` })
+    // 未知路由（issue #3）：error 原文保持逐字不变（既有测试与前端按原文断言/
+    // 匹配），只追加 hint 指路重启 —— 看板比守护进程新时的真实症状见
+    // UNKNOWN_API_HINT 注释。
+    json(res, 404, { error: `未知 API：${req.method} ${p}`, hint: UNKNOWN_API_HINT })
   }
 
   const handler = async (req, res) => {

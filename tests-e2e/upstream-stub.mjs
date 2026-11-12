@@ -171,7 +171,28 @@ export function makeUpstreamStub(clock, seed = {}) {
       return respond(200, { code: 0, data: { balance: 42 } });
     }
     if (path === "/activity/growth/streak") {
-      return respond(200, { code: 0, data: { streak: { days: 3 }, makeup_cards: { balance: 1 } } });
+      return respond(200, { code: 0, data: { streak: { days: 3 }, makeup_cards: { balance: 1 }, redemption_status: {} } });
+    }
+
+    // ---- 连登管家（0.3.3 streak 腿的其余端点）------------------------------------
+    if (path === "/activity/growth/heatmap") {
+      return respond(200, { code: 0, data: { days: [] } });
+    }
+    if (path === "/activity/growth/lottery/summary") {
+      return respond(200, { code: 0, data: { chances: 0 } });
+    }
+    if (path === "/activity/growth/makeup-cards/use") {
+      return respond(200, { code: 0, data: {} });
+    }
+    if (path === "/activity/growth/redeem") {
+      return respond(200, { code: 0, data: {} });
+    }
+    if (path === "/activity/growth/lottery/draw") {
+      return respond(200, { code: 0, data: { name: "5 积分" } });
+    }
+    if (path === "/billing/meter/claim-gift" || path === "/billing/meter/claim-compensation") {
+      // 缺省「已领取过」：e2e 的账号都不是首日新号，业务拒绝走静默分支
+      return respond(200, { code: 2101, msg: "already claimed" });
     }
 
     // ---- 猫猫旅行 -----------------------------------------------------------------

@@ -580,6 +580,7 @@ test("/api/history 记录该轮；job 结束后自动快照回填 /api/state", a
         "canAccept",
         "canLight",
         "code",
+        "description",
         "desktopOnly",
         "jumpUrl",
         "lockHint",

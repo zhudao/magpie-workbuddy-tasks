@@ -2,8 +2,12 @@
 //
 // 数据面（只消费 daemon.mjs 真实存在的路由，绝不发明接口）：
 //   GET  /api/hello            -> {name, version, ready}
+//        看板启动时查一次，拿 version 与静态文件版本（<meta name="wb-version">）比对：
+//        不一致 → 版本一致性横幅（插件文件更新了但老进程还在跑）。不为此每 3 秒轮询。
 //   GET  /api/state[?refresh=1|<uid>] -> {serveUrl, bindHost, port, reachableHint,
-//                                        accounts, intlSkipped, scheduler, job, stats, settings, notice?, engineErrors?}
+//                                        accounts, intlSkipped, enterpriseSkipped, scheduler, job, stats, settings, notice?, engineErrors?}
+//        enterpriseSkipped = {count, note}：被过滤掉的企业版账号数量与说明（只给数字/一句说明，
+//        绝不列出任何企业版账号的 uid / 昵称 / 域名）。
 //        看板地址块已按需求整块移除：页面不渲染地址块、不复制 serveUrl。
 //        接口里的 serveUrl/bindHost/port/reachableHint 保留（守护进程侧兼容），
 //        addrModel 纯函数仅为 tests-shell/serve-url.test.mjs 的形状校验而保留。
@@ -30,7 +34,26 @@
 //   POST /api/task/accept {uid,codes[]}   -> {accepted,already,failed}
 //   POST /api/task/claim  {uid,code}      -> {ok,credit,energy,via("chat"|"web"|""),reason}
 //   POST /api/checkin     {uids?}         -> [{uid,outcome,credit?,streak?,message}]
+//        outcome ∈ "claimed"|"done"|"pending"|"failed"（CONTRACT §10.4，hub #596）：
+//        "pending" = 上游回「处理中/请勿重复操作/系统繁忙」—— 不算成功、不落账、当天可重试，
+//        看板显示「处理中，可重试」，绝不显示成「已签到」。
+//   GET  /api/streak?uid=<uid>[&refresh=1]
+//                                         -> {uid, cached, streak:<连登状态>|null, error?}
+//        连登状态 = {ok, days, makeupCards, lotteryChances, heatmap:[{date,score}],
+//        tiers:[{tier:"7d"|"14d"|"28d", status}], updatedISO}（CONTRACT §10.1）；
+//        缓存 state/streak.json 新鲜期 10 分钟，refresh=1 强制拉上游（job 在跑 → 409 busy）。
+//        accounts[].streak 是同一形状的只读投影（state/streak.json），没查过 = null。
+//        后端尚未落地/字段缺失（undefined）时一律按 null 处理 —— 显示「未查询」，不抛错。
+//   POST /api/streak/run  {uids?}         -> {results:[{uid,outcome:"ok"|"skipped"|"failed",
+//                                                   earned, message, detail:{…}}]}
+//        缺省/空 uids = 全部「未冻结 + tasksEnabled」账号；账号间隔 1500ms；
+//        冻结账号 → outcome "failed" + 冻结提示（CONTRACT §10.2/§10.5）。
+//   POST /api/account/unfreeze {uid} | {uids} -> {ok, unfrozen:[…], missing:[…]}
+//        missing = 本来就没冻结（幂等）。冻结不再自动解除，只有这个接口（或看板「恢复」）能解。
+//        accounts[].frozen = {at:ISO, code:number|string, message} | null；
+//        顶层 frozen = [{uid, nickname, at, code, message}]（冻结总览）。
 //   POST /api/settings    (部分字段)       -> 完整 settings {scheduler,claim,legs,gapMs,hours,host}
+//        hours 键集合 mp|buddy|streak|travel|night（streak = 连登管家）；留空 = 不排程。
 //   POST /api/accounts                    -> {count,eligible,added,removed}（重扫本地文件，无副作用）
 //   POST /api/account/toggle {uid,tasksEnabled:bool} -> 200 该账号的最新行（accounts[] 元素同形状）
 //                                            | 400/404 {error:"…"}（中文）
@@ -58,7 +81,7 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 // ---- 文案映射（领域词汇对齐 daemon/engine 与 CONTRACT） -----------------------
 
-const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
+const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
 const ACCEPT_NAMES = {
   not_accepted: "未接取",
   accepted: "已接取",
@@ -76,7 +99,9 @@ const STEP_STATE_NAMES = {
   restricted: "风控冷却",
 };
 const TRIGGER_NAMES = { manual: "手动", schedule: "排程" };
-const OUTCOME_NAMES = { claimed: "已签到", done: "今日已签", failed: "失败" };
+// 签到回执（CONTRACT §10.4）：claimed=真领到、done=今天本来就签过、pending=上游处理中可重试、
+// failed=失败。pending 不是成功，绝不显示成「已签到」。
+const OUTCOME_NAMES = { claimed: "已签到", done: "今日已签", pending: "处理中，可重试", failed: "失败" };
 
 const LS_THEME = "wbt.theme"; // 主题：localStorage 持久化
 
@@ -84,6 +109,7 @@ const LS_THEME = "wbt.theme"; // 主题：localStorage 持久化
 
 const state = {
   hello: null,
+  helloBusy: false, // /api/hello 首次拉取中（防并发；拿到后不再重复请求）
   conn: "checking", // checking | online | down | stopped
   feed: "idle", // sse | poll | idle
   data: null, // 最近一次 /api/state
@@ -93,6 +119,11 @@ const state = {
   toggling: new Set(), // 「参与任务」开关正在请求中的 uid（期间禁用该行开关）
   creditBusy: new Set(), // 积分查询正在请求中的 uid（期间按钮显示「查询中…」）
   creditErrors: new Map(), // uid -> {error, needRelogin}（查询失败时只放进按钮 title）
+  streakBusy: new Set(), // 连登查询正在请求中的 uid（防重复并发；0.3.4 只由「刷新快照」触发）
+  streakErrors: new Map(), // uid -> string：查询失败原因（显示在连登区的说明行里，不弹错）
+  streakRuns: new Map(), // uid -> {ok, text}：最近一次「连登管家」结果（跨重绘保留，不静默）
+  heatOpen: new Set(), // 展开连登日历的 uid（默认折叠；轮询重绘不丢状态）
+  unfreezing: new Set(), // 「恢复」正在请求中的 uid（期间禁用该行按钮）
   busy: false, // 批量操作进行中
   lastFinished: null, // 最近一个结束的 job（SSE 收尾广播）
   es: null,
@@ -293,6 +324,45 @@ async function api(path, opts = {}) {
   return await apiOnce(path, opts);
 }
 
+// 静态文件（看板）自己的版本：读 <head> 里的 <meta name="wb-version">。
+// 与守护进程 /api/hello 的 version 不同 = 插件文件更新了但老进程还在跑。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function staticVersion(root = typeof document !== "undefined" ? document : null) {
+  const m = root?.querySelector?.('meta[name="wb-version"]');
+  const v = m ? String(m.getAttribute("content") || "").trim() : "";
+  return v;
+}
+
+// 「未知 API」展示层改写（0.3.4）：守护进程文件更新后端口上仍是老进程健康，
+// 新路由(如 /api/streak)在老进程里一律回 404 {error:"未知 API：GET /api/xxx"}。
+// 这句看着像看板坏了，其实只是没重启 —— 改写成「重启插件」的人话。
+// 纪律：
+//   · 这是纯展示改写，绝不改 ApiError 语义；原始 error 仍 console.error 进控制台。
+//   · 后端新加的 hint 字段（响应体 {error, hint}）优先，没有 hint 时用兜底句。
+//   · 文本里不含「未知 API」时原样返回（不做任何多余改动）。
+const UNKNOWN_API_RE = /未知\s*API/;
+
+// 从「未知 API：GET /api/streak」里取路径（兼容半角/全角冒号与有无 HTTP 方法）。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function unknownApiPath(text) {
+  const m = /未知\s*API\s*[：:]\s*(?:[A-Za-z]+\s+)?(\S+)/.exec(String(text ?? ""));
+  return m ? m[1] : "";
+}
+
+// 统一改写函数：所有展示错误的地方都走它（humanErr / 连登查询 / 积分查询 /
+// 单账号与批量操作 / 导入导出 / 历史）。返回可直接显示的文案。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function humanizeApiErr(text, hint) {
+  const raw = String(text ?? "");
+  if (!UNKNOWN_API_RE.test(raw)) return raw;
+  // 不吞错误：原始 error 打进控制台，便于分辨「真坏了」还是「只是没重启」。
+  try { console.error("[看板] 接口返回原始错误（屏幕已改写为友好提示）：", raw); } catch {}
+  const h = String(hint ?? "").trim();
+  if (h) return h;
+  const path = unknownApiPath(raw);
+  return `守护进程版本落后（缺少 ${path || "该"} 接口）—— 关掉再开启本插件让它重启。`;
+}
+
 // 把异常翻译成人话（后端给的中文原样透出，绝不显示堆栈）
 function humanErr(e, prefix = "操作失败") {
   if (e instanceof ApiError) {
@@ -300,7 +370,7 @@ function humanErr(e, prefix = "操作失败") {
       toast("已有批量任务在跑：同一时刻只允许一个 job。等它结束，或先点「停止当前任务」。", "warn", 7000);
       return;
     }
-    toast(`${prefix}（HTTP ${e.status}）：${e.message}`, "warn", 8000);
+    toast(`${prefix}（HTTP ${e.status}）：${humanizeApiErr(e.message, e.data?.hint)}`, "warn", 8000);
     return;
   }
   if (e && e.network) {
@@ -309,7 +379,7 @@ function humanErr(e, prefix = "操作失败") {
     toast("连不上守护进程：它可能已停止。可在 magpie 里重开本插件自动拉起，或用顶栏「启动命令」手动启动。", "warn", 9000);
     return;
   }
-  toast(`${prefix}：${e && e.message ? e.message : String(e)}`, "warn", 8000);
+  toast(`${prefix}：${humanizeApiErr(e && e.message ? e.message : String(e))}`, "warn", 8000);
 }
 
 // ---- 主题（默认跟随系统；显式选择持久化到 localStorage） -----------------------------
@@ -602,17 +672,20 @@ export function taskFlags(t) {
 // 微信小程序任务识别（纯展示：只决定任务行「小程序」徽章，不参与勾选 / 接取 / 领奖门控）。
 // MP 专属任务码口径与 engine/miniprogram.mjs 的 isMPCode 一致：Sequential_Tasks_ 前缀，
 // 或校园日 school_season。后端把 MP-only 任务并入快照后，前端据此标注执行通道。
+// 显式排除 Sequential_Tasks_7：它在 engine/constants.mjs 的 TASK_SPECS 里是
+// kind:"playbook"（PC 灵感功能），不走小程序链路。前端不引 constants，故此码在此硬编码排除，
+// 与后端 isMPCode「前缀命中但在 TASK_SPECS 里就不算 MP」的口径对齐。
 // 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
 export function isMPTask(t) {
   const code = String(t?.code ?? "");
+  if (code === "Sequential_Tasks_7") return false;
   return code === "school_season" || code.startsWith("Sequential_Tasks_");
 }
 
 // 领奖门控（维持既有口径）：acceptStatus==="completed"，或进度已达标（current>=target>0）。
 // 已领奖（claimed）的不再给按钮 —— 真实快照里 11 项 claimed 都是 1/1，不排除会长出
-// 11 个必然失败的按钮。缺码时不给按钮（无从 POST）。
+// 11 个必然失败的按钮。缺码不在这里挡：真正要 POST 的调用方再过滤（行内按钮 / 批量 codes）。
 export function claimableTask(t) {
-  if (String(t?.code ?? "") === "") return false;
   const status = String(t?.acceptStatus ?? "");
   if (status === "completed") return true;
   if (status === "claimed") return false;
@@ -893,11 +966,11 @@ function taskRow(a, t) {
   // 锁定提示：后端锁定说明优先，缺省给一句通用文案（老后端 locked 恒 false，不会走到这里）
   const lockText = f.lockHint || "到第二天才能接取任务";
 
-  // 接取：锁定行一律不显示「接取」按钮（即使老数据里 canAccept 仍为 true）；
-  // 否则仅当后端 canAccept === true（老后端回退旧口径，见 taskFlags）
-  if (f.locked) {
-    actions.append(el("span", { class: "muted", text: lockText, title: lockText }));
-  } else if (f.canAccept) {
+  // 接取：锁定行不在这里输出任何提示（锁文案只在任务列渲染：row-note / 「次日可接取」徽章 /
+  // 勾选框 title，见下方 lockNote）——操作列对锁定行只留 jumpCell(t)。
+  // 锁定行一律不显示「接取」按钮（即使老数据里 canAccept 仍为 true）；
+  // 非锁定行仅当后端 canAccept === true（老后端回退旧口径，见 taskFlags）
+  if (!f.locked && f.canAccept) {
     actions.append(
       el("button", {
         type: "button",
@@ -912,19 +985,29 @@ function taskRow(a, t) {
   } else if (isAuto && (status === "not_accepted" || status === "accepted")) {
     // taskType:"auto"：上游拒绝接取，不给「接取」按钮
     actions.append(el("span", { class: "muted", text: "自动任务，无需接取" }));
-  } else if (f.unforgeable) {
-    // 规则 2：unforgeable 行不参与批量（原因原文在任务列显示）
-    actions.append(el("span", { class: "muted", text: "不参与批量" }));
+  } else if (f.unforgeable && status === "not_accepted") {
+    // unforgeable：不能自动接取/上报进度，但上游完成后可以手动领奖。
+    // 只在「未接取」时提示；accepted / completed / claimed 不再显示这条，避免噪音。
+    actions.append(
+      el("span", {
+        class: "muted",
+        text: "不参与自动做任务",
+        title: "完成后仍可点「领奖」；自动做任务/上报进度不可用",
+      }),
+    );
   } else if (status === "not_accepted" && code === "") {
     // 窄守卫：快照真缺任务码时才提示（规范化后的快照 code 恒非空）
     actions.append(el("span", { class: "muted", text: "快照缺任务码，无法接取" }));
-  } else if (status === "not_accepted" && f.modern) {
-    // 引擎判定现在不能接（已接过 / 未收录 / 桌面端族）—— 不静默，给一句说明
+  } else if (status === "not_accepted" && f.modern && !f.locked) {
+    // 引擎判定现在不能接（已接过 / 未收录 / 桌面端族）—— 不静默，给一句说明。
+    // 锁定行排除在外：锁文案已由任务列承担，这里再放一句就是重复（reason 为空时还会退化成
+    // 「引擎判定不可自动接取」，对锁定行是误导）。
     actions.append(el("span", { class: "muted", text: f.reason || "引擎判定不可自动接取" }));
   }
 
-  // 领奖：维持既有条件（completed，或进度已达标；claimed 不再给按钮）
-  if (claimableTask(t)) {
+  // 领奖：维持既有条件（completed，或进度已达标；claimed 不再给按钮）。
+  // 缺码不给按钮（无从 POST）—— 缺码守卫在调用方，不在 claimableTask 里。
+  if (claimableTask(t) && code !== "") {
     actions.append(
       el("button", {
         type: "button",
@@ -955,6 +1038,15 @@ function taskRow(a, t) {
   // 锁定徽章 ⇐ locked === true；桌面端徽章 ⇐ desktopOnly === true；
   // 无法自动化徽章 ⇐ unforgeable === true（附 reason 原文）；
   // pinnedExpertId 非空时给一个等宽短串（次要信息，全值在 title）。
+  // 「不可自动化 / 需桌面端」的原因两条来源说的是同一件事（例：skill_share 的 reason
+  // 「需电脑端 5.9.0+ 的技能详情页用「分享」发给好友」 vs description 上游原文「升级到电脑端
+  // 至5.9.0或以上…」），同一行渲染两遍就是重复。规则：**description 非空只显示它**（上游原文
+  // 信息更全），reason 收进徽章 title；description 为空时才退回显示 reason。
+  const banner = f.unforgeable || f.desktopOnly;
+  const descNote = banner ? String(t.description ?? "").trim() : "";
+  const bannerReason = banner ? f.reason : "";
+  const reasonInTitle = descNote && bannerReason ? `\n上游说明：${bannerReason}` : "";
+
   const marks = [];
   if (isMPTask(t)) {
     const b = badge("小程序", "badge-quiet");
@@ -968,12 +1060,12 @@ function taskRow(a, t) {
   }
   if (f.desktopOnly) {
     const b = badge("需在桌面端完成", "badge-warn");
-    b.title = "引擎判定：伪造事件不推进、领奖必失败，只能在本机桌面 App 完成";
+    b.title = `引擎判定：伪造事件不推进、领奖必失败，只能在本机桌面 App 完成${reasonInTitle}`;
     marks.push(b);
   }
   if (f.unforgeable) {
     const b = badge("无法自动化", "badge-warn");
-    b.title = "引擎判定：无法自动化，不接取 / 不上报 / 不领奖";
+    b.title = `引擎判定：不能自动接取/上报进度；完成后仍可在看板手动领奖${reasonInTitle}`;
     marks.push(b);
   }
   if (f.pinnedExpertId) {
@@ -985,8 +1077,10 @@ function taskRow(a, t) {
       }),
     );
   }
-  const reasonNote = f.reason && (f.unforgeable || f.desktopOnly) ? f.reason : "";
-  // 锁定行在任务标题下给可见提示（不只放 title）；reason 原文仍单独展示
+  // 行说明只留一条：description 非空时它就是唯一说明（reason 已在徽章 title 里），
+  // 为空才退回 reason —— 两行不会再说同一件事。
+  const reasonNote = descNote ? "" : bannerReason;
+  // 锁定行在任务标题下给可见提示（不只放 title）；上游原文说明单独占一行
   const lockNote = f.locked ? lockText : "";
   const pickTitle = f.locked
     ? lockText
@@ -1026,6 +1120,7 @@ function taskRow(a, t) {
       marks.length ? el("div", { class: "cell-badges" }, marks) : null,
       lockNote ? el("div", { class: "row-note", text: lockNote }) : null,
       reasonNote ? el("div", { class: "row-note", text: reasonNote }) : null,
+      descNote ? el("div", { class: "row-note row-desc", text: descNote, title: descNote }) : null,
     ),
     el("td", { "data-label": "状态" }, acceptBadge(status)),
     el("td", { "data-label": "进度" }, progressCell(t.progress)),
@@ -1164,7 +1259,11 @@ async function refreshSnap(uid, btn) {
     const d = await api("api/state", { params: { refresh: uid } });
     state.data = d;
     renderAll();
-    toast(`已刷新 ${uid} 的任务快照`);
+    toast(`已刷新 ${accountByUid(uid)?.nickname || uid} 的任务快照`);
+    // 0.3.4：账号行里的「查询 / 重新查询连登」按钮已删 —— 刷新快照成功后顺带静默补查一次连登
+    // （GET /api/streak?uid=<uid>&refresh=1），只更新该账号的连登区。
+    // 静默口径：不弹任何 toast；批量任务在跑时 daemon 回 409 busy，直接跳过（刷新快照本身不失败）。
+    await queryStreak(uid);
   } catch (e) {
     humanErr(e, "刷新快照失败");
     const b = $(`[data-snap-refresh="${uid}"]`);
@@ -1304,8 +1403,9 @@ function accountRow(a) {
   const isApiKey = String(a.masked ?? "").startsWith("API key");
   const uid = String(a.uid ?? "");
   const name = String(a.nickname || uid || "（无昵称）");
+  // 域名 + uid 不再单独占一行（.acct-sub 已删）：并进昵称的 title，信息不丢、行高不涨。
   const metaBits = [a.domain, uid].filter((x) => x != null && x !== "");
-  const metaText = metaBits.length ? metaBits.join(" · ") : "（无 uid）";
+  const nameTitle = metaBits.length ? `${name} · ${metaBits.join(" · ")}` : name;
 
   const check = el("input", {
     type: "checkbox",
@@ -1322,6 +1422,10 @@ function accountRow(a) {
   });
 
   const st = accountBadge(a);
+  // 冻结（CONTRACT §10.5）是行级状态：醒目红色徽章放在凭据栏（同一列组，一眼看到）。
+  // frozen 非空 → 该账号不进排程 / 批量缺省目标；参与开关与任务按钮按现状保留，
+  // 但整行加 .acct-frozen 视觉标注「不会被调度」。
+  const frozen = frozenOf(a);
   const statusCell = el(
     "div",
     { class: "acct-cell acct-status", dataset: { label: "凭据" } },
@@ -1329,6 +1433,7 @@ function accountRow(a) {
       "span",
       { class: "cell-stack" },
       st.node,
+      frozen ? frozenBadge(frozen) : null,
       el("span", { class: st.subWarn ? "acct-note warn-text" : "acct-note", text: st.sub }),
     ),
   );
@@ -1389,13 +1494,16 @@ function accountRow(a) {
   );
 
   const toggling = state.toggling.has(uid);
+  const toggleTitle = isApiKey
+    ? "API key 账号不参与任务（批量与排程都会跳过）"
+    : frozen
+      ? `已冻结（${frozenCode(frozen)}）：开关照旧可切，但冻结解除前批量操作与排程都会跳过它`
+      : "参与任务：关闭后该账号不进入批量操作与排程（POST /api/account/toggle，立即生效并持久化）";
   const toggle = el(
     "label",
     {
       class: "switch-inline acct-toggle",
-      title: isApiKey
-        ? "API key 账号不参与任务（批量与排程都会跳过）"
-        : "参与任务：关闭后该账号不进入批量操作与排程（POST /api/account/toggle，立即生效并持久化）",
+      title: toggleTitle,
     },
     el("input", {
       type: "checkbox",
@@ -1411,16 +1519,24 @@ function accountRow(a) {
   const sideCell = el(
     "div",
     { class: "acct-cell acct-side", dataset: { label: "操作" } },
-    isApiKey
+    isApiKey && !frozen
       ? el("span", { class: "muted", text: "—" })
-      : el("button", {
-          type: "button",
-          class: "mini-btn",
-          dataset: { snapRefresh: uid },
-          text: "刷新快照",
-          title: "只读刷新：读取上游任务快照，不会接取任务也不会上报进度",
-          onclick: (ev) => refreshSnap(uid, ev.target),
-        }),
+      : el(
+          "div",
+          { class: "side-actions" },
+          // 冻结行第一位就是「恢复」：解冻是唯一的解锁动作，别让它藏在别处
+          frozen ? unfreezeButton(uid) : null,
+          isApiKey
+            ? null
+            : el("button", {
+                type: "button",
+                class: "mini-btn",
+                dataset: { snapRefresh: uid },
+                text: "刷新快照",
+                title: "只读刷新：读取上游任务快照，不会接取任务也不会上报进度",
+                onclick: (ev) => refreshSnap(uid, ev.target),
+              }),
+        ),
   );
 
   const expired = snapExpired(a.snapshot);
@@ -1442,7 +1558,9 @@ function accountRow(a) {
       }),
       el("span", { class: "acct-tasks-meta", text: snapMetaText }),
     ),
-    el("div", { class: "acct-tasks-body" }, snapMetrics(a.snapshot), taskTable(a)),
+    // 连登日历搬进「任务明细」详情里（任务表上方，0.3.4）：它是「这个账号最近发生了什么」
+    // 的明细，和任务表同属展开区；账号行只留昵称右侧那两行数字 + 档位。
+    el("div", { class: "acct-tasks-body" }, snapMetrics(a.snapshot), heatPanel(a), taskTable(a)),
   );
   if (state.expanded.has(uid)) tasks.open = true;
   tasks.addEventListener("toggle", () => {
@@ -1452,16 +1570,22 @@ function accountRow(a) {
 
   return el(
     "div",
-    { class: "acct", role: "group", "aria-label": `账号 ${name}` },
+    {
+      class: frozen ? "acct acct-frozen" : "acct",
+      role: "group",
+      "aria-label": `账号 ${name}${frozen ? `（已冻结 ${frozenCode(frozen)}）` : ""}`,
+    },
     el(
       "div",
       { class: "acct-grid" },
       el("div", { class: "acct-cell acct-pick" }, el("label", { class: "check" }, check)),
+      // 账号单元格横向：左边昵称，右边紧跟两行连登信息（数字 + 三档状态）。
+      // 原来横跨整行的 .acct-streak（含按钮与日历）已取消。
       el(
         "div",
         { class: "acct-cell acct-id" },
-        el("span", { class: "acct-name", text: name, title: name }),
-        el("span", { class: "acct-sub", text: metaText, title: metaText }),
+        el("span", { class: "acct-name", text: name, title: nameTitle }),
+        streakCellBlock(a),
       ),
       statusCell,
       progressCell,
@@ -1473,7 +1597,32 @@ function accountRow(a) {
   );
 }
 
+// 版本一致性横幅（0.3.4）：静态文件版本（<meta name="wb-version">）vs 守护进程
+// /api/hello 的 version。不一致 = 「插件文件更新了、端口上还是老进程健康复用」这个坑 ——
+// 报「重启插件」这一步。一致 / hello 没拿到（引擎与守护进程都没起来）→ 不显示，不多报。
+// 版本不一致提示：挂在 appbar 的「实时 · SSE」右边（用户 2026-11-11 指定位置），
+// 做成一颗告警胶囊 —— 顶栏是横条，放整段解释会把状态栏撑高，所以可见文案只留
+// 短句（两个版本号），完整解释进 title。守护进程健康（版本一致）时整颗隐藏。
+function renderVersionPill() {
+  const pill = $("#verPill");
+  if (!pill) return;
+  const fileV = staticVersion();
+  const svcV = String(state.hello?.version ?? "").trim();
+  if (!fileV || !svcV || fileV === svcV) {
+    pill.hidden = true;
+    pill.textContent = "";
+    pill.removeAttribute("title");
+    return;
+  }
+  pill.hidden = false;
+  pill.textContent = `守护进程版本落后（v${svcV} ≠ v${fileV}）`;
+  pill.title =
+    `插件文件是 v${fileV}，守护进程还在跑 v${svcV} —— 通常是更新后没重启守护进程；` +
+    "在 magpie 里关掉再开启本插件即可（或点看板顶栏「停止守护进程」后重新拉起）。";
+}
+
 function renderBanners() {
+  renderVersionPill(); // 顶栏胶囊，与账号区横幅无关；每次都按当前 hello 重算
   const box = $("#accountsBanners");
   box.replaceChildren();
   const d = state.data;
@@ -1512,6 +1661,24 @@ function renderIntlNote() {
   box.hidden = false;
 }
 
+// 企业版说明行：与 #intlNote 一模一样的样式与位置。数字取 /api/state 顶层
+// enterpriseSkipped.count，文案优先用后端的 note；缺失或为 0 时整行不显示。
+// 纪律：绝不渲染任何企业版账号内容（uid / 昵称 / 域名），只出计数与说明。
+function renderEnterpriseNote() {
+  const box = $("#enterpriseNote");
+  if (!box) return;
+  const count = Number(state.data?.enterpriseSkipped?.count);
+  if (!Number.isFinite(count) || count <= 0) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  const note = String(state.data?.enterpriseSkipped?.note ?? "").trim();
+  box.textContent =
+    note || `已忽略 ${count} 个企业版账号：企业版没有成长任务与签到，本插件只服务个人版`;
+  box.hidden = false;
+}
+
 function renderAccounts() {
   const box = $("#accountsList");
   box.replaceChildren();
@@ -1524,6 +1691,8 @@ function renderAccounts() {
     count.textContent = accounts.length ? `${accounts.length} 个账号 · ${eligible} 个参与` : "暂无账号";
   }
   renderIntlNote();
+  renderEnterpriseNote();
+  renderFrozenNote();
   if (!accounts.length) {
     box.append(
       el(
@@ -1778,7 +1947,7 @@ async function requestCredits(uid, refresh = false) {
       return {
         ok: false,
         kind: "upstream",
-        error: String(d.error || "上游查询失败"),
+        error: humanizeApiErr(String(d.error || "上游查询失败"), d.hint),
         needRelogin: !!d.needRelogin,
         nickname: d.nickname,
       };
@@ -1787,11 +1956,15 @@ async function requestCredits(uid, refresh = false) {
   } catch (e) {
     if (e instanceof ApiError) {
       if (e.status === 409) return { ok: false, kind: "busy", error: "批量任务运行中，稍后再查" };
-      if (e.status === 404) return { ok: false, kind: "notfound", error: "未知账号（可能已被移除）" };
-      return { ok: false, kind: "http", error: e.message || `HTTP ${e.status}` };
+      // 404 既可能是「账号不存在」，也可能是「老守护进程没这个路由（未知 API）」。
+      // 后者是版本落后，不能误报成账号不存在 —— 交给统一改写函数区分。
+      if (e.status === 404 && !UNKNOWN_API_RE.test(e.message)) {
+        return { ok: false, kind: "notfound", error: "未知账号（可能已被移除）" };
+      }
+      return { ok: false, kind: "http", error: humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint) };
     }
     if (e && e.network) return { ok: false, kind: "network", error: "连不上守护进程" };
-    return { ok: false, kind: "error", error: String((e && e.message) || e) };
+    return { ok: false, kind: "error", error: humanizeApiErr(String((e && e.message) || e)) };
   }
 }
 
@@ -2233,6 +2406,564 @@ function wireCreditsDialog() {
   });
 }
 
+// ---- 连登管家 / 冻结账号（0.3.3，CONTRACT §10） -----------------------------------------
+// 数据面（后端并行实现期间按「字段可能缺席」处理）：
+//   GET  /api/streak?uid=<uid>&refresh=0|1 -> {uid, cached, streak|null, error?}
+//   POST /api/streak/run {uids?}           -> {results:[{uid,outcome,earned,message,detail}]}
+//   POST /api/account/unfreeze {uid}|{uids}-> {ok, unfrozen[], missing[]}
+//   /api/state：accounts[].streak / accounts[].frozen / 顶层 frozen[] 都是只读投影。
+// 容错铁律：streak / frozen 为 undefined（后端还没落地）一律按 null 处理 —— 显示「未查询」，
+// 绝不抛错、绝不白屏；每个形状都先过 typeof / Array.isArray 守卫，缺字段不猜。
+// 纪律：结果不静默 —— 查询失败写进按钮 title（同积分列口径），连登管家的每个账号结果
+// 都同时进「行内状态行（state.streakRuns）」+ toast，轮询重绘后仍看得见。
+
+const STREAK_TIERS = ["7d", "14d", "28d"];
+const TIER_NAMES = { "7d": "7 天", "14d": "14 天", "28d": "28 天" };
+// 档位状态：engine/streak.mjs 只有 locked / claimed / available（available 才兑换）；
+// 上游将来给别的字符串原样展示，不硬映射成已知值。
+const TIER_STATUS_TEXT = { available: "可兑换", claimed: "已兑换", locked: "未达成" };
+// 三种状态必须一眼分得开（0.3.4）：可兑换 = 实心主色（可用态）、已兑换 = 成功色 + ✓、
+// 未达成 = 中性灰弱化（透明底 + 灰边灰字）。未知状态走 .tier-unknown（中性虚线），
+// 绝不落进成功色 —— 不把「不知道」显示成「已完成」。
+const TIER_STATUS_CLS = { available: "tier-available", claimed: "tier-claimed", locked: "tier-locked" };
+const TIER_STATUS_UNKNOWN_CLS = "tier-unknown";
+
+// 本地已查到的连登状态：跨 /api/state 轮询保留（同 creditCache 的理由 —— 后端投影为 null /
+// 尚未落地时，不会把刚查到的值刷回「未查询」）。
+const streakCache = new Map(); // uid -> 连登状态
+
+function streakNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// accounts[i].streak 的对象形状，或本地缓存；undefined / null / 非对象 → null（= 未查询）
+function streakOf(a) {
+  const s = a?.streak;
+  if (s && typeof s === "object") return s;
+  const c = streakCache.get(String(a?.uid ?? ""));
+  return c && typeof c === "object" ? c : null;
+}
+
+function streakTierOf(st, tier) {
+  const list = Array.isArray(st?.tiers) ? st.tiers : [];
+  const hit = list.find((t) => String(t?.tier ?? "") === tier);
+  return hit ? String(hit.status ?? "").trim() : "";
+}
+
+// accounts[i].frozen = {at, code, message}｜null；非空 = 已冻结（403 / 11140）。
+// undefined → null；形状异常（布尔 / 裸字符串）也不抛错，按「已冻结 + 无详情」渲染。
+function frozenOf(a) {
+  const f = a?.frozen;
+  if (f == null || f === false) return null;
+  if (f === true) return {};
+  if (typeof f === "object") return f;
+  return { message: String(f) };
+}
+
+function frozenCode(f) {
+  const c = f?.code;
+  return c == null || c === "" ? "11140" : String(c);
+}
+
+// 冻结徽章：醒目红色（.badge-danger）；悬停给时间 / 原因 / 处置口径（CONTRACT §10.5）
+function frozenBadge(f) {
+  const b = badge(`已冻结（${frozenCode(f)}）`, "badge-danger");
+  const at = f?.at ? fmtDateTime(f.at) : "时间未知";
+  const why = String(f?.message ?? "").trim() || "上游返回 403 / code 11140";
+  b.title = `冻结于 ${at}：${why}\n同设备连坐，需人工确认后恢复（点右侧「恢复」，冻结不会再自动解除）`;
+  return b;
+}
+
+// 档位徽章：7d / 14d / 28d 三个状态；tiers 缺失时显示「未知」，不硬编造状态。
+// 三种已知状态各有一枚专属 class（.tier-available / .tier-claimed / .tier-locked），
+// 状态字符串不认识时原样显示，走 .tier-unknown（中性，非成功色）。
+function streakTierBadges(st) {
+  return STREAK_TIERS.map((tier) => {
+    const status = streakTierOf(st, tier);
+    const b = badge(
+      `${TIER_NAMES[tier]}：${TIER_STATUS_TEXT[status] ?? (status || "未知")}`,
+      TIER_STATUS_CLS[status] ?? TIER_STATUS_UNKNOWN_CLS,
+    );
+    b.title = status
+      ? `连登 ${TIER_NAMES[tier]} 档：${status}（available 可兑换 / claimed 已兑换 / locked 未达成）`
+      : `连登 ${TIER_NAMES[tier]} 档：上游未给出状态`;
+    return b;
+  });
+}
+
+// 连登日历：纯 CSS grid 小格子（7 列 = 周一…周日），默认折叠（避免账号行过高）。
+// 上游一次给一整年（365 格），全渲染。
+// 每格 title = 日期 + score；score=0 淡色，>0 按固定阈值分 3 档深浅（阈值写死在 heatLevel，
+// 与上游数值量级无关，只做视觉分档）。日历数据只读后端给的 heatmap 数组，前端不自己算区间。
+const HEAT_WEEK = ["一", "二", "三", "四", "五", "六", "日"];
+
+function heatLevel(score) {
+  const s = streakNum(score);
+  if (s <= 0) return 0;
+  if (s <= 2) return 1;
+  if (s <= 5) return 2;
+  return 3;
+}
+
+// 北京日期 "YYYY-MM-DD" 的星期（0=周日）。用 Date.UTC 解析：本地时区在东八区以西时
+// new Date("YYYY-MM-DD") 会退到前一天，getDay() 就错一列。
+function dayOfWeek(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr ?? "").trim());
+  if (!m) return null;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return Number.isNaN(d.getTime()) ? null : d.getUTCDay();
+}
+
+// 日历显示窗口（天）。上游 /activity/growth/heatmap 一次回**一整年** 365 格，
+// 全铺出来在账号行里是 53 行、807px 高的细长条，而且近期才有分的格子全压在底部 ——
+// 看着就像布局坏了（2026-11-11 实测确认：网格与配色本身没错，是窗口太大）。
+// 只渲染最近 28 天（正好对齐 28d 档位的口径）：4–5 行、约 75px 高。
+const HEAT_WINDOW_DAYS = 28;
+
+function heatmapBlock(a, st) {
+  const uid = String(a.uid ?? "");
+  const all = (Array.isArray(st?.heatmap) ? st.heatmap : [])
+    .map((h) => ({ date: String(h?.date ?? "").trim(), score: streakNum(h?.score) }))
+    .filter((h) => h.date);
+  // 上游按日期升序返回，取尾部 = 最近 28 天
+  const cells = all.slice(-HEAT_WINDOW_DAYS);
+  const details = el("details", { class: "heat", dataset: { heat: uid } });
+  if (state.heatOpen.has(uid)) details.open = true;
+  const hit = cells.filter((h) => h.score > 0).length;
+  const total = cells.reduce((n, h) => n + h.score, 0);
+  // 全年口径的一年一次统计只放在汇总文案里（不渲染出来），免得又变成细长条
+  const yearHit = all.filter((h) => h.score > 0).length;
+  const summary = el(
+    "summary",
+    {
+      class: "heat-summary",
+      title: `连登日历：每格一天，颜色越深当天连登分越高（只画最近 ${HEAT_WINDOW_DAYS} 天；上游一次给一整年）`,
+    },
+    el("span", { class: "heat-label", text: `连登日历 · 近 ${HEAT_WINDOW_DAYS} 天` }),
+    el("span", {
+      class: "heat-meta",
+      text: cells.length
+        ? `${hit}/${cells.length} 天有记录 · 合计 ${total}${all.length > cells.length ? ` · 全年 ${yearHit} 天` : ""}`
+        : "无数据",
+    }),
+  );
+  const grid = el("div", { class: "heat-grid" });
+  for (const w of HEAT_WEEK) grid.append(el("span", { class: "heat-w", text: w, "aria-hidden": "true" }));
+  if (!cells.length) {
+    grid.append(el("span", { class: "heat-none", text: "暂无日历数据（点账号行「刷新快照」读取）" }));
+  } else {
+    // 周一起排：周日(0) 要补 6 格，其它补 dow-1 格
+    const dow = dayOfWeek(cells[0].date);
+    const lead = dow == null ? 0 : (dow + 6) % 7;
+    for (let i = 0; i < lead; i++) grid.append(el("span", { class: "heat-pad", "aria-hidden": "true" }));
+    for (const c of cells) {
+      grid.append(
+        el("span", {
+          class: `heat-cell heat-l${heatLevel(c.score)}`,
+          title: `${c.date} · score ${c.score}`,
+          "aria-label": `${c.date} score ${c.score}`,
+        }),
+      );
+    }
+  }
+  details.append(summary, el("div", { class: "heat-body" }, grid));
+  // 折叠状态存进 state：renderAccounts 每 3s 重建 DOM，不记就每次都被折回去
+  details.addEventListener("toggle", () => {
+    if (details.open) state.heatOpen.add(uid);
+    else state.heatOpen.delete(uid);
+  });
+  return details;
+}
+
+// 连登日历面板（0.3.4）：从账号行的连登块搬进「任务明细」详情里（任务表上方）。
+// 单独包一层带锚点的 div（[data-heat-cell]），好让连登查询后就地替换这一块，
+// 不必整行重绘（整行重绘会打散任务勾选与展开状态）。日历本身仍是默认折叠的 <details>，
+// 展开状态按 uid 记在 state.heatOpen —— 3 秒轮询重建 DOM 不会把它折回去。
+function heatPanel(a) {
+  const uid = String(a.uid ?? "");
+  return el("div", { class: "heat-panel", dataset: { heatCell: uid } }, heatmapBlock(a, streakOf(a)));
+}
+
+// 账号单元格里的「连登」两行（0.3.4）：昵称右边紧跟 —— 第 1 行数字（连登 / 补签卡 / 抽奖），
+// 第 2 行三档状态徽章。原来是账号网格下方一整条 .acct-streak：查询 / 连登管家两个按钮没了
+// （连登查询并进「刷新快照」，连登管家在批量操作条上），日历搬进了「任务明细」。
+// 锚点仍是 [data-streak-cell="uid"]，updateStreakArea() 依赖它 replaceWith 局部重绘，
+// 所以它必须**唯一存在**（一个账号一个）。
+// 额外说明行（冻结 / 最近一次连登管家结果 / 连登查询失败）只在有内容时追加，
+// 正常情况就是干净的两行；不静默、也不凭空多占行高。
+function streakCellBlock(a) {
+  const uid = String(a.uid ?? "");
+  const st = streakOf(a);
+  const err = state.streakErrors.get(uid);
+  const run = state.streakRuns.get(uid);
+  const frozen = frozenOf(a);
+  const kids = [];
+
+  if (!st) {
+    // 未查询就如实说未查询（后端还没落地 / 还没查过），绝不拿 0 冒充「连登 0 天」。
+    kids.push(el("span", { class: "streak-line streak-empty", text: "连登：未查询" }));
+    kids.push(el("span", { class: "streak-line streak-empty", text: "档位：未查询" }));
+  } else {
+    const updated = String(st.updatedISO ?? "").trim();
+    kids.push(
+      el(
+        "span",
+        {
+          class: "streak-line",
+          title: updated ? `更新于 ${fmtDateTime(updated)}` : "上游未给更新时间",
+        },
+        el(
+          "span",
+          { class: "streak-item", title: "连登天数（streak.days）" },
+          "连登 ",
+          el("b", { class: "streak-v", text: `${streakNum(st.days)} 天` }),
+        ),
+        " · ",
+        el(
+          "span",
+          { class: "streak-item", title: "补签卡余额（makeup_cards.balance）：>0 且昨日为 0 才补签" },
+          "补签卡 ",
+          el("b", { class: "streak-v", text: String(streakNum(st.makeupCards)) }),
+        ),
+        " · ",
+        el(
+          "span",
+          { class: "streak-item", title: "抽奖机会（lottery/summary 的 chances）：为 0 时连登管家不抽" },
+          "抽奖 ",
+          el("b", { class: "streak-v", text: `${streakNum(st.lotteryChances)} 次` }),
+        ),
+      ),
+      el("span", { class: "streak-line streak-tiers" }, ...streakTierBadges(st)),
+    );
+    // 全部子请求都失败时 streak 里带 ok:false + error（部分失败仍是 ok:true）——如实说出来
+    if (st.ok === false && st.error) {
+      kids.push(el("span", { class: "streak-note streak-err warn-text", text: `上游读取失败：${String(st.error)}` }));
+    }
+  }
+
+  if (frozen) {
+    const t = `已冻结（${frozenCode(frozen)}）：批量操作 / 排程 / 签到 / 连登管家都会跳过它；显式点到会如实失败。确认风险解除后点「恢复」。`;
+    kids.push(el("span", { class: "streak-note warn-text", text: t, title: t }));
+  }
+  // 最近一次「连登管家」结果（含批量那次）：原来在连登条上，现在跟在两行信息后面
+  // （账号单元格窄，CSS 限两行 + title 给全文，行高不被一句长文案顶起来）
+  if (run) {
+    kids.push(
+      el("span", {
+        class: run.ok ? "streak-note streak-run" : "streak-note streak-run warn-text",
+        text: run.text,
+        title: run.text,
+      }),
+    );
+  }
+  // 连登查询失败（含「刷新快照」顺带补查时失败）：按钮没了，失败原因就落在这里，不弹错也不吞掉
+  if (err) {
+    const t = `连登查询失败：${err}`;
+    kids.push(el("span", { class: "streak-note streak-err warn-text", text: t, title: t }));
+  }
+  return el("div", { class: "acct-streak", dataset: { streakCell: uid } }, ...kids);
+}
+
+// 只重绘连登区（同 updateCreditsCell 的理由：不打散任务勾选 / 折叠 / 输入焦点）。
+// 两个锚点：[data-streak-cell]（昵称右侧两行）+ [data-heat-cell]（任务明细里的日历面板）。
+function updateStreakArea(uid) {
+  const acct = accountByUid(uid);
+  if (!acct) return;
+  const box = $(`[data-streak-cell="${uid}"]`);
+  if (box) box.replaceWith(streakCellBlock(acct));
+  const heat = $(`[data-heat-cell="${uid}"]`);
+  if (heat) heat.replaceWith(heatPanel(acct));
+}
+
+function applyStreak(uid, streak) {
+  const acct = accountByUid(uid);
+  if (acct) acct.streak = streak;
+  if (streak && typeof streak === "object") streakCache.set(uid, streak);
+  state.streakErrors.delete(uid);
+  updateStreakArea(uid);
+}
+
+// HTTP 错误 / 空返回统一转成可渲染结果，绝不抛（调用方不用 try/catch）。
+async function requestStreak(uid, refresh) {
+  try {
+    const d = await api("api/streak", { params: { uid, refresh: refresh ? 1 : 0 } });
+    const s = d?.streak;
+    if (s && typeof s === "object") return { ok: true, streak: s };
+    // streak:null + error = 上游读不到；streak:null 无 error = 该账号还没查过（后端也没缓存）
+    return { ok: false, kind: "empty", error: humanizeApiErr(String(d?.error || "上游没有返回连登状态"), d?.hint) };
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 409) return { ok: false, kind: "busy", error: "批量任务运行中，稍后再查" };
+      if (e.status === 404) {
+        // 「未知 API：GET /api/streak」= 老守护进程没有这个路由（版本落后，改写成人话）；
+        // 其余 404 = 账号不存在。两者都如实说，后者保留原文兜底。
+        const hasBody = e.message && e.message !== "HTTP 404";
+        return {
+          ok: false,
+          kind: "absent",
+          error: hasBody
+            ? humanizeApiErr(e.message, e.data?.hint)
+            : "账号不存在，或 /api/streak 还没实现（后端需 0.3.3）",
+        };
+      }
+      return { ok: false, kind: "http", error: humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint) };
+    }
+    if (e && e.network) return { ok: false, kind: "network", error: "连不上守护进程" };
+    return { ok: false, kind: "error", error: humanizeApiErr(String((e && e.message) || e)) };
+  }
+}
+
+// 查询连登状态（refresh=1；是否真打上游由 daemon 的 10 分钟缓存定）。
+// 0.3.4：账号行里的「查询 / 重新查询」按钮取消 —— 唯一触发点是单账号「刷新快照」的顺带补查，
+// 所以默认 silent：不弹任何 toast；批量任务在跑时 daemon 回 409 busy → 静默跳过（连错误行都不留）。
+// 其它失败仍如实写进 state.streakErrors，由连登区那行「连登查询失败：…」显示（不弹错 ≠ 吞掉）。
+// silent:false 留给「将来若再给显式查询入口」用（显式点击要即时反馈）。
+async function queryStreak(uid, { silent = true } = {}) {
+  if (state.streakBusy.has(uid)) return { ok: false, kind: "pending", error: "正在查询连登状态" };
+  state.streakBusy.add(uid);
+  updateStreakArea(uid);
+  try {
+    const r = await requestStreak(uid, true);
+    const who = accountByUid(uid)?.nickname || uid;
+    if (r.ok) {
+      applyStreak(uid, r.streak);
+      if (!silent) {
+        const s = r.streak;
+        toast(`${who}：连登 ${streakNum(s.days)} 天 · 补签卡 ${streakNum(s.makeupCards)} · 抽奖 ${streakNum(s.lotteryChances)} 次`);
+      }
+      return r;
+    }
+    // 批量任务在跑：静默跳过（刷新快照的主动作不该被这条补查带出错误提示）
+    if (silent && r.kind === "busy") return r;
+    state.streakErrors.set(uid, r.error);
+    if (!silent) {
+      if (r.kind === "busy") toastCreditsBusy();
+      else toast(`${who}：连登查询失败 —— ${r.error}`, "warn", 8000);
+    }
+    return r;
+  } finally {
+    state.streakBusy.delete(uid);
+    updateStreakArea(uid);
+  }
+}
+
+// 「连登管家」结果 → 一行中文（CONTRACT §10.2 的 results[i]）。
+// 只认契约字段：outcome ok|skipped|failed、earned、message、detail{makeupUsed,makeupDate,
+// gifts[],redeemed[],drawn}；缺字段不猜、不抛。纯函数（导出仅供 Node 下校验）。
+export function streakResultText(r, who) {
+  const name = String(who || r?.uid || "账号");
+  const outcome = String(r?.outcome ?? "");
+  const detail = r?.detail && typeof r.detail === "object" ? r.detail : {};
+  const bits = [];
+  if (detail.makeupUsed) bits.push(`补签 ${String(detail.makeupDate ?? "").trim() || "昨日"}`);
+  // 礼包只报名字：金额统一走 earned（后端已汇总，避免同一笔积分报两遍）
+  for (const g of Array.isArray(detail.gifts) ? detail.gifts : []) {
+    if (g == null) continue;
+    const gn = String(g?.name ?? "").trim();
+    if (gn) bits.push(gn);
+  }
+  const redeemed = (Array.isArray(detail.redeemed) ? detail.redeemed : [])
+    .map((t) => TIER_NAMES[String(t)] ?? String(t))
+    .filter(Boolean);
+  if (redeemed.length) bits.push(`兑换 ${redeemed.join(" / ")}档`);
+  const drawn = streakNum(detail.drawn);
+  if (drawn > 0) bits.push(`抽奖 ${drawn} 次`);
+  const earned = streakNum(r?.earned);
+  if (earned > 0) bits.push(`+${fmtNum(earned)} 积分`);
+  // outcome 只认契约三值；其它/缺失一律「结果未知」—— 绝不把未知说成成功
+  const head = outcome === "failed" ? "失败" : outcome === "skipped" ? "跳过" : outcome === "ok" ? "完成" : "结果未知";
+  const tail = bits.length ? `：${bits.join(" · ")}` : "";
+  const msg = String(r?.message ?? "").trim();
+  // 失败 / 跳过时 message 是重点（冻结原因、企业版说明…）；成功且有明细时不重复 message
+  const msgPart = msg && (outcome !== "ok" || !bits.length) ? `（${msg}）` : "";
+  return `${name}：连登管家${head}${tail}${msgPart}`;
+}
+
+// 用运行结果里的 detail 更新行内数字（同一轮上游读到的值 → 比等下一次查询更即时）。
+// 只在已经查过（本地有状态）时合并：不凭一条运行结果凭空造出连登状态。
+function mergeStreakDetail(uid, detail) {
+  if (!detail || typeof detail !== "object") return;
+  const cur = streakCache.get(uid) ?? accountByUid(uid)?.streak;
+  if (!cur || typeof cur !== "object") return;
+  const next = { ...cur };
+  for (const k of ["days", "makeupCards", "lotteryChances"]) {
+    const v = Number(detail[k]);
+    if (Number.isFinite(v)) next[k] = v;
+  }
+  applyStreak(uid, next);
+}
+
+function rememberStreakRun(uid, row, who) {
+  const key = String(uid ?? "").trim();
+  // 没有 row（后端没给这个账号的结果）不算成功：如实标红，不静默
+  const ok = !!row && String(row.outcome ?? "") !== "failed";
+  const text = row ? streakResultText(row, who) : `${who}：连登管家没有返回结果`;
+  if (!key) return { ok: false, text: text || `${who}：连登管家没有返回结果` };
+  state.streakRuns.set(key, { ok, text });
+  return { ok, text };
+}
+
+// 0.3.4：账号行里的「连登管家」按钮已删（用户口径：连登管家在批量条上已经有一个了）。
+// 单账号要跑就连登写清 uid 走批量接口 POST /api/streak/run {uids:[uid]}；界面入口统一在批量条。
+
+// 批量「连登管家」（批量操作条）：作用于勾选账号；未勾选 = 全部可参与账号（同 /api/checkin 口径）
+async function runStreakSelected() {
+  await withBusy(async () => {
+    const uids = [...state.selected];
+    setBatchStatus("连登管家运行中…（补签 → 礼包/补偿 → 档位兑换 → 抽奖；账号之间守护进程会间隔至少 1.5 秒）");
+    try {
+      const body = uids.length ? { uids } : {};
+      const r = await api("api/streak/run", { method: "POST", body });
+      const list = Array.isArray(r?.results) ? r.results : [];
+      if (!list.length) {
+        setBatchStatus("连登管家完成：没有可运行的账号。");
+        return;
+      }
+      let earned = 0;
+      let failed = 0;
+      const lines = list.map((row) => {
+        const ruid = String(row?.uid ?? "");
+        const who = accountByUid(ruid)?.nickname || ruid || "—";
+        const { ok, text } = rememberStreakRun(ruid, row, who);
+        if (!ok) failed++;
+        earned += streakNum(row?.earned);
+        if (row?.detail) mergeStreakDetail(ruid, row.detail);
+        return text;
+      });
+      const head = `连登管家完成：${list.length} 个账号 · 共 +${fmtNum(earned)} 积分${failed ? ` · ${failed} 个失败` : ""}`;
+      setBatchStatus(`${head}\n${lines.join("\n")}`);
+      toast(head, failed ? "warn" : "info", failed ? 9000 : 6500);
+      await loadState();
+    } catch (e) {
+      setBatchStatus("");
+      humanErr(e, "连登管家失败");
+    }
+  });
+}
+
+// 冻结总览：优先用顶层 frozen[]（CONTRACT §10.3），缺席时回退 accounts[].frozen。
+// 只出 [{uid, nickname, at, code, message}]；两处都不存在 = 空数组（老后端）。
+function frozenRows() {
+  const out = [];
+  const seen = new Set();
+  const top = state.data?.frozen;
+  if (Array.isArray(top)) {
+    for (const item of top) {
+      const f = item && typeof item === "object" ? item : null;
+      const uid = String(f?.uid ?? (typeof item === "string" ? item : "")).trim();
+      if (!uid || seen.has(uid)) continue;
+      seen.add(uid);
+      out.push({ uid, nickname: String(f?.nickname ?? ""), at: f?.at, code: f?.code, message: f?.message });
+    }
+  }
+  for (const a of state.data?.accounts ?? []) {
+    const uid = String(a?.uid ?? "");
+    if (!uid || seen.has(uid)) continue;
+    const f = frozenOf(a);
+    if (!f) continue;
+    seen.add(uid);
+    out.push({ uid, nickname: String(a?.nickname ?? ""), at: f.at, code: f.code, message: f.message });
+  }
+  return out;
+}
+
+// 批量区的冻结提示条：N 个账号已冻结 + 「全部恢复」。冻结账号不进排程 / 批量缺省目标，
+// 显式点到会如实失败（§10.5）—— 所以这里必须显式说出来，不能让它悄悄消失。
+function renderFrozenNote() {
+  const box = $("#frozenNote");
+  if (!box) return;
+  const rows = frozenRows();
+  box.replaceChildren();
+  if (!rows.length) {
+    box.hidden = true;
+    return;
+  }
+  const names = rows.map((r) => r.nickname || r.uid);
+  box.hidden = false;
+  box.append(
+    el("span", {
+      class: "frozen-text warn-text",
+      text: `${rows.length} 个账号已冻结（${names.slice(0, 3).join("、")}${names.length > 3 ? " 等" : ""}）`,
+      title: "冻结 = 上游 403 / code 11140：同设备账号会连坐，需人工确认后在账号行点「恢复」",
+    }),
+    el("button", {
+      type: "button",
+      class: "mini-btn",
+      id: "btnUnfreezeAll",
+      text: "全部恢复",
+      title: "POST /api/account/unfreeze {uids}：确认风险已解除后再恢复（会被二次确认）",
+      onclick: () => unfreezeSelected(),
+    }),
+  );
+}
+
+// 单账号恢复：POST /api/account/unfreeze {uid}（幂等；missing = 本来就没冻结）
+async function unfreezeOne(uid) {
+  if (state.unfreezing.has(uid)) return;
+  const who = accountByUid(uid)?.nickname || uid;
+  state.unfreezing.add(uid);
+  renderAccounts();
+  try {
+    const r = await api("api/account/unfreeze", { method: "POST", body: { uid } });
+    const missing = (Array.isArray(r?.missing) ? r.missing : []).map((x) => String(x));
+    toast(
+      missing.includes(uid)
+        ? `${who}：本来就没有冻结（无需恢复）`
+        : `${who}：已恢复 —— 冻结解除，可重新参与批量操作与排程`,
+    );
+    await loadState();
+  } catch (e) {
+    humanErr(e, "恢复失败");
+  } finally {
+    state.unfreezing.delete(uid);
+    renderAccounts();
+  }
+}
+
+// 批量恢复：POST /api/account/unfreeze {uids}（先二次确认：解冻是风控决定，不能手滑）
+async function unfreezeSelected() {
+  const rows = frozenRows();
+  if (!rows.length) {
+    toast("当前没有已冻结的账号。");
+    return;
+  }
+  const names = rows.map((r) => r.nickname || r.uid).join("、");
+  const ok = confirm(
+    `恢复 ${rows.length} 个已冻结账号？\n\n${names}\n\n冻结来自上游 403 / code 11140，同设备账号会连坐：请先确认风险已解除再恢复。恢复后它们会重新进入批量操作与排程。`,
+  );
+  if (!ok) return;
+  const uids = rows.map((r) => r.uid);
+  for (const u of uids) state.unfreezing.add(u);
+  renderAccounts();
+  try {
+    const r = await api("api/account/unfreeze", { method: "POST", body: { uids } });
+    const unfrozen = (Array.isArray(r?.unfrozen) ? r.unfrozen : []).length;
+    const missing = (Array.isArray(r?.missing) ? r.missing : []).length;
+    toast(`已恢复 ${unfrozen} 个账号${missing ? `；${missing} 个本来就没冻结` : ""}`);
+    await loadState();
+  } catch (e) {
+    humanErr(e, "批量恢复失败");
+  } finally {
+    for (const u of uids) state.unfreezing.delete(u);
+    renderAccounts();
+  }
+}
+
+// 账号行里的「恢复」按钮（冻结时替换掉普通操作；刷新快照按钮保留在下一行位置由 sideCell 决定）
+function unfreezeButton(uid) {
+  const busy = state.unfreezing.has(uid);
+  return el("button", {
+    type: "button",
+    class: "mini-btn danger-btn",
+    dataset: { unfreeze: uid },
+    text: busy ? "恢复中…" : "恢复",
+    disabled: busy,
+    title: "POST /api/account/unfreeze {uid}：解除该账号的 403/11140 冻结（确认风险已解除再点）",
+    onclick: () => unfreezeOne(uid),
+  });
+}
+
 // 「批量接任务」按钮旁的常驻说明（规则 4）：勾选范围内有多少未接取项被引擎判定为
 // 不可自动接取（桌面端 / 未收录）。数字只来自后端 canAccept 字段；老后端没给字段、
 // 或计数为 0 时不显示（不猜、不静默少接）。
@@ -2257,10 +2988,12 @@ function renderAcceptNote() {
     blocked += plan.blocked;
     locked += plan.locked;
   }
+  // 文案要短：这三段挤在批量条右侧的 280px 里，长了会折行（折行后右对齐 → 左侧参差，
+  // 看着像错位）。详细口径留在按钮 title 与 README 里，这里只给数字与最短说明。
   const parts = [];
-  if (modern && blocked > 0) parts.push(`${blocked} 项不可自动接取（桌面端/未收录）`);
-  if (locked > 0) parts.push(`${locked} 项次日可接取（锁定中，批量接取会跳过）`);
-  if (noSnap > 0) parts.push(`${noSnap} 个账号无快照（接取前会先只读刷新）`);
+  if (modern && blocked > 0) parts.push(`${blocked} 项不可自动接取`);
+  if (locked > 0) parts.push(`${locked} 项锁定中（接取会跳过）`);
+  if (noSnap > 0) parts.push(`${noSnap} 个账号无快照（先只读刷新）`);
   box.textContent = parts.join(" · ");
   box.hidden = parts.length === 0;
 }
@@ -2279,9 +3012,19 @@ function updateSelectionUI() {
   const jobRunning = !!state.data?.job;
   const offline = state.conn !== "online";
   const noElig = elig.length === 0;
-  for (const id of ["#btnAccept", "#btnRun", "#btnClaim", "#btnCheckin"]) {
+  for (const id of ["#btnAccept", "#btnRun", "#btnClaim", "#btnCheckin", "#btnStreak"]) {
     const b = $(id);
-    b.disabled = state.busy || jobRunning || offline || noElig;
+    if (b) b.disabled = state.busy || jobRunning || offline || noElig;
+  }
+  // 批量连登管家的按钮说明随勾选范围变：与 /api/streak/run 的 uids 口径一致
+  const btnStreak = $("#btnStreak");
+  if (btnStreak) {
+    btnStreak.textContent = jobRunning ? "任务运行中…" : "连登管家";
+    btnStreak.title = noElig
+      ? "没有可参与任务的账号"
+      : state.selected.size
+        ? `对勾选的 ${state.selected.size} 个账号跑连登管家（补签 → 礼包/补偿 → 档位兑换 → 抽奖）`
+        : "对全部可参与账号跑连登管家（补签 → 礼包/补偿 → 档位兑换 → 抽奖）；冻结账号会被守护进程跳过";
   }
   $("#btnRun").textContent = jobRunning ? "任务运行中…" : "批量做任务";
   if (noElig && !offline) {
@@ -2424,8 +3167,10 @@ function setBatchStatus(text) {
 }
 
 // 顶部「任务腿」是唯一选择源：勾选由 settings.legs 回写，HTML 里不再写死 checked。
-// settings.legs 缺失/为空时回退到旧版出厂默认（成长任务），与后端「未指定 legs 时补 growth」一致。
-const DEFAULT_LEGS = ["growth"];
+// settings.legs 缺失/为空时回退到出厂默认。0.3.3（CONTRACT §10.3）起的默认腿是
+// ["growth","streak","travel"]（连登管家是幂等纯收益，默认做）—— 老后端不给 legs 时
+// 前端兜底同一份默认；用户存过 legs 的实例由服务端值决定，不受这里影响。
+const DEFAULT_LEGS = ["growth", "streak", "travel"];
 let syncedLegsKey = null; // 最近一次从 settings.legs 同步到顶部的值（排序后拼接）
 
 function legsFromSettings(v) {
@@ -2463,7 +3208,7 @@ function withBusy(fn) {
 async function runFull() {
   const legs = selectedLegs();
   if (!legs.length) {
-    toast("请至少勾选一条任务腿（成长任务 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
+    toast("请至少勾选一条任务腿（成长任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
     return;
   }
   await withBusy(async () => {
@@ -2493,13 +3238,19 @@ async function runFull() {
   });
 }
 
-// 拿账号的可操作任务码：没有快照就先刷一次（?refresh=<uid>，走上游、daemon 自带限速）
-async function ensureSnapshot(a) {
-  if (a.snapshot) return a;
-  const d = await api("api/state", { params: { refresh: a.uid } });
+// 强制刷新某账号的最新快照（?refresh=<uid>，走上游、daemon 自带限速）。
+// 成功后用整份 state 覆盖本地并重绘，返回刷新后的账号行（账号消失时为 null）。
+async function refreshSnapshotNow(uid) {
+  const d = await api("api/state", { params: { refresh: uid } });
   state.data = d;
   renderAll();
-  return accountByUid(a.uid) ?? a;
+  return accountByUid(uid) ?? null;
+}
+
+// 拿账号的可操作任务码：没有快照就先刷一次（保持「无快照才刷」的原语义；有快照直接用）
+async function ensureSnapshot(a) {
+  if (a.snapshot) return a;
+  return (await refreshSnapshotNow(a.uid)) ?? a;
 }
 
 async function acceptSelected() {
@@ -2525,22 +3276,50 @@ async function acceptSelected() {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
           return;
         }
-        notes.push(`${a0.nickname || a0.uid}：快照刷新失败（${e.message}）`);
+        notes.push(`${a0.nickname || a0.uid}：快照刷新失败（${humanizeApiErr(e.message, e.data?.hint)}）`);
         continue;
       }
-      const plan = acceptPlan(a.snapshot?.tasks);
+      let plan = acceptPlan(a.snapshot?.tasks);
       // 任务级勾选：只提交与 acceptPlan.codes 的交集；勾选项全被过滤掉时明确说明，
       // 绝不静默退回「接该账号全部」（未勾选的账号不受影响 = 全部）。
-      const picked = pickedCodes(a.uid);
-      const pickedSet = picked ? new Set(picked) : null;
-      if (pickedSet) usedPicked = true;
-      const codes = pickedSet ? plan.codes.filter((c) => pickedSet.has(c)) : plan.codes;
+      // 这里直接用内存里的原始勾选集合：pickedCodes 会剔除锁定项，若勾选恰好只剩锁定项，
+      // 它返回 null 会被误判成「没有勾选」→ 反而接全部。
+      const sel = pickedSet(a.uid);
+      const hadPick = !!sel && sel.size > 0;
+      if (hadPick) usedPicked = true;
+      let codes = hadPick ? plan.codes.filter((c) => sel.has(c)) : plan.codes;
+      let refreshed = false;
+      // 有勾选但按当前快照筛不出可接项：本地快照可能停在旧状态（上游已接取、快照仍显示
+      // 未接）。强制刷新一次最新快照再判断；已有可接项 / 本来就没有待接项时不做无谓刷新。
+      if (hadPick && !codes.length && plan.pending > 0) {
+        let fresh = null;
+        try {
+          fresh = await refreshSnapshotNow(a.uid);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 409) {
+            setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
+            return;
+          }
+          notes.push(`${a.nickname || a.uid}：快照刷新失败（${humanizeApiErr(e.message, e.data?.hint)}）`);
+          continue;
+        }
+        if (!fresh) {
+          notes.push(`${a.nickname || a.uid}：快照刷新失败`);
+          continue;
+        }
+        a = fresh;
+        refreshed = true;
+        plan = acceptPlan(a.snapshot?.tasks);
+        // 刷新后重新读勾选（renderAll 可能把锁定项剔除）；勾选没了 = 无待接项，不退回全部
+        const sel2 = pickedSet(a.uid);
+        codes = sel2 && sel2.size ? plan.codes.filter((c) => sel2.has(c)) : [];
+      }
       // 规则 4：不可自动接取的项要说出来，不能静默少接
       if (plan.blocked) {
         blockedNotes.push(`${a.nickname || a.uid}：${plan.blocked} 项不可自动接取（桌面端/未收录）`);
       }
-      if (pickedSet && !codes.length) {
-        pickedEmpty.push(`${a.nickname || a.uid}：已选任务都不可自动接取/无待接`);
+      if (hadPick && !codes.length) {
+        pickedEmpty.push(`${a.nickname || a.uid}：已选任务都不可自动接取/无待接${refreshed ? "（已刷新最新快照）" : ""}`);
         continue;
       }
       if (!codes.length) {
@@ -2566,7 +3345,7 @@ async function acceptSelected() {
           setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
           return;
         }
-        notes.push(`${a.nickname || a.uid}：${e.message}`);
+        notes.push(`${a.nickname || a.uid}：${humanizeApiErr(e.message, e.data?.hint)}`);
       }
     }
     const parts = [
@@ -2607,17 +3386,47 @@ async function claimSelected() {
         failNotes.push(`${a0.nickname || a0.uid}：快照刷新失败`);
         continue;
       }
-      // 任务级勾选：pending 任务按勾选过滤；有勾选但无匹配待领奖时明确说明
-      const picked = pickedCodes(a.uid);
-      const pickedSet = picked ? new Set(picked) : null;
-      if (pickedSet) usedPicked = true;
-      const pending = (a.snapshot?.tasks ?? []).filter((t) => t.acceptStatus === "completed");
-      const scoped = pickedSet ? pending.filter((t) => pickedSet.has(String(t?.code ?? ""))) : pending;
-      const codes = scoped.filter((t) => t.code).map((t) => t.code);
-      if (pickedSet && !scoped.length) {
-        pickedEmpty.push(`${a.nickname || a.uid}：已选任务都不可领奖/无待领奖`);
-        continue;
+      // 任务级勾选：pending 任务按勾选过滤；有勾选但无匹配待领奖时明确说明。
+      // 领奖不受 locked 限制，勾选范围直接用内存里的原始集合（pickedCodes 会剔除锁定项，
+      // 若勾选恰好只剩锁定项会返回 null → 被误判成「没有勾选」→ 反而领全部）。
+      const sel = pickedSet(a.uid);
+      const hadPick = !!sel && sel.size > 0;
+      if (hadPick) usedPicked = true;
+      let pick = hadPick ? new Set(sel) : null;
+      // 与单行「领奖」按钮同一口径：completed，或进度已达标（current >= target > 0）
+      let pending = (a.snapshot?.tasks ?? []).filter((t) => claimableTask(t));
+      let scoped = pick ? pending.filter((t) => pick.has(String(t?.code ?? ""))) : pending;
+      // 勾选了任务却按当前快照筛不出可领项：多半是本地快照还停在接取时的旧状态
+      // （上游已完成、快照仍是 accepted 0/N）。强制刷新一次最新快照再判断；
+      // 已有可领项时绝不额外刷新（避免每次「只领奖」都多打一次上游）。
+      if (hadPick && !scoped.length) {
+        let fresh = null;
+        try {
+          fresh = await refreshSnapshotNow(a.uid);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 409) {
+            setBatchStatus("已有批量任务在跑，领奖中止。");
+            return;
+          }
+          failNotes.push(`${a.nickname || a.uid}：快照刷新失败`);
+          continue;
+        }
+        if (!fresh) {
+          failNotes.push(`${a.nickname || a.uid}：快照刷新失败`);
+          continue;
+        }
+        a = fresh;
+        // 刷新后重新读勾选（renderAll 可能把锁定项剔除）；勾选没了 = 无可领项，不退回全部
+        const sel2 = pickedSet(a.uid);
+        pick = sel2 && sel2.size ? new Set(sel2) : null;
+        pending = (a.snapshot?.tasks ?? []).filter((t) => claimableTask(t));
+        scoped = pick ? pending.filter((t) => pick.has(String(t?.code ?? ""))) : [];
+        if (!scoped.length) {
+          pickedEmpty.push(`${a.nickname || a.uid}：已选任务都不可领奖/无待领奖（已刷新最新快照）`);
+          continue;
+        }
       }
+      const codes = scoped.filter((t) => t.code).map((t) => t.code);
       if (scoped.length && !codes.length) noCode.push(a.nickname || a.uid);
       for (const code of codes) {
         try {
@@ -2635,7 +3444,7 @@ async function claimSelected() {
             setBatchStatus("已有批量任务在跑，领奖中止。");
             return;
           }
-          failNotes.push(`${a.nickname || a.uid}/${code}：${e.message}`);
+          failNotes.push(`${a.nickname || a.uid}/${code}：${humanizeApiErr(e.message, e.data?.hint)}`);
         }
       }
     }
@@ -2664,15 +3473,38 @@ async function checkinSelected() {
         setBatchStatus("签到完成：没有可签到的账号。");
         return;
       }
+      // 回执细分（CONTRACT §10.4）：claimed=真签到、done=今天本来就签过、failed=失败，
+      // pending=上游「处理中 / 请勿重复操作 / 系统繁忙」—— 不算成功、不落账、当天可重试。
+      // pending 单独计数、行内如实标注，绝不混进「已签到」。
+      let claimed = 0;
+      let done = 0;
+      let pending = 0;
+      let failed = 0;
       const lines = list.map((r) => {
         const who = accountByUid(r.uid)?.nickname || r.uid;
-        const outcome = OUTCOME_NAMES[r.outcome] ?? String(r.outcome ?? "—");
-        const gain = Number(r.credit) > 0 ? `，+${fmtNum(r.credit)} 积分` : "";
-        const streak = r.streak != null ? `，连登 ${r.streak} 天` : "";
+        const oc = String(r.outcome ?? "");
+        const outcome = OUTCOME_NAMES[oc] ?? (oc || "—");
+        if (oc === "claimed") claimed++;
+        else if (oc === "done") done++;
+        else if (oc === "pending") pending++;
+        else failed++;
+        // pending 不带收益（上游没落账）；积分 / 连登只在真领到时显示
+        const gain = oc !== "pending" && Number(r.credit) > 0 ? `，+${fmtNum(r.credit)} 积分` : "";
+        const streak = oc !== "pending" && r.streak != null ? `，连登 ${r.streak} 天` : "";
         const msg = r.message ? `（${r.message}）` : "";
-        return `${who}：${outcome}${gain}${streak}${msg}`;
+        const retry = oc === "pending" ? " —— 不算已签，稍后可再点「每日签到」重试" : "";
+        return `${who}：${outcome}${gain}${streak}${msg}${retry}`;
       });
-      setBatchStatus(`每日签到完成：\n${lines.join("\n")}`);
+      const parts = [`${list.length} 个账号`];
+      if (claimed) parts.push(`新签到 ${claimed}`);
+      if (done) parts.push(`今天已签 ${done}`);
+      if (pending) parts.push(`处理中 ${pending}（可重试）`);
+      if (failed) parts.push(`失败 ${failed}`);
+      setBatchStatus(`每日签到完成：${parts.join(" · ")}\n${lines.join("\n")}`);
+      if (pending) {
+        // 不静默：处理中的账号最容易被误当成签到成功（上游原话就是「请勿重复操作」）
+        toast(`${pending} 个账号签到「处理中」：上游还没处理完，不算已签 —— 稍后再点「每日签到」重试。`, "warn", 8000);
+      }
       await loadState();
     } catch (e) {
       setBatchStatus("");
@@ -2838,10 +3670,10 @@ async function exportAccounts(btn) {
       status.textContent = "";
       humanErr(e, "导出失败");
     } else if (e instanceof ApiError) {
-      // 后端中文 error 原样透出（如 404 no such account），不显示堆栈
-      status.textContent = `导出失败（HTTP ${e.status}）：${e.message}`;
+      // 后端中文 error 原样透出（如 404 no such account），不显示堆栈；未知 API → 人话改写
+      status.textContent = `导出失败（HTTP ${e.status}）：${humanizeApiErr(e.message, e.data?.hint)}`;
     } else {
-      status.textContent = `导出失败：${e?.message ?? e}`;
+      status.textContent = `导出失败：${humanizeApiErr(String(e?.message ?? e))}`;
     }
   } finally {
     btn.disabled = false;
@@ -3090,8 +3922,8 @@ function renderImportError(e, prefix) {
   }
   box.replaceChildren();
   if (e instanceof ApiError) {
-    // 400 无可导入账号 / 409 auth 解析失败 等：后端中文 error 原样透出，不显示堆栈
-    setImpStatus(`${prefix}（HTTP ${e.status}）：${e.message}`);
+    // 400 无可导入账号 / 409 auth 解析失败 等：后端中文 error 原样透出，不显示堆栈；未知 API → 人话改写
+    setImpStatus(`${prefix}（HTTP ${e.status}）：${humanizeApiErr(e.message, e.data?.hint)}`);
     return;
   }
   if (e && e.network) {
@@ -3099,7 +3931,7 @@ function renderImportError(e, prefix) {
     humanErr(e, prefix);
     return;
   }
-  setImpStatus(`${prefix}：${e?.message ?? e}`);
+  setImpStatus(`${prefix}：${humanizeApiErr(String(e?.message ?? e))}`);
 }
 
 // ---- 导入 / 导出抽屉（已合并进账号卡片） ------------------------------------------------
@@ -3231,6 +4063,7 @@ function renderScheduler() {
   // settings.hours.growth 即使老后端还带也一律忽略。mp 默认 []（不排程）。
   const hours = settings.hours ?? {};
   setVal($("#hoursMp"), (hours.mp ?? []).join(","));
+  setVal($("#hoursStreak"), (hours.streak ?? []).join(","));
   setVal($("#hoursBuddy"), (hours.buddy ?? []).join(","));
   setVal($("#hoursTravel"), (hours.travel ?? []).join(","));
   setVal($("#hoursNight"), (hours.night ?? []).join(","));
@@ -3310,11 +4143,13 @@ function parseHoursInput(v) {
 }
 
 async function saveHours() {
-  // 排程服务四条无任务码的腿：小程序链式任务 / Buddy 盲盒 / 猫猫旅行 / 夜猫子；
+  // 排程服务五条无任务码的腿：小程序链式任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子；
   // 成长任务已从排程里移除（手工运行仍可选它）。所有输入框留空 = []（不排程）；
-  // mp 默认不排程（按天解锁），buddy 会消耗成长能量（是否真正开盒由后端决定）。
+  // mp 默认不排程（按天解锁），streak 是幂等的纯收益（默认不排，需要时显式配小时窗口），
+  // buddy 会消耗成长能量（是否真正开盒由后端决定）。
   const hours = {
     mp: parseHoursInput($("#hoursMp").value),
+    streak: parseHoursInput($("#hoursStreak").value),
     buddy: parseHoursInput($("#hoursBuddy").value),
     travel: parseHoursInput($("#hoursTravel").value),
     night: parseHoursInput($("#hoursNight").value),
@@ -3332,7 +4167,7 @@ async function saveDefaults() {
   // 顶部 .leg-check 是唯一选择源：「保存默认」保存的就是此刻顶部的勾选。
   const legs = selectedLegs();
   if (!legs.length) {
-    toast("请至少勾选一条任务腿（成长任务 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
+    toast("请至少勾选一条任务腿（成长任务 / 连登管家 / Buddy 盲盒 / 猫猫旅行 / 夜猫子）。", "warn");
     return;
   }
   const gapMs = Number($("#gapMs").value);
@@ -3394,7 +4229,7 @@ async function loadHistory() {
 
 function renderHistoryError(e) {
   $("#histBody").replaceChildren(
-    el("div", { class: "empty", text: `历史读取失败：${e?.message ?? e}` }),
+    el("div", { class: "empty", text: `历史读取失败：${humanizeApiErr(String(e?.message ?? e), e?.data?.hint)}` }),
   );
   $("#histPager").replaceChildren();
 }
@@ -3483,6 +4318,8 @@ function startPolling() {
   if (state.pollTimer) return;
   state.pollTimer = setInterval(() => {
     loadState({ quiet: true });
+    // /api/hello 只在启动探一次；失败后按这个既有轮询节奏（3s）重试，绝不为版本检查另开快循环。
+    ensureHello();
   }, 3000);
 }
 function stopPolling() {
@@ -3653,6 +4490,12 @@ async function loadState({ quiet = false } = {}) {
         const cached = creditCache.get(String(a.uid ?? ""));
         if (cached) a.credits = cached;
       }
+      // 连登状态同理（0.3.3 后端未落地时 streak 恒为 undefined）：本地已查到的值兜底，
+      // 否则 3s 轮询会把连登数字刷回「未查询」。
+      if (a.streak == null) {
+        const cached = streakCache.get(String(a.uid ?? ""));
+        if (cached) a.streak = cached;
+      }
     }
     if (state.conn !== "stopped") state.conn = "online";
     renderAll();
@@ -3712,6 +4555,7 @@ function wireStatic() {
   $("#btnAccept").addEventListener("click", acceptSelected);
   $("#btnClaim").addEventListener("click", claimSelected);
   $("#btnCheckin").addEventListener("click", checkinSelected);
+  $("#btnStreak").addEventListener("click", runStreakSelected);
 
   // 账号导出 / 导入（合并在账号卡片内的抽屉里）
   $("#ioToggleBtn").addEventListener("click", toggleIo);
@@ -3743,29 +4587,43 @@ function wireStatic() {
   } catch {}
 }
 
+// 拉一次 /api/hello 做版本一致性检查。拿到结果就不再打（不为版本检查每 3 秒发请求）；
+// 失败返回错误实例交给调用方判断，并由 3s 轮询里的同一次调用重试。
+async function ensureHello() {
+  if (state.hello || state.helloBusy) return null;
+  state.helloBusy = true;
+  try {
+    state.hello = await api("api/hello");
+    renderTop();
+    renderBanners();
+    return null;
+  } catch (e) {
+    return e;
+  } finally {
+    state.helloBusy = false;
+  }
+}
+
 async function boot() {
   renderTop();
   // 守护进程无鉴权：首屏直接渲染，hello / state / history / SSE 都不需要任何凭据。
-  try {
-    state.hello = await api("api/hello");
-  } catch (e) {
-    if (e.network) {
-      state.conn = "down";
-      renderTop();
-      $("#accountsList").replaceChildren(
-        el("div", { class: "empty" },
-          el("strong", {}, "连不上守护进程。"),
-          "它可能没有启动：magpie 开启本插件时会自动拉起；也可在插件目录手动执行 ",
-          el("code", { text: "node daemon.mjs" }),
-          "，启动后刷新本页。实际端口与绑定地址写在 ",
-          el("code", { text: "<状态目录>/daemon.json" }),
-          "。",
-        ),
-      );
-      return;
-    }
-    // 其余错误：继续读 state，让它把话说全
+  const helloErr = await ensureHello();
+  if (helloErr && helloErr.network) {
+    state.conn = "down";
+    renderTop();
+    $("#accountsList").replaceChildren(
+      el("div", { class: "empty" },
+        el("strong", {}, "连不上守护进程。"),
+        "它可能没有启动：magpie 开启本插件时会自动拉起；也可在插件目录手动执行 ",
+        el("code", { text: "node daemon.mjs" }),
+        "，启动后刷新本页。实际端口与绑定地址写在 ",
+        el("code", { text: "<状态目录>/daemon.json" }),
+        "。",
+      ),
+    );
+    return;
   }
+  // 其余错误（含 hello 暂时拿不到）：继续读 state，让它把话说全
   if (state.conn !== "stopped") state.conn = "checking";
   await loadState();
   if (state.conn === "online") {

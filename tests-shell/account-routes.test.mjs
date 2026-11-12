@@ -106,7 +106,9 @@ describe("路由登记表（单一真相：routeNeedsKey 恒 false / API_ROUTE_A
       "GET /api/history",
       "GET /api/jobs/job-1",
       "GET /api/state",
+      "GET /api/streak",
       "POST /api/account/toggle",
+      "POST /api/account/unfreeze",
       "POST /api/accounts",
       "POST /api/accounts/import",
       "POST /api/checkin",
@@ -114,6 +116,7 @@ describe("路由登记表（单一真相：routeNeedsKey 恒 false / API_ROUTE_A
       "POST /api/settings",
       "POST /api/shutdown",
       "POST /api/stop",
+      "POST /api/streak/run",
       "POST /api/task/accept",
       "POST /api/task/claim",
     ])

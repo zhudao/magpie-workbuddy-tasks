@@ -62,7 +62,7 @@ async function canonicalTasks() {
 }
 
 const SNAP_KEYS = [
-  "acceptStatus", "canAccept", "canLight", "code", "desktopOnly", "jumpUrl",
+  "acceptStatus", "canAccept", "canLight", "code", "description", "desktopOnly", "jumpUrl",
   "lockHint", "locked", "lockedUntil", "pinnedExpertId", "progress", "reason",
   "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
 ]
@@ -73,14 +73,14 @@ const LOCK_KEYS = ["locked", "lockedUntil", "lockHint"]
 // ---- 单元：snapTask 幂等 + projectSnapshot 分流 -----------------------------
 
 describe("P2 单元：缓存形态重投影 === 直接刷新投影（幂等）", () => {
-  test("旧 8 键 / 现行 17 键投影形态再投影，均与直接刷新逐字节一致", async () => {
+  test("旧 8 键 / 现行 18 键投影形态再投影，均与直接刷新逐字节一致", async () => {
     const fresh = (await canonicalTasks()).map(snapTask)
     assert.ok(fresh.length >= 5)
 
-    // 现行新版缓存写出的形态：投影后 17 键（判断 + 次日锁字段齐）
+    // 现行新版缓存写出的形态：投影后 18 键（判断 + 次日锁字段 + 上游说明齐）
     const round14 = JSON.parse(JSON.stringify(fresh))
     // 旧版 daemon（P0-2 之前）写出的形态：8 键（无 6 个判断字段与 3 个锁字段）
-    const round8 = round14.map(({ desktopOnly, unforgeable, reason, canAccept, canLight, pinnedExpertId, locked, lockedUntil, lockHint, ...rest }) => rest)
+    const round8 = round14.map(({ desktopOnly, unforgeable, reason, canAccept, canLight, pinnedExpertId, locked, lockedUntil, lockHint, description, ...rest }) => rest)
     for (const t of round8) {
       assert.deepEqual(
         Object.keys(t).sort(),
@@ -89,8 +89,11 @@ describe("P2 单元：缓存形态重投影 === 直接刷新投影（幂等）",
       )
     }
 
-    assert.deepEqual(round8.map(snapTask), fresh, "旧 8 键缓存重算 6 个判断字段后 === 直接刷新投影")
-    assert.deepEqual(round14.map(snapTask), fresh, "17 键投影形态再投影 === 直接刷新投影（幂等）")
+    // 旧 8 键缓存没有 description（该字段 0.3.3 才进投影）：重投影后补空串、其余逐字节一致
+    const strip = (t) => { const { description, ...r } = t; return r }
+    assert.deepEqual(round8.map(snapTask).map(strip), fresh.map(strip), "旧 8 键缓存重算判断字段后 === 直接刷新投影（description 除外）")
+    assert.ok(round8.map(snapTask).every((t) => t.description === ""), "旧缓存缺 description → 补空串，不抛也不 undefined")
+    assert.deepEqual(round14.map(snapTask), fresh, "18 键投影形态再投影 === 直接刷新投影（幂等）")
   })
 
   test("canReprojectTask：8/14 键形态可重建；缺 code/taskType/acceptStatus 等一律不可", () => {

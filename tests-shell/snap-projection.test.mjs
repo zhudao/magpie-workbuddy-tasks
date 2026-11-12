@@ -81,13 +81,14 @@ describe("P0-2：snapTask 投影（真实形态 19 项）", () => {
     const snaps = await snapAll(REAL_19())
     assert.equal(snaps.length, 19)
 
-    // 投影键集合逐字钉死（契约 §3）：8 个规范字段 + 6 个判断字段 + 3 个次日锁字段
+    // 投影键集合逐字钉死（契约 §3）：9 个规范字段（含 description 上游说明）
+    // + 6 个判断字段 + 3 个次日锁字段
     //（无锁调用 → locked=false、lockedUntil/lockHint 空串，需求 2）
     for (const s of snaps) {
       assert.deepEqual(Object.keys(s).sort(), [
-        "acceptStatus", "canAccept", "canLight", "code", "desktopOnly", "jumpUrl",
-        "lockHint", "locked", "lockedUntil", "pinnedExpertId", "progress", "reason",
-        "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
+        "acceptStatus", "canAccept", "canLight", "code", "description", "desktopOnly",
+        "jumpUrl", "lockHint", "locked", "lockedUntil", "pinnedExpertId", "progress",
+        "reason", "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
       ])
     }
 

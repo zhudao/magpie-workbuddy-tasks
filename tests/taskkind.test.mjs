@@ -1,8 +1,11 @@
 // tests/taskkind.test.mjs —— 任务 → kind 解析层（P0-1）的单元与 fetchTasks 集成回归。
 //
 // 真实环境事实（2026-10-31 容器内只读实测，两账号一致）：
-//   - 上游每账号返回 19 项任务，其中 4 个 expert_use_* 不在 TASK_SPECS，reward
-//     50 积分 + 5 能量，jump_url 是 URL 编码的 deeplink，expertId 以 %3D 出现；
+//   - 上游每账号返回 19 项任务，其中 4 个 expert_use_* 曾不在 TASK_SPECS、靠
+//     jump_url 派生专家 id；0.3.3 起这 4 个已逐字收录进 TASK_SPECS（CONTRACT
+//     §10.6，expert 钉死真实 id）—— jump_url 派生只剩「未来未收录任务」的兜底；
+//     真实形态 reward 50 积分 + 5 能量，jump_url 是 URL 编码的 deeplink，expertId
+//     以 %3D 出现；
 //   - WorkBuddy_Valorant / Expert_lighthouse 的 jump_url 只有 workbuddy://expert
 //     （不含 expertId）→ 钉死常量仍是唯一来源；
 //   - not_accepted 任务的 progress 是 null。
@@ -92,18 +95,20 @@ test("resolveTaskKind：lighthouse 的 jump_url 只有 workbuddy://expert ——
 });
 
 test("resolveTaskKind：未收录但 jump_url 派生得出 → expert 类、事件 id 钉在解析出的 id 上", () => {
+  // expert_use_maidehao 等四条 0.3.3 起已收录（§10.6）；「派生」分支用一条
+  // 不在 TASK_SPECS 的未来 code 验证兜底路径仍在。
   const rk = resolveTaskKind({
-    code: "expert_use_maidehao",
-    title: "体验「中国电商运营专家」",
-    jumpUrl: jumpOf("ex_GDl31WahyIH0"),
+    code: "expert_use_future99",
+    title: "体验「未来电商专家」",
+    jumpUrl: jumpOf("ex_FutureExpert9"),
     acceptStatus: "accepted",
     taskType: "single",
   });
   assert.equal(rk.source, "jump_url");
   assert.equal(rk.kind, "expert", "expertType=agent（buildEvent expert 族）");
   assert.equal(rk.spec, null);
-  assert.equal(rk.pinnedExpertId, "ex_GDl31WahyIH0");
-  assert.equal(rk.expertName, "中国电商运营专家");
+  assert.equal(rk.pinnedExpertId, "ex_FutureExpert9");
+  assert.equal(rk.expertName, "未来电商专家");
   assert.equal(rk.unforgeable, false);
   assert.equal(rk.reason, "");
   assert.equal(rk.desktopOnly, false);
@@ -111,6 +116,21 @@ test("resolveTaskKind：未收录但 jump_url 派生得出 → expert 类、事�
   assert.equal(rk.lightable, true);
   assert.equal(rk.canAccept, false, "accepted 后不再给接取结论");
   assert.equal(rk.canLight, true);
+
+  // 已收录的 expert_use_* 走 spec 分支：钉死常量与 jump_url 派生出的 id 一致，
+  // source 升级为 spec（spec 优先级高于 jump_url，CONTRACT §2/§7.4）
+  const specHit = resolveTaskKind({
+    code: "expert_use_maidehao",
+    title: "体验「中国电商运营专家」",
+    jumpUrl: jumpOf("ex_GDl31WahyIH0"),
+    acceptStatus: "accepted",
+    taskType: "single",
+  });
+  assert.equal(specHit.source, "spec", "TASK_SPECS 命中优先于 jump_url 派生");
+  assert.equal(specHit.kind, "expert");
+  assert.equal(specHit.pinnedExpertId, "ex_GDl31WahyIH0");
+  assert.equal(specHit.expertName, "中国电商运营专家");
+  assert.equal(specHit.canLight, true);
 });
 
 test("resolveTaskKind：未收录且派生不出 → unforgeable + 未收录任务，绝不接取/点亮", () => {
@@ -158,11 +178,21 @@ test("resolveTaskKind：canAccept/canLight 状态矩阵（六类任务 × 四种
       }),
       grid: [[false, false], [false, false], [false, false], [false, false]],
     },
-    "派生 expert_use_*": {
+    "已收录 expert_use_*（spec，0.3.3 §10.6）": {
       make: (status) => ({
         code: "expert_use_douyinyin",
         title: "体验「抖音策略师」",
         jumpUrl: jumpOf("ex_FbY5nlWTqDod"),
+        acceptStatus: status,
+        taskType: "single",
+      }),
+      grid: [[true, false], [false, true], [false, false], [false, false]],
+    },
+    "未收录但派生得出（expert_use_future99）": {
+      make: (status) => ({
+        code: "expert_use_future99",
+        title: "体验「未来电商专家」",
+        jumpUrl: jumpOf("ex_FutureExpert9"),
         acceptStatus: status,
         taskType: "single",
       }),
@@ -247,10 +277,12 @@ test("fetchTasks：未收录/派生任务的 unforgeable+reason 落到规范 Tas
   assert.equal(wechat.unforgeable, true, "spec.unforgeable 语义沿用");
   assert.match(wechat.reason, /微信/);
 
-  // 规范 Task 的键集合不变（taskkind 只改 unforgeable/reason 的取值来源）
+  // 规范 Task 的键集合不变（taskkind 只改 unforgeable/reason 的取值来源；
+  // locked/unlockAt 是 2026-11-11 起的锁字段——web 清单也带，与 fetchMPTasks
+  // 同口径归一）
   assert.deepEqual(Object.keys(unknown).sort(), [
-    "acceptStatus", "code", "description", "jumpUrl", "progress",
-    "reason", "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable",
+    "acceptStatus", "code", "description", "jumpUrl", "locked", "progress",
+    "reason", "rewardCredit", "rewardEnergy", "taskType", "title", "unforgeable", "unlockAt",
   ]);
 });
 

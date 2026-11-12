@@ -1,6 +1,6 @@
 {
   "name": "magpie-workbuddy-tasks",
-  "version": "0.3.2",
+  "version": "0.3.4",
   "description": "WorkBuddy 成长/旅行/夜猫任务批量自动化：复用 magpie 已登录账号，本地看板 + 小时排程 + Agent 工具",
   "type": "module",
   "main": "./index.mjs",
