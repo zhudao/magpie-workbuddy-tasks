@@ -98,19 +98,21 @@ const post = (port, path, body) =>
 const tick = (ms = 80) => new Promise((r) => setTimeout(r, ms))
 
 describe("normalizeScheduleHours（纯函数）", () => {
-  test("growth 与未知键丢弃、0–23 整数去重升序、非法输入落空表（buddy/mp/streak 键保留）", () => {
-    // 旧 settings.json 的形状：growth 原样存在 → 归一后消失；buddy/mp/streak 是合法键
-    assert.deepEqual(normalizeScheduleHours({ growth: [9], travel: [21, 9, 9], night: [1, "x", 24, -1], buddy: [3, 3, "y", 25], mp: [8], streak: [6, 6] }), {
+  test("growth 与未知键丢弃、0–23 整数去重升序、非法输入落空表（buddy/mp/streak/campaign 键保留）", () => {
+    // 旧 settings.json 的形状：growth 原样存在 → 归一后消失；buddy/mp/streak/campaign 是合法键
+    assert.deepEqual(normalizeScheduleHours({ growth: [9], travel: [21, 9, 9], night: [1, "x", 24, -1], buddy: [3, 3, "y", 25], mp: [8], streak: [6, 6], campaign: [10, 10] }), {
       mp: [8],
+      campaign: [10],
       buddy: [3],
       streak: [6],
       travel: [9, 21],
       night: [1],
     })
-    assert.deepEqual(normalizeScheduleHours({ growth: [1, 2, 3] }), { mp: [], buddy: [], streak: [], travel: [], night: [] })
-    assert.deepEqual(normalizeScheduleHours(null), { mp: [], buddy: [], streak: [], travel: [], night: [] })
-    assert.deepEqual(normalizeScheduleHours([9, 21]), { mp: [], buddy: [], streak: [], travel: [], night: [] })
-    assert.deepEqual(normalizeScheduleHours({ travel: "9,21" }), { mp: [], buddy: [], streak: [], travel: [], night: [] })
+    const empty = { mp: [], campaign: [], buddy: [], streak: [], travel: [], night: [] }
+    assert.deepEqual(normalizeScheduleHours({ growth: [1, 2, 3] }), empty)
+    assert.deepEqual(normalizeScheduleHours(null), empty)
+    assert.deepEqual(normalizeScheduleHours([9, 21]), empty)
+    assert.deepEqual(normalizeScheduleHours({ travel: "9,21" }), empty)
   })
 })
 
@@ -138,7 +140,7 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
     try {
       const s = await (await get(h.port, "/api/state")).json()
       assert.equal(s.scheduler.enabled, true)
-      assert.deepEqual(Object.keys(s.settings.hours).sort(), ["buddy", "mp", "night", "streak", "travel"], "hours 键限制为 mp|buddy|streak|travel|night")
+      assert.deepEqual(Object.keys(s.settings.hours).sort(), ["buddy", "campaign", "mp", "night", "streak", "travel"], "hours 键限制为 mp|campaign|buddy|streak|travel|night（§11.1）")
       assert.ok(!JSON.stringify(s.settings.hours).includes("growth"), "settings.hours 不含 growth")
       assert.ok(
         !s.scheduler.nextRuns.some(([leg]) => leg === "growth"),
@@ -169,7 +171,7 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
       const st = await post(h.port, "/api/settings", { hours: { growth: [3], travel: [5], night: [2], buddy: [7], mp: [8], streak: [6] } })
       assert.equal(st.status, 200)
       const body = await st.json()
-      assert.deepEqual(Object.keys(body.hours).sort(), ["buddy", "mp", "night", "streak", "travel"])
+      assert.deepEqual(Object.keys(body.hours).sort(), ["buddy", "campaign", "mp", "night", "streak", "travel"])
       assert.deepEqual(body.hours.travel, [5])
       assert.deepEqual(body.hours.night, [2])
       assert.deepEqual(body.hours.buddy, [7], "buddy 窗口可显式配置")
@@ -179,7 +181,7 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
 
       const onDisk = JSON.parse(readFileSync(join(stateDir, "settings.json"), "utf8"))
       assert.ok(!("growth" in (onDisk.hours ?? {})), "落盘的 settings.json 不含 growth")
-      assert.deepEqual(onDisk.hours, { mp: [8], buddy: [7], streak: [6], travel: [5], night: [2] })
+      assert.deepEqual(onDisk.hours, { mp: [8], campaign: [], buddy: [7], streak: [6], travel: [5], night: [2] })
     } finally {
       await h.stop()
     }
@@ -191,7 +193,7 @@ describe("旧 settings.json 含 hours.growth 的升级读径", () => {
     const h = await boot(stateDir)
     try {
       const s = await (await get(h.port, "/api/state")).json()
-      assert.deepEqual(s.settings.hours, { mp: [], buddy: [], streak: [], travel: [], night: [] })
+      assert.deepEqual(s.settings.hours, { mp: [], campaign: [], buddy: [], streak: [], travel: [], night: [] })
       assert.ok(!JSON.stringify(s.scheduler.nextRuns).includes("growth"))
       assert.deepEqual(s.scheduler.nextRuns, [], "默认全空 → nextRuns 为空（不排任何腿）")
       // settings.legs 默认 0.3.3 起含 streak（连登管家纯收益且幂等，默认做）
@@ -294,7 +296,7 @@ describe("排程时间留空 = 不排（需求 4）", () => {
     try {
       // 用户显式写空的 travel 保持空（不会被默认值复活），其余腿补默认（也是空）
       const s = await (await get(h.port, "/api/state")).json()
-      assert.deepEqual(s.settings.hours, { mp: [], buddy: [], streak: [], travel: [], night: [] })
+      assert.deepEqual(s.settings.hours, { mp: [], campaign: [], buddy: [], streak: [], travel: [], night: [] })
 
       // 北京 09:00（UTC 01:00）— 旧行为的旅行窗口：现在 hours.travel=[] 不触发
       const at9 = Date.UTC(2026, 9, 31, 1, 0)
@@ -326,7 +328,7 @@ describe("排程时间留空 = 不排（需求 4）", () => {
     const h = await boot(stateDir)
     try {
       const s = await (await get(h.port, "/api/state")).json()
-      assert.deepEqual(s.settings.hours, { mp: [], buddy: [], streak: [], travel: [9, 21], night: [1] })
+      assert.deepEqual(s.settings.hours, { mp: [], campaign: [], buddy: [], streak: [], travel: [9, 21], night: [1] })
       const at9 = Date.UTC(2026, 9, 31, 1, 0) // 北京 09:00
       const job = h.ticks.checkScheduler(at9)
       assert.ok(job, "升级用户的 travel 09:00 窗口照常触发")

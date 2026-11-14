@@ -217,3 +217,57 @@ test("refreshAccount：无 refreshToken / 无 accessToken 时如实失败", asyn
   assert.equal(bad.ok, false);
   assert.match(bad.reason, /refresh token failed/);
 });
+
+// ---- init.replaceHeaders（CONTRACT §11.1）：头族替换通道的凭据红线 ------------------
+// 运营活动的 MP 事件上报要「不带桌面身分」的最小头族，mergeInitHeaders 只能覆盖、
+// 删不掉 base 里的桌面 UA/X-Domain 一族，所以引擎开了一条 replaceHeaders 通道。
+// 通道本身是**凭据边界**：Authorization 只能由引擎注入 —— 调用方无论怎么写
+// （大小写、空串、别的 token）都必须被剥掉换成 acct.access，且绝不能漏发。
+test("replaceHeaders：init.headers 原样成为整个头族（不再合并 kind 头族，桌面身分被去掉）", async () => {
+  const acct = makeAcct();
+  const calls = [];
+  const f = async (url, init) => {
+    calls.push({ url, init });
+    return RESP(200, { code: 0, data: {} });
+  };
+  await callJSON(
+    acct,
+    "chat",
+    "https://copilot.tencent.com/v2/report",
+    { method: "POST", body: "{}", replaceHeaders: true, headers: { "X-Client-Platform": "mp-weixin", "X-Test": "1" } },
+    { fetch: f },
+  );
+  const h = calls[0].init.headers;
+  assert.equal(h["X-Client-Platform"], "mp-weixin", "替换集合里的头原样在");
+  assert.equal(h["X-Test"], "1");
+  assert.equal(h["X-Domain"], undefined, "替换集合里没有的头不得从 chat 头族漏进来");
+  assert.equal(h["X-IDE-Version"], undefined, "桌面身分整族都不该出现");
+  assert.equal(h.Authorization, "Bearer " + acct.access, "凭据头由引擎注入");
+});
+
+test("replaceHeaders：调用方写的 Authorization（任意大小写）一律被剥掉、换成引擎的 access", async () => {
+  const acct = makeAcct();
+  const calls = [];
+  const f = async (url, init) => {
+    calls.push({ url, init });
+    return RESP(200, { code: 0, data: {} });
+  };
+  await callJSON(
+    acct,
+    "chat",
+    "https://copilot.tencent.com/v2/report",
+    {
+      method: "POST",
+      body: "{}",
+      replaceHeaders: true,
+      headers: { authorization: "Bearer EVIL", Authorization: "Bearer EVIL2", AUTHORIZATION: "Bearer EVIL3", "X-Keep": "yes" },
+    },
+    { fetch: f },
+  );
+  const h = calls[0].init.headers;
+  const authKeys = Object.keys(h).filter((k) => k.toLowerCase() === "authorization");
+  assert.deepEqual(authKeys, ["Authorization"], "凭据头只能有一个，且是引擎注入的那个键名");
+  assert.equal(h.Authorization, "Bearer " + acct.access);
+  assert.ok(!JSON.stringify(h).includes("EVIL"), "任何外部写法的凭据值都不得进入请求头");
+  assert.equal(h["X-Keep"], "yes", "非凭据头照常保留");
+});

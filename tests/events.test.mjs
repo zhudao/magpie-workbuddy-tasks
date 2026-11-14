@@ -21,7 +21,9 @@ function evList(kind, opts = {}) {
 test("每种 kind 的 eventCode 与必填字段", () => {
   const cases = [
     ["canvas", "wbx_design_canvas_task_create", ["conversationId", "requestId", "source", "isCustomModel", "inputLength", "id", "cost", "isSuccessful"]],
-    ["template", "agent_task_created_with_template", ["isCustomModel", "id", "name", "requestId", "conversationId"]],
+    // template（template_5）不再有单事件构造（CONTRACT §11.3 换成四事件组 +
+    // 真实场景表，走 tasks.runTemplateTask）—— buildEvent 没有 template 分支，
+    // 误用落 heartbeat（见下方「template 无单事件构造」用例）
     ["expert", "expert_actual_use", ["mode", "id", "name", "expertTitle", "type", "expertType", "source", "version", "cost", "characterCount", "conversationId", "requestId", "messageId", "requestModelId", "requestModelName"]],
     ["team", "expert_actual_use", ["expertType"]],
     ["lighthouse", "expert_actual_use", ["expertType"]],
@@ -77,11 +79,18 @@ test("playbook：双事件链（cta_click + prompt_send，hub 937c179 口径）"
 });
 
 test("userId 必在（缺了服务端 200 但静默丢弃）", () => {
-  for (const kind of ["canvas", "template", "expert", "team", "lighthouse", "skill", "automation", "playbook", "skin", "chat", "glmchat", "cat", "whatever"]) {
+  for (const kind of ["canvas", "expert", "team", "lighthouse", "skill", "automation", "playbook", "skin", "chat", "glmchat", "cat", "whatever"]) {
     const list = evList(kind);
     assert.ok(list.length >= 1, kind);
     for (const e of list) assert.equal(e.userId, "uid-X", `${kind} 的 ${e.eventCode ?? "?"}`);
   }
+});
+
+test("template 无单事件构造（§11.3：四事件组在 runTemplateTask，不在 buildEvent）", () => {
+  // buildEvent 的 template 分支已删除：误用只会落 heartbeat（比静默发旧的单事件
+  // 更诚实）；四事件组由 tests/template-scenes.test.mjs 钉死。
+  const e = ev("template");
+  assert.equal(e.eventCode, "heartbeat");
 });
 
 test("timestamp 用注入时钟；conversationId 形态 wb-task-<now>-<idx>", () => {

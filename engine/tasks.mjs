@@ -11,6 +11,8 @@
 import {
   ACCEPT_CHUNK,
   CLAIM_POLL_ATTEMPTS,
+  DESKTOP_UA_CN,
+  DESKTOP_VERSION_CN,
   EXPERT_ID_POOL,
   LIBRARY_DOC_URL,
   LIBRARY_ELEMENT_ID,
@@ -18,12 +20,22 @@ import {
   NIGHT_TASK_CODES,
   PROGRESS_RISING_MS,
   REPORT_SETTLE_MS,
+  SKILL_MARKET_URL,
+  SKILL_SHARE_CHANNEL_URL,
+  SKILL_SHARE_POLL_GAP_MS,
+  SKILL_SHARE_POLL_TRIES,
+  SKILL_SHARE_PREFERRED_ID,
   TASK_SPECS,
   TEAM_ID_POOL,
+  TEMPLATE_FALLBACK_SCENES,
+  TEMPLATE_POLL_GAP_MS,
+  TEMPLATE_POLL_TRIES,
+  TEMPLATE_SCENES_URL,
   WEB_UA,
   inNightWindow,
 } from "./constants.mjs";
-import { deriveId } from "./fingerprint.mjs";
+import { randomUUID } from "node:crypto";
+import { deriveId, uuidHex } from "./fingerprint.mjs";
 import { defaultNow } from "./identity.mjs";
 import { MP_TASK_CODES, runMiniProgramTasks } from "./miniprogram.mjs"; // 小程序链式任务（CONTRACT §7）
 import { resolveTaskKind } from "./taskkind.mjs"; // 任务 → kind 解析（CONTRACT §2/§7，唯一判断源）
@@ -290,6 +302,402 @@ export async function reportBuddy5Events(acct, events, opts = {}) {
   return !!res.ok;
 }
 
+// ---- 桌面域上报 + skill_share / template_5 流程（CONTRACT §11.2/§11.3，hub 8eede085）----
+
+// desktopFingerprint(uid, nick, nowMs)：桌面端事件上报的公共指纹包络（hub
+// `_report_desktop_events` 的 `wb_fingerprint.get_desktop_fingerprint(...)` 对应物）。
+// 字段形状与 buildEvent("buddy5") 的实测桌面指纹同源（2026-11-06 真机抓包），但
+// ideVersion/extVersion 按 hub 的上报时覆写取 DESKTOP_VERSION_CN（5.8.3）。
+function desktopFingerprint(uid, nick, nowMs) {
+  const now = Math.floor(nowMs);
+  return {
+    timezone: "Asia/Shanghai", reportDelay: 2000, userId: uid,
+    username: nick, userNickname: nick, product: "SaaS",
+    releaseDate: 1789036585355, commit: "5f9692923c93033111c51ad7b003eb80204a9b75",
+    ideName: "WorkBuddy", ideType: "WorkBuddy",
+    ideVersion: DESKTOP_VERSION_CN, machineId: deriveId(uid, "machine"),
+    sessionId: deriveId(uid, "session"),
+    extName: "workbuddy-desktop", extVersion: DESKTOP_VERSION_CN,
+    os: "win32", arch: "x64", osVersion: "10.0.26220", cpuCores: 20, memorySize: 24,
+    timestamp: now, presentAt: now,
+  };
+}
+
+// reportDesktopEvents(acct, events, opts) -> boolean
+// 桌面域事件上报（hub `_report_desktop_events` 的移植）：事件合并桌面指纹包络，
+// 打 **chat 域** /v2/report（桌面事件与 chat 同一上游契约，不是 web 域），头在
+// chat 头族上覆盖桌面 UA / X-Domain: copilot.tencent.com / X-Product: SaaS /
+// X-Request-ID / X-User-Id。hub 口径：desktop 端点常回**空 body** —— 2xx 就是
+// 传输层成功；callJSON 对非 JSON 主体按失败结算（code -1），这里按 2xx 翻正，
+// 免得把一次成功上报误判成失败而不敢领奖。
+export async function reportDesktopEvents(acct, events, opts = {}) {
+  const ctx = ctxOf(opts);
+  await ctx.breathe();
+  const uid = String(acct?.uid ?? "");
+  const nick = String(acct?.nickname ?? "");
+  const envelope = desktopFingerprint(uid, nick, ctx.now());
+  const list = (Array.isArray(events) ? events : [events]).map((e) => ({ ...envelope, ...e }));
+  const res = await callJSON(
+    acct, "chat", chatUrl(opts) + "/v2/report",
+    {
+      method: "POST",
+      body: JSON.stringify(list),
+      headers: {
+        "Content-Type": "application/json;charset=UTF-8",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": DESKTOP_UA_CN,
+        "X-Domain": "copilot.tencent.com",
+        "X-Product": "SaaS",
+        "X-Request-ID": deriveId(uid, "req") + String(Math.floor(ctx.now()) % 1000000),
+        "X-User-Id": uid,
+      },
+    },
+    opts,
+  );
+  if (res.restricted) return false;
+  if (res.ok) return true;
+  return res.status >= 200 && res.status < 300; // 2xx + 非 JSON body（含空 body）= 成功
+}
+
+// newGrowthMessageId(nowMs)：hub `_new_message_id` 的移植
+//（"%012x%s" % (int(time.time()*1000), uuid4().hex[:20])）。template_5 的事件
+// requestId 用它。
+export function newGrowthMessageId(nowMs) {
+  const ms = Math.floor(nowMs ?? Date.now());
+  return `${ms.toString(16).padStart(12, "0")}${uuidHex().slice(0, 20)}`;
+}
+
+// templateEvents(sceneId, sceneName, nowMs) -> 四事件组（hub `_template_events`
+// 逐字移植，CONTRACT §11.3）：一组真实模板创建动作把 template_5 推进 1。
+// 顺序钉死：agent_task_created → agent_task_created_with_template → template_used
+// → playbook_prompt_send；同一组共享 requestId/conversationId。
+// 注意事件体本身不带 userId —— 它们只经 reportDesktopEvents 上报，userId 由桌面
+// 指纹包络携带（hub 同款）。
+export function templateEvents(sceneId, sceneName, nowMs) {
+  const requestId = newGrowthMessageId(nowMs);
+  const conversationId = randomUUID();
+  return [
+    { eventCode: "agent_task_created", source: "CLOUD", name: "",
+      mode: "craft", requestModelId: "default", action: sceneId,
+      has_template: true, template_id: sceneId,
+      template_name: sceneName, requestId, conversationId },
+    { eventCode: "agent_task_created_with_template",
+      templateId: sceneId, templateName: sceneName,
+      template_id: sceneId, mode: "working", isCustomModel: true,
+      id: sceneId, name: sceneName, requestId, conversationId },
+    { eventCode: "template_used", template_id: sceneId,
+      templateId: sceneId, templateName: sceneName,
+      task_mode: "working", id: sceneId, name: sceneName,
+      source: "growth-center", conversationId },
+    { eventCode: "playbook_prompt_send", ext1: randomUUID(),
+      requestId, id: sceneId, name: sceneName,
+      type: "other", promptLength: 30, isOfficial: 1,
+      source: "growth-center", conversationId },
+  ];
+}
+
+// fetchTemplateScenes(acct, opts) -> {ok:true, scenes:[[id,name],...], fallback?}
+// 真实场景表（hub `_fetch_template_scenes` 移植）：GET TEMPLATE_SCENES_URL，
+// 只看 HTTP 2xx 与 data.scenes（hub 不看信封 code）；请求失败/为空才回落内置表
+//（fallback:true 标记回落，测试与调用方据此区分「真场景」与「兜底表」）。
+// restricted 透传（绝不吞掉 403/11140）。
+export async function fetchTemplateScenes(acct, opts = {}) {
+  const ctx = ctxOf(opts);
+  await ctx.breathe();
+  const res = await callJSON(acct, "chat", TEMPLATE_SCENES_URL, { method: "GET" }, opts);
+  if (res.restricted) {
+    return { ok: false, restricted: true, scenes: [], reason: res.msg || "restricted" };
+  }
+  if (res.status >= 200 && res.status < 300) {
+    const rows = res.data?.scenes ?? [];
+    const scenes = [];
+    for (const row of rows) {
+      if (!row || typeof row !== "object" || row.id === undefined || row.id === null) continue;
+      scenes.push([String(row.id), String(row.name ?? "")]);
+    }
+    if (scenes.length) return { ok: true, scenes };
+  }
+  return {
+    ok: true,
+    fallback: true,
+    scenes: TEMPLATE_FALLBACK_SCENES.map(([id, nm]) => [String(id), String(nm)]),
+    reason: res.ok ? "场景表为空" : `HTTP ${res.status ?? 0} ${res.msg || ""}`.trim(),
+  };
+}
+
+// skillShareChannelEvents(skillId, skillName, shareCode, nowMs) -> 两条事件
+//（hub `_skill_share_channel_events` 逐字移植）：click → success，共享同一
+// actionAt 时间戳与 share_code id。只经 reportDesktopEvents 上报（userId 由
+// 桌面指纹包络携带）。
+export function skillShareChannelEvents(skillId, skillName, shareCode, nowMs) {
+  const common = { skillId, skillName, skillType: "market" };
+  const now = Math.floor(nowMs);
+  return [
+    { ...common, eventCode: "skill_share_channel_action",
+      action: "link", panelAction: "click", panelType: "clipboard",
+      isSuccessful: true, cost: 0, id: shareCode, actionAt: now },
+    { ...common, eventCode: "skill_share_channel_action",
+      action: "link", panelAction: "success", panelType: "clipboard",
+      isSuccessful: true, cost: 0, id: shareCode, actionAt: now },
+  ];
+}
+
+// skillShareMarketSkill(acct, opts) -> {ok:true, skill:{id,name,description}}
+//                                        | {ok:false, reason, restricted?}
+// 市场技能目录（hub `_skill_share_market_skill` 移植）：POST SKILL_MARKET_URL
+// body {"page":1,"page_size":20}（chat 头）。hub 接受信封 code in (0,200,"0","200")
+// —— callJSON 只认 code 0，这里按 hub 口径把 code 200 也翻正。选技能：偏好
+// SKILL_SHARE_PREFERRED_ID，否则第一个可用；行内字段容错与 hub 一致
+//（skill_id|id、display_name_zh|name|display_name_en、description_zh|description|
+// description_en 截 60）。
+export async function skillShareMarketSkill(acct, opts = {}) {
+  const ctx = ctxOf(opts);
+  await ctx.breathe();
+  const res = await callJSON(
+    acct, "chat", SKILL_MARKET_URL,
+    { method: "POST", body: JSON.stringify({ page: 1, page_size: 20 }) },
+    opts,
+  );
+  if (res.restricted) {
+    return { ok: false, reason: res.msg || "restricted", restricted: true };
+  }
+  // hub 接受 code in (0, 200, "0", "200")：callJSON 把 "200" 解析成数字 200
+  const ok = res.ok || res.code === 200;
+  if (!ok) {
+    return { ok: false, reason: `市场技能列表被拒: HTTP ${res.status ?? 0} ${String(res.msg || res.raw || "").slice(0, 120)}`.trim() };
+  }
+  const skills = res.data?.skills ?? [];
+  const candidates = [];
+  for (const row of skills) {
+    if (!row || typeof row !== "object") continue;
+    const id = String(row.skill_id ?? row.id ?? "").trim();
+    if (!id) continue;
+    const nm = String(row.display_name_zh ?? row.name ?? row.display_name_en ?? "").trim();
+    if (!nm) continue;
+    candidates.push({
+      id,
+      name: nm,
+      description: String(row.description_zh ?? row.description ?? row.description_en ?? "").trim().slice(0, 60),
+    });
+  }
+  if (!candidates.length) return { ok: false, reason: "市场技能目录为空" };
+  const skill = candidates.find((r) => r.id === SKILL_SHARE_PREFERRED_ID) ?? candidates[0];
+  return { ok: true, skill };
+}
+
+// createSkillShareChannel(acct, skill, opts)
+//   -> {ok:true, shareCode, channelId} | {ok:false, reason, restricted?, status?}
+// **真实上游动作**（hub `_create_skill_share_channel` 逐字移植，CONTRACT §11.2）：
+// 在 Open Platform 创建一条 c2c 资产分享渠道 —— 上游会真实生成分享链接，这不是
+// 伪造事件，是真实分享动作的自动化。body/头逐字照 hub（asset_ref 是紧凑 JSON
+// 字符串；头在 chat 头族上覆盖 Content-Type/Accept/桌面 UA/X-User-Id/X-Domain）。
+// 必须同时拿到 share_code 与 ways[share_way=="link"].resource_ref 才算成功
+//（缺一 → 上游没给出可用的分享形态，如实失败）。
+export async function createSkillShareChannel(acct, skill, opts = {}) {
+  const ctx = ctxOf(opts);
+  const skillId = String(skill?.id ?? "").trim();
+  if (!skillId) return { ok: false, reason: "市场技能 ID 为空" };
+  await ctx.breathe();
+  const body = {
+    asset_kind: "skill",
+    asset_source: "market",
+    asset_ref: JSON.stringify({ asset_id: skillId }),
+    ways: ["link", "wxacode", "wxapath"],
+    extra: {
+      name: skill.name || "技能",
+      description: skill.description || "",
+      shareKey: skillId,
+      marketplaceSource: "builtin-market",
+    },
+  };
+  const res = await callJSON(
+    acct, "chat", SKILL_SHARE_CHANNEL_URL,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": DESKTOP_UA_CN,
+        "X-User-Id": String(acct?.uid ?? ""),
+        "X-Domain": "copilot.tencent.com",
+      },
+    },
+    opts,
+  );
+  if (res.restricted) {
+    return { ok: false, reason: res.msg || "restricted", restricted: true, status: res.status };
+  }
+  const ok = res.ok || res.code === 200; // 与市场列表同款：hub 接受 code 200
+  if (!ok) {
+    return {
+      ok: false,
+      reason: String(res.msg || "创建分享渠道失败").slice(0, 160),
+      status: res.status,
+    };
+  }
+  const data = res.data ?? {};
+  const shareCode = String(data.share_code ?? "").trim();
+  let link = "";
+  for (const way of data.ways ?? []) {
+    if (way && typeof way === "object" && way.share_way === "link") {
+      link = String(way.resource_ref ?? "").trim();
+      break;
+    }
+  }
+  if (!shareCode || !link) {
+    return { ok: false, reason: "分享接口缺少 share_code 或 link", status: res.status };
+  }
+  return { ok: true, shareCode, link, channelId: String(data.channel_id ?? "") };
+}
+
+// waitGrowthProgress(acct, code, target, tries, gapMs, opts) -> Task | null
+//（hub `_wait_for_growth_task` 移植）：轮询成长清单直到服务端确认达标或等待
+// 预算耗尽。每次轮询之间 breathe(gapMs)（≥1s 铁律由 ctx/spacer 保证）。
+export async function waitGrowthProgress(acct, code, target, tries, gapMs, opts = {}) {
+  const ctx = ctxOf(opts);
+  let fresh = null;
+  for (let i = 0; i < Math.max(1, tries); i++) {
+    if (i) await ctx.breathe(gapMs);
+    fresh = (await fetchTasks(acct, opts)).find((x) => x.code === code) ?? null;
+    if (!fresh) continue;
+    if (
+      fresh.acceptStatus === "completed" ||
+      fresh.acceptStatus === "claimed" ||
+      (fresh.progress?.current ?? 0) >= target
+    ) {
+      return fresh;
+    }
+  }
+  return fresh;
+}
+
+// finishSpecialTask(acct, t, fresh, logs, opts, lit) -> {credit, energy, lit, claimed, restricted?}
+//（hub `_finish_special_task` 移植）：只在**服务端确认完成之后**才领奖 —— 进度
+// 未确认就领奖必报 task not completed，所以没确认就顺延下一轮；claim=false 时
+// 只记「等待手动领取」。
+async function finishSpecialTask(acct, t, fresh, logs, opts, lit = 0) {
+  const ctx = ctxOf(opts);
+  const claim = opts.claim !== false;
+  const name = t.title || t.code;
+  const target = t.progress?.target ?? 1;
+  const current = fresh?.progress?.current ?? t.progress?.current ?? 0;
+  const confirmed =
+    !!fresh &&
+    (fresh.acceptStatus === "completed" ||
+      fresh.acceptStatus === "claimed" ||
+      current >= target);
+  if (!confirmed) {
+    logs.push(`? 任务 [${name}] 进度 ${current}/${target} 未确认，领奖顺延到下次运行`);
+    return { credit: 0, energy: 0, lit, claimed: 0 };
+  }
+  if (fresh.acceptStatus === "claimed") {
+    logs.push(`✓ 任务 [${name}] 已领奖`);
+    return { credit: 0, energy: 0, lit, claimed: 0 };
+  }
+  if (!claim) {
+    logs.push(`⏸ 任务 [${name}] 已达成，等待手动领取`);
+    return { credit: 0, energy: 0, lit, claimed: 0 };
+  }
+  const res = await claimTask(acct, t.code, opts);
+  if (res.ok) {
+    logs.push(`✓ 任务 [${name}] 领奖成功: +${res.credit ?? 0} 积分`);
+    await ctx.breathe();
+    return { credit: res.credit ?? 0, energy: res.energy ?? 0, lit, claimed: 1 };
+  }
+  logs.push(`! 任务 [${name}] 进度已达成但领奖失败: ${res.reason || "未知原因"}`);
+  await ctx.breathe();
+  return { credit: 0, energy: 0, lit, claimed: 0, ...(res.restricted ? { restricted: true } : {}) };
+}
+
+// runSkillShareTask(acct, t, logs, opts) -> {credit, energy, lit, claimed, restricted?}
+// skill_share 完整流程（CONTRACT §11.2，hub `_run_skill_share_task` 移植）：
+// 市场技能 → 创建真实分享渠道 → 两条渠道事件 → 轮询进度 → 领奖。
+// **创建渠道是真实上游动作（上游会真实生成分享链接），不是伪造事件**；市场/
+// 渠道/事件任一步失败都如实跳过、不领奖、不伪造；restricted 透传（冻结）。
+export async function runSkillShareTask(acct, t, logs, opts = {}) {
+  const name = t.title || t.code;
+  const zero = () => ({ credit: 0, energy: 0, lit: 0, claimed: 0 });
+
+  // 1) 市场技能目录
+  const market = await skillShareMarketSkill(acct, opts);
+  if (market.restricted) return { ...zero(), restricted: true };
+  if (!market.ok) {
+    logs.push(`⏭ 任务 [${name}] 市场未返回可分享技能，不伪造分享（${market.reason}）`);
+    return zero();
+  }
+  const skill = market.skill;
+
+  // 2) 创建分享渠道（真实动作）
+  const channel = await createSkillShareChannel(acct, skill, opts);
+  if (channel.restricted) return { ...zero(), restricted: true };
+  if (!channel.ok) {
+    logs.push(`! 任务 [${name}] 创建分享渠道失败: ${channel.reason}`);
+    return zero();
+  }
+
+  // 3) 两条 skill_share_channel_action（click → success，桌面头上报）
+  const events = skillShareChannelEvents(skill.id, skill.name, channel.shareCode, ctxOf(opts).now());
+  if (!(await reportDesktopEvents(acct, events, opts))) {
+    logs.push(`! 任务 [${name}] 渠道已创建但事件上报失败，不领奖`);
+    return zero();
+  }
+
+  // 4) 轮询服务端进度（4 × 3s），确认后才领奖
+  logs.push(`正在等待任务 [${name}] 服务端进度落账...`);
+  const target = t.progress?.target ?? 1;
+  const fresh = await waitGrowthProgress(acct, t.code, target, SKILL_SHARE_POLL_TRIES, SKILL_SHARE_POLL_GAP_MS, opts);
+  return finishSpecialTask(acct, t, fresh, logs, opts, 1);
+}
+
+// runTemplateTask(acct, t, logs, opts) -> {credit, energy, lit, claimed, restricted?}
+// template_5 完整流程（CONTRACT §11.3，hub `_run_template_task` 移植）：按缺口
+// 逐组上报四事件（templateEvents），**一组上报必须推进服务端计数才发下一组**
+//（计数不动就停手，绝不喷重复事件）；进度未确认不提前领奖。
+export async function runTemplateTask(acct, t, logs, opts = {}) {
+  const name = t.title || t.code;
+  const target = Math.max(1, Number(t.progress?.target ?? 5) || 5);
+  let current = Number(t.progress?.current ?? 0) || 0;
+  const zero = () => ({ credit: 0, energy: 0, lit: 0, claimed: 0 });
+
+  const scenes = await fetchTemplateScenes(acct, opts);
+  if (scenes.restricted) return { ...zero(), restricted: true };
+  if (!scenes.scenes.length) {
+    logs.push(`⏭ 任务 [${name}] 取不到模板场景，跳过`);
+    return zero();
+  }
+
+  let fresh = null;
+  while (current < target) {
+    const [sceneId, sceneName] = scenes.scenes[current % scenes.scenes.length];
+    const before = current;
+    if (!(await reportDesktopEvents(acct, templateEvents(sceneId, sceneName, ctxOf(opts).now()), opts))) {
+      logs.push(`! 任务 [${name}] 场景 ${sceneName || sceneId} 事件上报失败`);
+      return zero();
+    }
+    fresh = await waitGrowthProgress(acct, t.code, target, TEMPLATE_POLL_TRIES, TEMPLATE_POLL_GAP_MS, opts);
+    if (!fresh) break;
+    const nextCurrent = Number(fresh.progress?.current ?? 0) || 0;
+    if (
+      fresh.acceptStatus === "completed" ||
+      fresh.acceptStatus === "claimed" ||
+      nextCurrent >= target
+    ) {
+      current = Math.max(current, nextCurrent);
+      break;
+    }
+    // 一组四事件必须推进服务端计数才继续下一组；计数不动说明事件没有落账，
+    // 留到下次运行，绝不原地补喷重复事件（hub 口径）。
+    if (nextCurrent <= before) {
+      logs.push(`任务 [${name}] 服务端进度未增长，停止本轮补发`);
+      break;
+    }
+    current = nextCurrent;
+  }
+  logs.push(`任务 [${name}] 当前服务端进度 ${current}/${target}`);
+  return finishSpecialTask(acct, t, fresh, logs, opts, 1);
+}
+
 // ---- 领奖 --------------------------------------------------------------------
 
 // claimTask(acct, code, opts) -> {ok, credit, energy, via, reason, restricted?}
@@ -345,11 +753,13 @@ export function buildEvent(acct, kind, idx = 0, expert = null, opts = {}) {
       inputLength: 12, id: `wbx-canvas-${now}`, cost: 0,
       isSuccessful: true, userId: uid };
   }
-  if (kind === "template") {
-    return { eventCode: "agent_task_created_with_template", timestamp: now,
-      reportDelay: 0, isCustomModel: true, id: String(idx),
-      name: "幻灯片", requestId: rid, conversationId: cid, userId: uid };
-  }
+  // kind:"template"（template_5）不再有单事件构造：旧实现是单条
+  // agent_task_created_with_template + 硬编码「幻灯片」，已被 CONTRACT §11.3 的
+  // 四事件组（agent_task_created → agent_task_created_with_template →
+  // template_used → playbook_prompt_send）+ 服务端真实场景表替换 —— 见本文件
+  // runTemplateTask / templateEvents（progressTask 对 kind:"template" 直接分流，
+  // 绝不走 buildEvent）。这里不再保留 template 分支：误用会落 heartbeat，
+  // 比静默发旧事件更诚实。
   if (kind === "expert" || kind === "team" || kind === "lighthouse") {
     const etype = kind === "team" ? "team" : "agent";
     let exId, name;
@@ -554,10 +964,27 @@ export async function progressTask(acct, t, logs, opts = {}) {
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
 
+  const kind = rk.kind;
+
+  // skill_share（CONTRACT §11.2，hub 8eede085）：官方 Open Platform 分享路径 ——
+  // 市场技能 → 创建真实分享渠道 → 两条渠道事件 → 轮询 → 领奖。创建渠道是
+  // **真实上游动作**（上游会真实生成分享链接），不是伪造事件；任一步失败如实
+  // 跳过、不领奖（见 runSkillShareTask）。
+  if (kind === "skillshare") {
+    return runSkillShareTask(acct, t, logs, opts);
+  }
+
+  // template_5（CONTRACT §11.3，hub 8eede085）：真实场景表 + 四事件组
+  //（agent_task_created → agent_task_created_with_template → template_used →
+  // playbook_prompt_send），按缺口逐组上报；进度未确认不提前领奖
+  //（见 runTemplateTask —— 旧的 buildEvent 单事件「幻灯片」实现已删除）。
+  if (kind === "template") {
+    return runTemplateTask(acct, t, logs, opts);
+  }
+
   // 需点亮上报 —— 专家/团队事件必须使用互不相同的 id，否则上游按
   // (eventCode, id) 去重，进度永远不动。
   const need = Math.max(1, tgt - cur);
-  const kind = rk.kind;
   // 「浏览资料库」走 web 域的元素点击事件（CONTRACT §7），不是 chat 域的
   // buildEvent 族 —— 日志也注明路径不同。
   if (kind === "library") {

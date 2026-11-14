@@ -162,6 +162,28 @@ function mergeInitHeaders(base, extra) {
   return merged;
 }
 
+// replaceInitHeaders(acct, extra)：init.replaceHeaders === true 时用 init.headers
+// **原样替换**整个头族（而不是合并进 kind 头族）。背景（CONTRACT §11.1）：运营
+// 活动的 MP 事件上报在 hub 里用的是**最小头族** —— `_campaign_headers` =
+// MP_REPORT_HEADERS + Authorization + X-User-Id（「Activity APIs use the
+// mini-program identity, not the desktop profile」），与桌面端 chat 头族的差异不是
+// 「多几个头」而是「不带桌面身分」；mergeInitHeaders 只能覆盖、删不掉 base 里的
+// 桌面 UA/X-Domain 一族，所以要一条替换通道。红线不变：Authorization 只能由
+// 引擎自己注入 —— replace 集合里无论大小写写了什么 Authorization 一律剥掉，
+// 换成 acct.access 的 Bearer token（凭据头永不被外部输入顶替、也绝不漏发）。
+function replaceInitHeaders(acct, extra) {
+  const out = {};
+  if (extra && typeof extra === "object") {
+    for (const [k, v] of Object.entries(extra)) {
+      if (v === undefined || v === null) continue;
+      if (String(k).toLowerCase() === "authorization") continue; // 凭据头不可被顶替
+      out[String(k)] = String(v);
+    }
+  }
+  out["Authorization"] = "Bearer " + String(acct?.access ?? ""); // 凭据头由引擎注入
+  return out;
+}
+
 // ---- 信封 --------------------------------------------------------------------
 function parseEnvelope(text) {
   let env = {};
@@ -212,9 +234,10 @@ async function attempt(fetchImpl, url, method, headers, body, signal) {
 // callJSON(acct, kind, url, init, opts) -> {ok, status, code, data, msg, raw, restricted?}
 //
 // - kind: 'chat' | 'billing' | 'web'（决定头族）
-// - init: {method, body, headers?, ids?}（body 已是字符串/undefined；headers 是
-//   可选的自定义头，按大小写敏感合并进 kind 头族 —— Authorization 除外，见
-//   mergeInitHeaders）
+// - init: {method, body, headers?, ids?, replaceHeaders?}（body 已是字符串/undefined；
+//   headers 是可选的自定义头，按大小写敏感合并进 kind 头族 —— Authorization 除外，
+//   见 mergeInitHeaders；replaceHeaders===true（引擎内部专用）时 init.headers 原样
+//   替换整个头族、Authorization 由引擎注入，见 replaceInitHeaders）
 // - opts: {fetch, now, sleep, signal, log, leg, env, base, bases, gap, spacer, __ctx}
 // - 信封：{code, msg, data}，code===0 视为成功（2xx 且 code 0）
 // - 3 次线性退避重试，只重试「瞬时网络故障 / 5xx」（hub 的 _retryable 口径）
@@ -233,7 +256,13 @@ async function callJSONInto(acct, kind, url, init = {}, opts = {}, ctx = ctxOf(o
   const sleep = opts.sleep ?? ctx.sleep;
   const method = String(init.method || "GET").toUpperCase();
   const step = stepOf(opts, acct);
-  const headers = mergeInitHeaders(headersFor(acct, kind, init.ids ?? {}, opts), init.headers);
+  // init.replaceHeaders === true（引擎内部专用，CONTRACT §11.1）：init.headers 原样
+  // 成为整个头族（Authorization 仍由引擎注入，见 replaceInitHeaders）；其余调用
+  // 走「kind 头族 + 大小写敏感合并」的老路。
+  const headers =
+    init.replaceHeaders === true
+      ? replaceInitHeaders(acct, init.headers)
+      : mergeInitHeaders(headersFor(acct, kind, init.ids ?? {}, opts), init.headers);
   const body = init.body === undefined ? undefined : String(init.body);
   const signal = opts.signal ?? ctx.signal ?? undefined;
 

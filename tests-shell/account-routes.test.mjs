@@ -100,6 +100,7 @@ describe("路由登记表（单一真相：routeNeedsKey 恒 false / API_ROUTE_A
     const registered = API_ROUTE_AUTH.map((r) => `${r.method} ${r.path.split("?")[0]}`).sort()
     assert.deepEqual(registered, [
       "GET /api/accounts/export",
+      "GET /api/campaign",
       "GET /api/credits",
       "GET /api/events",
       "GET /api/hello",
@@ -111,6 +112,8 @@ describe("路由登记表（单一真相：routeNeedsKey 恒 false / API_ROUTE_A
       "POST /api/account/unfreeze",
       "POST /api/accounts",
       "POST /api/accounts/import",
+      "POST /api/campaign/claim",
+      "POST /api/campaign/run",
       "POST /api/checkin",
       "POST /api/run",
       "POST /api/settings",

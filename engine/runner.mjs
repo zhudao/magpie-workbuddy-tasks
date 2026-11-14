@@ -5,10 +5,11 @@
 //
 // 同一时刻只允许 1 个 job（current() 全局闸门；第二个 start() 抛 409）。
 // 账号与账号之间按 trigger 间隔（manual 1.5 s / schedule 2–5 s 抖动，见
-// schedule.accountGapMs）；腿的顺序固定 growth → mp → streak → buddy → travel →
-// night（mp 在 growth 后：小程序链式任务也是成长体系的一部分；streak 在 buddy
-// 前：连登管家是纯收益且幂等，先收；buddy 在 travel 前：开出的 Buddy 可被随后
-// 一轮旅行使用），spec.legs 是这个顺序的子集。
+// schedule.accountGapMs）；腿的顺序固定 growth → mp → campaign → streak → buddy
+// → travel → night（mp 在 growth 后：小程序链式任务也是成长体系的一部分；
+// campaign 在 mp 后 streak 前：运营活动任务独立于成长体系（CONTRACT §11.1）；
+// streak 在 buddy 前：连登管家是纯收益且幂等，先收；buddy 在 travel 前：开出
+// 的 Buddy 可被随后一轮旅行使用），spec.legs 是这个顺序的子集。
 // spec.taskCodes（{uid: string[]} | null，任务级勾选）只在 growth/mp 腿生效。
 // 旅行只由 travel 腿触发（growth 腿显式 travel:false）；growth+mp 同跑时 growth
 // 腿传 mpTasks:false（2b 关闭），避免小程序任务被两条腿各跑一遍。
@@ -20,10 +21,11 @@
 //（POST /api/account/unfreeze）能解除，绝不自动恢复。
 
 import { runBuddyOpen } from "./buddy.mjs";
+import { runCampaignTasks } from "./campaign.mjs"; // 运营活动任务腿（CONTRACT §11.1）
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS } from "./constants.mjs";
 import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
-import { runMiniProgramTasks } from "./miniprogram.mjs"; // 小程序链式任务腿（CONTRACT §7）
+import { runMiniProgramTasks, isMPCode } from "./miniprogram.mjs"; // 小程序链式任务腿（CONTRACT §7）
 import { runStreakSteward } from "./streak.mjs"; // 连登管家腿（CONTRACT §10.1）
 import { accountGapMs } from "./schedule.mjs";
 import { eligibleAccounts } from "./store.mjs";
@@ -31,7 +33,9 @@ import { runGrowthTasks } from "./tasks.mjs";
 import { runCatTravel, runNightTask } from "./travel.mjs";
 import { clock, refreshAccount } from "./upstream.mjs";
 
-const LEG_ORDER = ["growth", "mp", "streak", "buddy", "travel", "night"];
+// 腿顺序（CONTRACT §11.1）：campaign 独立于成长体系（独立的 /portal/activity/*
+// 契约），排在 mp 之后、streak 之前；runner 与 daemon 的 LEGS 同序。
+const LEG_ORDER = ["growth", "mp", "campaign", "streak", "buddy", "travel", "night"];
 
 // 任务级勾选（CONTRACT §2/§3）每个账号清单的上限与 daemon.startJob 同款。
 const TASK_CODES_CAP = 500;
@@ -60,7 +64,7 @@ function normalizeTaskCodes(raw) {
 function normalizeSpec(spec = {}) {
   const legs = (Array.isArray(spec.legs) && spec.legs.length ? spec.legs : [...LEG_ORDER])
     .filter((l) => LEG_ORDER.includes(l))
-    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→mp→streak→buddy→travel→night
+    .sort((a, b) => LEG_ORDER.indexOf(a) - LEG_ORDER.indexOf(b)); // 顺序固定 growth→mp→campaign→streak→buddy→travel→night
   return {
     uids: Array.isArray(spec.uids) && spec.uids.length ? [...spec.uids] : null,
     legs: legs.length ? legs : [...LEG_ORDER],
@@ -383,7 +387,36 @@ export class JobRunner {
         // 刷新调用」与这一条腿分属两个节奏器（legOpts 每腿新建）—— 这里补一拍
         // gap，保证跨边界的两次上游调用也 ≥1s（宁可多等，绝不硬闯）。
         await this._sleep(Math.max(0, Number(this.opts.gap ?? DEFAULT_GAP_MS)));
+        // 任务级勾选（CONTRACT §3/§11.6）：codes 是**两套命名空间混在一个清单**里的 ——
+        // 成长/小程序的裸 code，以及活动任务的 `<activityCode>:<taskCode>`（**含冒号**）。
+        // 各腿只认自己那套，别把对面那套当「不存在的任务」去警告。
+        // 筛完为空 = 该账号选中的任务都不属于这条腿 → 整腿跳过；**绝不能传空数组**：
+        // 引擎把「空/未传」一律当「全部」，传下去会跑光所有任务（用户只勾了活动任务，
+        // 却把所有成长任务跑一遍 —— 这是不可接受的反向放大）。
+        const legCodes = (() => {
+          const all = job.spec.taskCodes?.[acct.uid];
+          if (!Array.isArray(all) || !all.length) return null; // 未勾选 = 全部
+          const isCampaignCode = (c) => String(c).includes(":");
+          // 三套命名空间各归各腿，别把别人的码当自己的（2026-11-14 实测：只勾了一个成长任务，
+          // mp 腿也拿到那串码 → 空跑一遍却显示「完成」，用户以为小程序任务被跑了）：
+          //   campaign 腿 = 含冒号的 `<活动>:<任务>`
+          //   mp 腿       = MP 专属码（Sequential_Tasks_* / school_season，走 isMPCode 同一判定源）
+          //   growth 腿   = 其余（**但当本次 job 含 mp 腿时，MP 专属码让给 mp 腿**，
+          //                 否则给 growth —— 那时它内部的 2b 分支会处理小程序任务）
+          if (leg === "campaign") return all.filter(isCampaignCode);
+          if (leg === "mp") return all.filter((c) => !isCampaignCode(c) && isMPCode(c));
+          if (leg === "growth") {
+            const mpLegInJob = Array.isArray(job.spec.legs) && job.spec.legs.includes("mp");
+            return all.filter((c) => !isCampaignCode(c) && !(mpLegInJob && isMPCode(c)));
+          }
+          return null; // 其它腿（streak/buddy/travel/night）没有任务码
+        })();
+
         const step = this._step(job, acct, leg, "running");
+        if (Array.isArray(legCodes) && legCodes.length === 0) {
+          this._finishStep(job, step, "skip", "该账号选中的任务都不属于这条腿，跳过");
+          continue;
+        }
         let res = null;
         try {
           const legOpts = {
@@ -391,13 +424,9 @@ export class JobRunner {
             log: logFn,
             claim: job.spec.claim,
             signal: ctrl.signal,
-            // 任务级勾选（CONTRACT §3）：growth/mp 腿把该账号的选中清单作为
-            // opts.codes 传给引擎；未勾选（taskCodes=null）、该账号不在映射里
-            // 或清单为空 → undefined = 全部任务（旧行为）。buddy/travel/night
-            // 腿没有任务码，不传。
-            ...((leg === "growth" || leg === "mp") && job.spec.taskCodes
-              ? { codes: job.spec.taskCodes[acct.uid] }
-              : {}),
+            ...(legCodes ? { codes: legCodes } : {}),
+            // 任务级勾选：用上面按腿筛好的 legCodes（null = 全部；已在建 step 前
+            // 处理「筛完为空」的整腿跳过）。
             // 猫猫旅行只由 travel 腿触发：growth 腿显式 travel:false（runGrowthTasks
             // 第 3 步据此整段跳过）——只勾 growth 绝不跑旅行、growth+travel 也只跑
             // 一次，步骤 detail/收益由 travel 腿自己记。
@@ -413,6 +442,7 @@ export class JobRunner {
           };
           if (leg === "growth") res = await runGrowthTasks(acct, legOpts);
           else if (leg === "mp") res = await runMiniProgramTasks(acct, legOpts);
+          else if (leg === "campaign") res = await runCampaignTasks(acct, legOpts);
           else if (leg === "streak") res = await runStreakSteward(acct, legOpts);
           else if (leg === "buddy") res = await runBuddyOpen(acct, legOpts);
           else if (leg === "travel") res = await runCatTravel(acct, legOpts);

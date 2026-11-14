@@ -6,7 +6,7 @@
   <meta name="robots" content="noindex">
   <!-- 静态文件版本：必须与 package.json 的 version 一致（后端测试比对四处：
        package.json / index.mjs 的 VERSION / page 页脚 / 这个 meta）。app.js 读它做版本一致性检查。 -->
-  <meta name="wb-version" content="0.3.4">
+  <meta name="wb-version" content="0.3.6">
   <title>WorkBuddy 任务 · 看板</title>
   <link rel="icon" href="logo-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
@@ -173,7 +173,7 @@
         <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->
         <fieldset class="segments" id="legsBox">
           <legend class="sr-only">任务腿</legend>
-          <label class="segment" title="成长任务（含微信小程序链式任务 Sequential_Tasks_1–6；小程序任务随成长任务一起跑）"><input type="checkbox" class="leg-check" value="growth"><span>成长任务</span></label>
+          <label class="segment" title="积分任务 = 成长任务 + 小程序链式任务 + 活动任务（一次跑完这三类；小程序任务次日解锁、活动任务独立记账）"><input type="checkbox" class="leg-check" value="points"><span>积分任务</span></label>
           <label class="segment" title="连登管家：补签昨日 → 领新手礼包/活动补偿 → 兑换可用连登档位 → 抽奖（幂等、纯收益，已领的静默跳过）"><input type="checkbox" class="leg-check" value="streak"><span>连登管家</span></label>
           <label class="segment" title="Buddy 盲盒：消耗成长能量开盲盒（不是领奖）；无能量时后端会跳过"><input type="checkbox" class="leg-check" value="buddy"><span>Buddy 盲盒</span></label>
           <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
@@ -190,7 +190,7 @@
         <div class="batch-actions">
           <div class="batch-hints">
             <span class="sel-count" id="selCount">已选 0 个账号</span>
-            <!-- 任务级勾选的全局汇总：有勾选时显示「已选 N 项任务」 -->
+            <!-- 任务级勾选的全局汇总：有勾选时显示「已选 N 项任务 · 本轮所有目标账号只做这些」 -->
             <span class="task-sel-summary" id="taskSelSummary" hidden></span>
             <!-- 批量接取只提交后端判定 canAccept 的任务；不可自动接取的项数在这里说明，
                  而不是静默少接（数字来自 snapshot.tasks[].canAccept，见 app.js acceptPlan）。 -->
@@ -267,18 +267,13 @@
               <input class="input input-mono" id="hoursTravel" inputmode="numeric" placeholder="留空" aria-label="猫猫旅行小时窗口">
               <span class="hint">北京时间小时；留空 = 不排程</span>
             </div>
-            <div class="hour-row">
-              <span class="field-label">夜猫子</span>
-              <input class="input input-mono" id="hoursNight" inputmode="numeric" placeholder="留空" aria-label="夜猫子小时窗口">
-              <span class="hint">北京时间小时；留空 = 不排程；上游只在 23:00–08:00 计数</span>
-            </div>
             <!-- 保存按钮放在 hours 网格里：第 3 行第 2 列 = 「夜猫子」右边、「猫猫旅行」下面，
                  紧贴它要保存的那几个输入框（原先在说明文案下方，离得远）。 -->
             <div class="hour-row hour-actions">
               <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
             </div>
           </div>
-          <p class="hint hours-note">北京时间（UTC+8）小时；留空 = 不排程。小程序任务按天解锁，连登管家幂等（不会重复领），Buddy 盲盒消耗成长能量，夜猫子仅 23:00–08:00 计数。</p>
+          <p class="hint hours-note">北京时间（UTC+8）小时；留空 = 不排程。小程序任务按天解锁，活动任务与成长任务解耦（独立跑、独立记账），连登管家幂等（不会重复领），Buddy 盲盒消耗成长能量，夜猫子仅 23:00–08:00 计数。</p>
 
           <div class="sched-cols">
             <div class="sched-block">

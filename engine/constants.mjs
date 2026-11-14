@@ -138,16 +138,40 @@ export const TASK_SPECS = {
     name: "关注官方公众号",
   },
   Expert_Philanthropy: { unforgeable: true, reason: "真实捐款动作", reward: 0, name: "公益爱心捐赠" },
-  // 分享一个技能给好友（2026-11-11 上游 task_desc 原文：升级到电脑端 5.9.0+，
-  // 前往「技能」列表点击任意技能，进详情页通过「分享」发送给好友；valid_end
-  // 2026-11-18）。**真实分享动作 + 新客户端**：桌面端 asar（实测 5.6.2 / 9-21
-  // 构建）与 web 入口包都没有 skill_share 事件，hub 也未支持 —— 不猜事件名、
-  // 不伪造，如实列为不可自动化并给深链（workbuddy://skill）。
-  skill_share: {
-    unforgeable: true, reward: 100, name: "分享一个技能给好友",
-    reason: "需电脑端 5.9.0+ 的技能详情页用「分享」发给好友（真实分享动作，无事件可伪造）",
-  },
+  // 分享一个技能给好友（CONTRACT §11.2，hub 8eede085 把原「不可自动化」结论作废）：
+  // 官方 Open Platform 路径 —— 先在市场技能目录里选一个技能，再经
+  // open.workbuddy.cn 的 asset-shares 接口**创建真实分享渠道**（上游会真实生成
+  // 分享链接，这是真实动作不是伪造事件），随后上报两条 skill_share_channel_action
+  // 桌面事件并轮询进度。执行在 tasks.mjs 的 kind:"skillshare" 流程（growth 腿）。
+  skill_share: { kind: "skillshare", target: 1, reward: 100, name: "分享一个技能给好友" },
 };
+
+// ---- skill_share 官方分享路径（CONTRACT §11.2，hub 8eede085 逐字）-------------
+// 市场技能目录：POST {bill}/v2/operation-platform/market/skill/list（chat 头）。
+export const SKILL_MARKET_URL = "https://www.codebuddy.cn/v2/operation-platform/market/skill/list";
+// 创建分享渠道：POST open.workbuddy.cn 的 asset-shares c2c channels（真实上游动作）。
+export const SKILL_SHARE_CHANNEL_URL =
+  "https://open.workbuddy.cn/api/v2/open-platform/asset-shares/c2c/channels";
+// 偏好分享的技能 id（hub 实测可用；市场里没有它时取第一个可用技能）。
+export const SKILL_SHARE_PREFERRED_ID = "skill_2097350077599879168";
+// 渠道事件上报后等服务端进度落账：4 次 × 3s（hub SKILL_SHARE_POLL_TRIES/GAP）。
+export const SKILL_SHARE_POLL_TRIES = 4;
+export const SKILL_SHARE_POLL_GAP_MS = 3000;
+
+// ---- template_5 真实场景（CONTRACT §11.3，hub 8eede085 逐字）-------------------
+// 场景表：GET www.workbuddy.cn/console/as/support/scenes?locale=zh-CN（chat 头）；
+// 请求失败/为空才回落 hub 的内置表。
+export const TEMPLATE_SCENES_URL = "https://www.workbuddy.cn/console/as/support/scenes?locale=zh-CN";
+export const TEMPLATE_FALLBACK_SCENES = [
+  ["0", "幻灯片"],
+  ["4", "深度研究"],
+  ["8", "数据分析"],
+  ["16", "设计"],
+  ["20", "日常开发"],
+];
+// 每组四事件上报后的进度确认轮询：4 次 × 2s（hub TEMPLATE_POLL_TRIES/GAP）。
+export const TEMPLATE_POLL_TRIES = 4;
+export const TEMPLATE_POLL_GAP_MS = 2000;
 
 // ---- 逆向修复常量（2026-09 实测校准）----------------------------------------
 // 这些任务上游只认桌面客户端的真实行为信号（jump_url 均为 workbuddy:// 深链，
