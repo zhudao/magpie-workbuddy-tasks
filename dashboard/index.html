@@ -6,7 +6,7 @@
   <meta name="robots" content="noindex">
   <!-- 静态文件版本：必须与 package.json 的 version 一致（后端测试比对四处：
        package.json / index.mjs 的 VERSION / page 页脚 / 这个 meta）。app.js 读它做版本一致性检查。 -->
-  <meta name="wb-version" content="0.3.6">
+  <meta name="wb-version" content="0.3.7">
   <title>WorkBuddy 任务 · 看板</title>
   <link rel="icon" href="logo-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
@@ -289,17 +289,17 @@
           <details class="adv">
             <summary>
               <span>运行默认</span>
-              <small>领奖模式 · 账号间隔 · 上游主机</small>
+              <small>领奖模式 · 上游调用间隔 · 上游主机</small>
             </summary>
             <div class="adv-body">
               <div class="adv-row">
                 <label class="check"><input type="checkbox" id="defClaim"> 完成后自动领奖（手动运行的默认模式）</label>
               </div>
               <div class="adv-row">
-                <span class="field-label">账号间隔</span>
-                <input class="input input-mono gap-input" id="gapMs" type="number" min="500" max="10000" step="100"
-                  aria-label="账号间隔毫秒">
-                <span class="hint">ms，500–10000；风控红线：任意两次上游调用至少间隔 1 秒</span>
+                <span class="field-label">上游调用间隔</span>
+                <input class="input input-mono gap-input" id="gapMs" type="number" min="1000" max="10000" step="100"
+                  aria-label="上游调用间隔毫秒">
+                <span class="hint">ms，1000–10000；风控红线，不可低于 1 秒</span>
               </div>
               <div class="adv-row">
                 <button type="button" class="ghost-btn" id="saveDefaultsBtn">保存默认</button>

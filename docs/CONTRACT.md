@@ -342,7 +342,16 @@ enterpriseId 都不给）。两个计数按 provider 分域、各自独立：国
 `daemon.json` 的 `host`，三处日志/提示同口径）。
 
 ```
-GET  /api/hello                 -> {name, version, ready}
+GET  /api/hello                 -> {name, version, pid, ready}
+                                    // pid = 应答进程的 process.pid（2026-11 起）：探测方
+                                    // （lifecycle.probeDaemon → daemon 拒双开门/B6 写前
+                                    // 复查）据此做身份校验——「端口上应答的守护进程必须
+                                    // 就是 daemon.json 记的那个」才算双开冲突；否则 bind
+                                    // 后的自探（daemon.json 记着僵尸/复用 pid、端口正是
+                                    // 本进程刚绑的）会被「有人应答即外来」的旧谓词误判成
+                                    // 外来双开，新进程自己把自己劝退、永远起不来。老版本
+                                    // hello 没有 pid 字段，探测方对缺 pid 的响应保守判
+                                    // 冲突（升级期兼容口径）
 GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     intlSkipped:{count,note},   // 只读诊断计数：国际版账号
                                     // 的数量与去向说明（note="本插件只服务国内版 workbuddy，

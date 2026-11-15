@@ -70,14 +70,16 @@ import {
 import { readAuthDocument } from "./engine/store.mjs"
 // 排程时间口径（CONTRACT §7/§8）：窗口小时与同日去重日界一律北京时间（UTC+8），
 // 与容器时区无关 —— 生产容器是 UTC，getHours() 会把北京 09:00 读成 1 点。
-import { beijingDateKey, beijingHour } from "./engine/constants.mjs"
+// 防风控节奏（铁律 4）的两个常量也出自 constants.mjs：DEFAULT_GAP_MS（未配置时
+// 的默认值）与 MIN_UPSTREAM_GAP_MS（红线下限，见 upstreamGapMs()）。
+import { beijingDateKey, beijingHour, DEFAULT_GAP_MS, MIN_UPSTREAM_GAP_MS } from "./engine/constants.mjs"
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.6")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.7")
   } catch {
-    return "0.3.6"
+    return "0.3.7"
   }
 })()
 
@@ -97,6 +99,14 @@ const HISTORY_CAP = 2000
 // GET /api/streak 的连登缓存（CONTRACT §10.2）与它同口径（10 分钟新鲜期）。
 export const CREDITS_TTL_MS = 10 * 60 * 1000
 
+// job.log 出门长度上限（F2）：与看板前端的 LOG_MAX_LINES = 2000 对齐。safeJob
+// 是 /api/state、/api/run、SSE job 事件等所有 job 出口的统一闸门 —— 长跑 job
+// 数百步/数千行会让 payload 与前端重绘量随时间线性增长。超过上限时是**有意的
+// 截断**、只保留最新的 LOG_MAX_LINES 行：前端已实现同值客户端上限，会把「来源
+// 收缩」当成截断信号自行 resync，无需任何分页协议。只封长度，不改 /api/state
+// 的结构。导出供测试对齐。
+export const LOG_MAX_LINES = 2000
+
 // 排程小时窗口只认这六条腿（契约 §7/§8/§10.3/§11.1）：到点自动跑的都是无任务码
 // 的腿；growth 刻意不在排程里（engine/schedule.SCHEDULE_WINDOWS 同口径），只能手动
 // 发起（看板「立即运行」/ POST /api/run / 工具，可配合 codes 勾选）。
@@ -109,7 +119,15 @@ const DEFAULT_SETTINGS = {
   // 手动运行未指定 legs 时的默认腿（0.3.3 起新增 streak：连登管家是纯收益且
   // 幂等，默认做；已在 settings.json 里存过 legs 的实例不受影响）。
   legs: ["growth", "streak", "travel"],
-  gapMs: 1500, // 账号之间的基础间隔（手动）；排程时 runner 另加 2–5s 抖动
+  // gapMs 是「单次上游调用间距」（铁律 4 红线）：任意两次上游调用之间（start-
+  // start）的最小间隔，读侧一律经 upstreamGapMs() 收敛，实际生效值永远 ≥
+  // MIN_UPSTREAM_GAP_MS(1000ms)——红线只可调得更保守，不可突破；/api/settings
+  // 的可设下限与之对齐（能设的 = 实际生效的）。**它与「账号之间的节奏」是两
+  // 件事**：账号与账号之间的手动节奏固定 1.5s、排程 2–5s 抖动
+  //（engine/schedule.accountGapMs，见 jitterMs），不读这个值、也不受红线下限
+  // 约束。旧注释「账号之间的基础间隔（手动）」是历史口径，runner 的账号间隔
+  // 现由 accountGapMs 决定，settings.gapMs 只喂上游调用间距。
+  gapMs: 1500,
   jitterMs: [2000, 5000], // 排程运行的账号间抖动（交给 runner，见契约 §0.4）
   // 北京小时窗口 UTC+8（只有 mp|campaign|buddy|streak|travel|night 可配窗口，
   // growth 无窗口；与容器时区无关）。**默认全部空 = 默认不排任何腿，留空即不
@@ -139,8 +157,6 @@ export function normalizeScheduleHours(raw) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const nowIso = () => new Date().toISOString()
-const dateKey = (d = new Date()) =>
-  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
 
 // ---- 日期键小工具（小程序链式锁专用，全部 UTC 毫秒算术，与宿主时区无关）------
 const DAY_MS = 86400000
@@ -720,6 +736,21 @@ export async function startDaemon(opts = {}) {
   // 默认值复活）。growth 仍可手动跑：settings.legs / POST /api/run 的 legs 不受影响。
   settings.hours = normalizeScheduleHours({ ...DEFAULT_SETTINGS.hours, ...(settings.hours ?? {}) })
   settings.host = { ...DEFAULT_SETTINGS.host, ...(settings.host ?? {}) }
+
+  // upstreamGapMs() -> 实际生效的「单次上游调用间距」（铁律 4 红线的唯一收敛读法）。
+  // daemon 里任何把 settings.gapMs 交给 spacer / engineOpts / runnerCtx 的路径都
+  // 必须经这里取值，不许各自直读 —— 否则下次新增路径就会漏掉兜底（这正是旧版
+  // 能被面板旋钮破线的原因）。保证：
+  //   1. 实际生效值永远 ≥ MIN_UPSTREAM_GAP_MS(1000ms)——settings.gapMs 非法
+  //     （0/负数/NaN）时按 DEFAULT_GAP_MS 兜底再抬线；旧版落盘的 500 在这里被
+  //     无声抬到 1000（红线只能更保守，绝不放宽）；
+  //   2. 旋钮调大仍然生效（Math.max 不封顶；/api/settings 另有 10000 上限）；
+  //   3. 改设置即时生效（每次现读 settings.gapMs）。
+  // 口径提醒：「账号之间的节奏」（手动 1.5s / 排程 2–5s 抖动，
+  // engine/schedule.accountGapMs）是另一件事，不走这里、不受此红线下限约束。
+  function upstreamGapMs() {
+    return Math.max(MIN_UPSTREAM_GAP_MS, Number(settings.gapMs) || DEFAULT_GAP_MS)
+  }
   let snapshots = readJson(snapshotsFile, {})
   let history = Array.isArray(readJson(historyFile, [])) ? readJson(historyFile, []) : []
   let fired = readJson(firedFile, {})
@@ -895,7 +926,7 @@ export async function startDaemon(opts = {}) {
   // engine 缺 makeSpacer（老引擎/测试假引擎）时降级为 null，行为与旧版一致。
   const upstreamSpacer =
     typeof engine?.upstream?.makeSpacer === "function"
-      ? engine.upstream.makeSpacer({ now, sleep: sleepFn, gap: () => settings.gapMs })
+      ? engine.upstream.makeSpacer({ now, sleep: sleepFn, gap: () => upstreamGapMs() })
       : null
 
   // ---- runner（settings 就绪后再构造；ctx 只依赖契约 §2 + runner 的可选 opts） ----
@@ -909,16 +940,29 @@ export async function startDaemon(opts = {}) {
     loadAccounts: () => loadAccountsCn(),
     // 铁律 3：token 刷新后原子回写 plugin-auth.json（engine/store.saveAccountRefresh），
     // 保证 magpie 社区插件与我们用的是同一对凭据。
+    // B3：store 的写前竞态复查发现「第三方（magpie 宿主/导入确认）刚并发改写过
+    // plugin-auth.json」时经 onConflict 在这里留显式日志（daemon 的日志出口），
+    // 绝不静默丢弃；连续两轮不符时 store 抛 WB_AUTH_WRITE_CONFLICT，runner 会把
+    // 该账号这一步记为「刷新成功但回写失败」（job.log 可见），下次刷新自然重试。
     saveRefresh: (acctKey, patch) => {
       const save = engine?.store?.saveAccountRefresh
       if (typeof save !== "function") {
         throw new Error("引擎未提供 saveAccountRefresh（engine/store.mjs），拒绝回写凭据")
       }
-      return save(cfgDir, acctKey, patch)
+      return save(cfgDir, acctKey, patch, {
+        onConflict: (info) =>
+          log(
+            `[auth] ${acctKey} plugin-auth.json 检测到并发写（第 ${info?.attempt} 轮写前复查不符` +
+              `${info?.stage === "giveup" ? "，放弃本次回写" : "，重读后重试"}）：` +
+              `第三方可能刚轮换过 refresh token，已按新文档为准，避免覆盖新凭据`,
+          ),
+      })
     },
-    // settings 动态读取（getter：spread 进 legOpts 时取当前值，改设置对下一个 job 生效）
+    // settings 动态读取（getter：spread 进 legOpts 时取当前值，改设置对下一个
+    // job 生效）。经 upstreamGapMs() 收敛：runner 的腿间 sleep 与 daily 上报的
+    // gap 也永远 ≥ 红线下限（铁律 4）。
     get gap() {
-      return settings.gapMs
+      return upstreamGapMs()
     },
     // 每日活跃（CONTRACT §7）：幂等账本与落盘回调交给 runner —— runner 在每个
     // 账号开跑前调 engine/daily.reportDailyActivity，成功经 onDailySent 原子写回
@@ -1144,7 +1188,10 @@ export async function startDaemon(opts = {}) {
       ...(opts.fetch ? { fetch: opts.fetch } : {}),
       now,
       sleep: sleepFn,
-      gap: settings.gapMs,
+      // 经 upstreamGapMs() 收敛（铁律 4 红线）：engineOpts() 是 daemon 内所有
+      // 引擎调用的唯一 opts 工厂，这里的 gap 一收敛，手动操作/快照/积分/连登
+      // 等全部路径的「单次上游调用间距」都不会低于红线下限。
+      gap: upstreamGapMs(),
       ...(upstreamSpacer ? { spacer: upstreamSpacer } : {}),
       bases: { chat: settings.host.chat || "", bill: settings.host.bill || "", web: settings.host.web || "" },
       env: { WB_CONFIG_DIR: cfgDir, WB_STATE_DIR: stateDir },
@@ -1242,53 +1289,40 @@ export async function startDaemon(opts = {}) {
     }
   }
 
-  // ---- 活动缓存收尾刷新（CONTRACT §11.5：job 结束写回 state/campaign.json）--
-  // job 真跑过 campaign 腿的账号，收尾时静默 fetchCampaignState 写回
-  // state/campaign.json —— 让看板活动明细在 job 完成后自动更新（不再要求用户
-  // 手动点「刷新快照」）。调用方（finalizeJob）按 step.leg === "campaign" 过滤，
-  // 没跑 campaign 腿的账号不进这里（没跑就查一次上游是浪费）。节奏与
-  // refreshSnapshots 同款：每账号前 ≥1s 限速红线 + 账号间隔 1500ms，上游调用
-  // 经 engineOpts() 的全局节流器排队（绝不绕过铁律 4）；有 job 在跑就让路。
-  // 失败只记日志（restricted 也只是失败文案，绝不在收尾路径冻结账号），绝不抛、
-  // 绝不影响 job 结论 —— 调用点 fire-and-forget（.catch(() => {})）。
-  async function refreshCampaignAfterJob(uids) {
-    const fn = engine?.campaign?.fetchCampaignState
-    if (typeof fn !== "function") return
-    for (const uid of uids) {
-      if (runner?.current()) return // 有 job 在跑就让路，别跟它抢限速窗口（同 refreshSnapshots）
-      const acct = accountByUid(uid)
-      if (!acct) continue
-      try {
-        await sleepFn(1000) // 限速红线：与上一轮上游调用（可能是刚结束的 job）之间 ≥1s
-        const state = await fn(acct, engineOpts(acct))
-        if (state?.ok) {
-          // 只写缓存投影（与 fetchCampaignForUid 成功路径同一落点）：/api/state
-          // 的 accounts[].campaign 与 GET /api/campaign 的 TTL（state.updatedISO）
-          // 从下一次读取起自动看到新值。
-          campaignCache[uid] = state
-          saveCampaign()
-        } else {
-          log(`[campaign] ${uid} 刷新失败：${scrub(String(state?.error || state?.msg || "活动任务读取失败"))}`)
-        }
-      } catch (e) {
-        log(`[campaign] ${uid} 刷新失败：${shortErr(e)}`)
-      }
-      await sleepFn(1500) // 账号间隔
-    }
+  // ---- 收尾缓存刷新（CONTRACT §11.5：job 结束静默写回缓存投影）--------------
+  // refreshCachedAfterJob(kind, uids)：campaign / streak 两条收尾刷新链路原本是
+  // 两段近乎逐字的重复块（差异只有引擎函数、缓存字段、落盘器与文案），收敛成
+  // 一处 —— 限速/让路/失败口径修正只改这里。kind：
+  //   campaign → engine.campaign.fetchCampaignState 写 state/campaign.json
+  //   streak   → engine.streak.fetchStreakState   写 state/streak.json
+  // 触发条件由调用方（finalizeJob）按 step.leg === kind 且非 skip 过滤（腿没跑/
+  // 冻结跳过都不刷，没跑就查一次上游是浪费），两条刷新在 finalizeJob 里串行执行
+  //（绝不并发打上游），前端「跑一轮」改走 job 后由此回填看板（不再要求用户手动
+  // 点「刷新快照」）。节奏与 refreshSnapshots 同款：每账号前 ≥1s 限速红线 +
+  // 账号间隔 1500ms，上游调用经 engineOpts() 的全局节流器排队（绝不绕过铁律 4）；
+  // 有 job 在跑就让路（直接 return，后面的账号也不刷）。失败只记日志（restricted
+  // 也只是失败文案，绝不在收尾路径冻结账号），绝不抛、绝不影响 job 结论 ——
+  // 调用点 fire-and-forget（.catch(() => {})）。
+  const AFTER_JOB_REFRESH_SPECS = {
+    campaign: {
+      engineFn: () => engine?.campaign?.fetchCampaignState,
+      cache: campaignCache,
+      save: saveCampaign,
+      tag: "campaign",
+      fallback: "活动任务读取失败",
+    },
+    streak: {
+      engineFn: () => engine?.streak?.fetchStreakState,
+      cache: streakCache,
+      save: saveStreak,
+      tag: "streak",
+      fallback: "连登状态查询失败",
+    },
   }
 
-  // ---- 连登缓存收尾刷新（§11.5 对称缺口：job 结束写回 state/streak.json）----
-  // 前端「跑一轮」改走 job 后，连登天数/补签卡/抽奖数不再有 POST /api/streak/run
-  // 的返回值可即时回填 —— job 真跑过 streak 腿的账号，收尾时静默
-  // fetchStreakState 写回 state/streak.json（与 GET /api/streak 成功路径同一
-  // 落点；/api/state 投影与 TTL 依据 updatedISO 自动看到新值）。触发条件、节奏、
-  // 失败口径与 refreshCampaignAfterJob 完全同款：调用方（finalizeJob）按
-  // step.leg === "streak" 且非 skip 过滤（腿没跑/冻结跳过都不刷），两条刷新在
-  // finalizeJob 里串行执行（绝不并发打上游），每账号前 ≥1s 限速红线 + 账号
-  // 间隔 1500ms，上游调用经 engineOpts() 的全局节流器排队；有 job 在跑就让路；
-  // 失败只记日志，绝不抛、绝不影响 job 结论。
-  async function refreshStreakAfterJob(uids) {
-    const fn = engine?.streak?.fetchStreakState
+  async function refreshCachedAfterJob(kind, uids) {
+    const spec = AFTER_JOB_REFRESH_SPECS[kind]
+    const fn = spec?.engineFn?.()
     if (typeof fn !== "function") return
     for (const uid of uids) {
       if (runner?.current()) return // 有 job 在跑就让路，别跟它抢限速窗口（同 refreshSnapshots）
@@ -1298,14 +1332,16 @@ export async function startDaemon(opts = {}) {
         await sleepFn(1000) // 限速红线：与上一轮上游调用（可能是刚结束的 job）之间 ≥1s
         const state = await fn(acct, engineOpts(acct))
         if (state?.ok) {
-          // 只写缓存投影（与 fetchStreakForUid 成功路径同一落点）
-          streakCache[uid] = state
-          saveStreak()
+          // 只写缓存投影（与 fetchCampaignForUid/fetchStreakForUid 成功路径同一
+          // 落点）：/api/state 的 accounts[].campaign|streak 与 GET /api/campaign
+          // |streak 的 TTL（state.updatedISO）从下一次读取起自动看到新值。
+          spec.cache[uid] = state
+          spec.save()
         } else {
-          log(`[streak] ${uid} 刷新失败：${scrub(String(state?.error || state?.msg || "连登状态查询失败"))}`)
+          log(`[${spec.tag}] ${uid} 刷新失败：${scrub(String(state?.error || state?.msg || spec.fallback))}`)
         }
       } catch (e) {
-        log(`[streak] ${uid} 刷新失败：${shortErr(e)}`)
+        log(`[${spec.tag}] ${uid} 刷新失败：${shortErr(e)}`)
       }
       await sleepFn(1500) // 账号间隔
     }
@@ -1345,12 +1381,18 @@ export async function startDaemon(opts = {}) {
   }
 
   function computeStats() {
-    const today = dateKey()
+    // 「今日」口径（P3-1）：与全仓日期口径（排程窗口/同日去重/连登/夜猫子）一致，
+    // 一律**北京日**（engine/constants 的 beijingDateKey，UTC 16:00 整翻北京日）。
+    // 旧版 today 用宿主时区 dateKey()、行侧取 ISO 串的 UTC 日期段 —— UTC 容器里
+    // 「今日积分」要到北京 08:00 才翻日；UTC+8 宿主上则是拿宿主日比 UTC 日，
+    // 两头都是错口径。行侧 beijingDayFromIso 解析不了的脏 at 视作不属今日（与
+    // 旧行为「匹配不上就跳过」一致）。
+    const today = beijingDateKey(now())
     let credit = 0
     let energy = 0
     const jobIds = new Set()
     for (const r of history) {
-      if (String(r.at ?? "").slice(0, 10) !== today) continue
+      if (beijingDayFromIso(r.at) !== today) continue
       if (r.state === "ok" || r.state === "skip") {
         credit += Number(r.credit) || 0
         energy += Number(r.energy) || 0
@@ -1376,6 +1418,40 @@ export async function startDaemon(opts = {}) {
     }
   }
 
+  // SSE keepalive 心跳（P3-3）：空闲的长连接可能被反代/中间层静默掐断 —— 每
+  // SSE_PING_MS 给所有客户端写一行合法的 SSE 注释（": ping\n\n"，EventSource 与
+  // 各类解析器都会忽略注释行，不产生任何事件），用来保活 TCP 与中间层超时。
+  // 生命周期与文件里既有定时器（every/timers）同款口径：
+  //   · 定时器 unref（不阻止进程自然退出）；
+  //   · 首个客户端连上才起表（没有客户端绝不空转）；
+  //   · 最后一个客户端断开时停表（并从 timers 登记簿摘除，不留泄漏）；
+  //   · shutdown 时随 timers 统一清掉。
+  const ssePingMs = Number.isFinite(opts.ssePingMs) ? Math.max(1, Math.floor(opts.ssePingMs)) : 25000
+  let ssePingTimer = null
+  function ssePing() {
+    for (const res of sseClients) {
+      try {
+        res.write(": ping\n\n")
+      } catch {
+        sseClients.delete(res)
+      }
+    }
+  }
+  function sseStartPing() {
+    if (ssePingTimer) return
+    ssePingTimer = setInterval(ssePing, ssePingMs)
+    ssePingTimer.unref?.()
+    timers.push(ssePingTimer)
+  }
+  function sseStopPingIfIdle() {
+    if (ssePingTimer && sseClients.size === 0) {
+      clearInterval(ssePingTimer)
+      const i = timers.indexOf(ssePingTimer)
+      if (i >= 0) timers.splice(i, 1)
+      ssePingTimer = null
+    }
+  }
+
   // job 观察者：轮询 runner 的 Job，把新增 step / log 行 / 状态变化推给 SSE，
   // job 结束时落历史、刷新快照。只依赖契约 §2 的 get()/current()。
   let watchedJobId = null
@@ -1394,7 +1470,9 @@ export async function startDaemon(opts = {}) {
   function safeJob(job) {
     if (!job) return null
     const j = { ...job }
-    if (Array.isArray(j.log)) j.log = j.log.map(scrub)
+    // job.log 出门截断（F2，见 LOG_MAX_LINES 注释）：只留最新的 LOG_MAX_LINES 行
+    // —— 这是有意的截断，前端按「来源收缩」自行 resync。
+    if (Array.isArray(j.log)) j.log = j.log.slice(-LOG_MAX_LINES).map(scrub)
     if (Array.isArray(j.steps)) j.steps = j.steps.map((s) => ({ ...s, detail: scrub(s.detail ?? "") }))
     return j
   }
@@ -1435,8 +1513,8 @@ export async function startDaemon(opts = {}) {
     // 队，这里再把两个刷新巡回也串起来 —— 绝不并发打上游；中途有新 job 启动时
     // 各自让路。fire-and-forget：失败只记日志，绝不影响 job 结论。
     const refreshCachesAfterJob = async () => {
-      if (campaignUids.length) await refreshCampaignAfterJob(campaignUids)
-      if (streakUids.length) await refreshStreakAfterJob(streakUids)
+      if (campaignUids.length) await refreshCachedAfterJob("campaign", campaignUids)
+      if (streakUids.length) await refreshCachedAfterJob("streak", streakUids)
     }
     if (campaignUids.length || streakUids.length) refreshCachesAfterJob().catch(() => {})
   }
@@ -1499,6 +1577,21 @@ export async function startDaemon(opts = {}) {
     return out
   }
 
+  // pruneFired(nowMs)：lastFired.json 的防膨胀闸（P3-2）。去重键形状是
+  // `legs@h@北京日`，日期段一过就永远不可能再命中任何未来 fireKey —— 写键时
+  // 顺带删掉早于北京「今天」的全部条目，文件收敛在「当日键数（≤ legs×24）+
+  // lastCycle」，不再随天数线性增长。lastCycle 是 ISO 时间戳（不是日期键），
+  // 不属清理对象。读改写与 saveFired 同一内存对象 + writeJson 的 tmp+rename
+  // 原子落盘（与既有的 fired 写入同款并发口径，无额外窗口）。
+  function pruneFired(nowMs = now()) {
+    const today = beijingDateKey(nowMs)
+    for (const k of Object.keys(fired)) {
+      if (k === "lastCycle") continue
+      const m = /@(\d{4}-\d{2}-\d{2})$/.exec(k)
+      if (m && m[1] < today) delete fired[k]
+    }
+  }
+
   function checkScheduler(nowMs = Date.now()) {
     try {
       if (!settings.scheduler) return null
@@ -1523,6 +1616,7 @@ export async function startDaemon(opts = {}) {
       if (!eligible.length) {
         // 没账号就不算「触发过」，但也不必 30s 一试：标记掉，明天的窗口再说
         fired[fireKey] = nowIso()
+        pruneFired(nowMs) // P3-2：写键时顺带剔除早于北京今日的陈旧条目
         saveFired()
         log(`[scheduler] 窗口 ${fireKey} 到点但没有可参与任务的账号，跳过`)
         broadcast({ kind: "scheduler", event: "skip", legs, hour: h, reason: "无可参与账号" })
@@ -1539,6 +1633,7 @@ export async function startDaemon(opts = {}) {
       fired[fireKey] = nowIso()
       fired.lastCycle = fired[fireKey]
       lastCycle = fired[fireKey]
+      pruneFired(nowMs) // P3-2：写键时顺带剔除早于北京今日的陈旧条目
       saveFired()
       broadcast({ kind: "scheduler", event: "fire", legs, hour: h, jobId: job?.id ?? null })
       log(`[scheduler] 窗口触发：${legs.map((l) => LEG_NAMES[l] ?? l).join(" + ")}，job ${job?.id ?? "?"}`)
@@ -1615,7 +1710,10 @@ export async function startDaemon(opts = {}) {
       legs,
       claim: spec.claim !== undefined ? !!spec.claim : settings.claim,
       trigger: spec.trigger === "schedule" ? "schedule" : "manual",
-      gapMs: settings.gapMs,
+      // job spec 里的 gapMs 同样经 upstreamGapMs() 收敛（当前 runner 不读这个
+      // spec 字段，账号间隔走 accountGapMs；收敛只为「settings.gapMs 的所有
+      // 出口都是生效值」这一个口径，防止未来有人接上它时拿到未抬线的值）。
+      gapMs: upstreamGapMs(),
       jitterMs: Array.isArray(spec.jitterMs) ? spec.jitterMs : settings.jitterMs,
       // 任务级勾选（CONTRACT §3）：body.codes 的两种形状在这里归一成
       // {uid: string[]} | null；growth 腿在 runner 里据此只处理选中任务。
@@ -1656,8 +1754,9 @@ export async function startDaemon(opts = {}) {
     if (runner?.current()) {
       return { status: 409, body: { error: "busy" } }
     }
-    // 限速红线：手动操作与上一次上游调用（可能是刚结束的 job）之间也 ≥1s
-    await sleepFn(Math.max(1000, Number(settings.gapMs) || 0))
+    // 限速红线：手动操作与上一次上游调用（可能是刚结束的 job）之间也 ≥1s。
+    // 这里的手写 Math.max 已收敛进 upstreamGapMs()（同一个红线下限，别再散写）。
+    await sleepFn(upstreamGapMs())
     try {
       return { status: 200, body: await handler() }
     } catch (e) {
@@ -1834,22 +1933,25 @@ export async function startDaemon(opts = {}) {
     return out
   }
 
-  // ---- 积分余额（GET /api/credits，CONTRACT §3）---------------------------
-  // engine/credits.fetchCredits 的只读封装 + state/credits.json 缓存。
-  // 节流：不用 manualOp 包裹（manualOp 的 409 口径太粗）——
+  // ---- 「只读封装 + 缓存」三端点的公共骨架（GET /api/credits §3、/api/streak §10.2、
+  // ---- /api/campaign §11.1）--------------------------------------------------
+  // fetchCachedForUid(spec, uid, force)：三段近乎逐字的重复块收敛成一处 —— 404/
+  // 409/TTL/503 这些口径（最容易被口径修正改漏两处的地方）只改这里。各端点只注入
+  // 差异（见 CACHED_READER_SPECS）：引擎函数、engineOpts 参数、缓存读写器、新鲜期
+  // 判定、响应体形状与端点特有的附加行为。控制流（与原三份逐字等价）：
+  //   · 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
+  //     一律 404（intl 与企业版账号在 accountByUid 里就已经是「找不到」）。企业版
+  //     给专属文案（issue #3）：ENTERPRISE_NO_GROWTH_MSG 说清「为什么看不到」与
+  //     「去哪里看」，绝不泄露昵称/域名/enterpriseId 等额外信息；
   //   · 缓存新鲜且未强制 refresh → 直接回缓存，一次上游都不发；
   //   · 要拉取时 job 在跑（或已在拉取中）→ 409 busy，避免跟 job 抢节流窗口；
   //     但「有缓存且未 refresh」时仍直接回缓存（哪怕已过期）——展示优先；
-  //   · 真拉取走 engineOpts()（唯一 spacer/fetch/gap），engine 内部每次调用前
-  //     breathe + 经全局节流器排队，≥1s 的铁律 4 照常成立。
-  let creditsBusy = false
-
-  async function fetchCreditsForUid(uid, force = false) {
-    // 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
-    // 一律 404（intl 与企业版账号在 accountByUid 里就已经是「找不到」）。
-    // 企业版给专属文案（issue #3）：账号在 magpie 里确实存在，只是企业版没有
-    // 成长体系 —— 404 说清「为什么看不到」与「去哪里看」（ENTERPRISE_NO_GROWTH_MSG），
-    // 绝不泄露昵称/域名/enterpriseId 等额外信息。
+  //   · 引擎能力缺失 → 503（engineErrorsText）；真拉取走 engineOpts（唯一
+  //     spacer/fetch/gap），≥1s 的铁律 4 照常成立；
+  //   · 拉取成功 → 写缓存 + 落盘（credits 另发 SSE 提示）；失败/异常 → 200 +
+  //     ok:false|error，错误文本过 scrub，旧缓存原样保留并一并带回；busy 盒子
+  //     try/finally 保证并发闸不悬挂。
+  async function fetchCachedForUid(spec, uid, force = false) {
     const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
     if (raw) {
       return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
@@ -1859,54 +1961,135 @@ export async function startDaemon(opts = {}) {
       return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
     }
     const nickname = acct.nickname || acct.accountId || uid
-    const cached = cachedCreditsOf(uid)
-    const fresh =
-      !!cached && Number(cached.updatedAt) > 0 && now() - Number(cached.updatedAt) < CREDITS_TTL_MS
-    if (cached && !force && fresh) {
-      return { status: 200, body: { ok: true, uid, nickname, credits: cached } }
+    const cached = spec.cacheOf(uid)
+    if (cached && !force && spec.isFresh(cached)) {
+      return { status: 200, body: spec.body.cachedHit(uid, nickname, cached) }
     }
-    if (runner?.current() || creditsBusy) {
-      if (cached && !force) return { status: 200, body: { ok: true, uid, nickname, credits: cached } }
+    if (runner?.current() || spec.busy.v) {
+      if (cached && !force) return { status: 200, body: spec.body.cachedHit(uid, nickname, cached) }
       return { status: 409, body: { error: "busy" } }
     }
-    const fn = engine?.credits?.fetchCredits
+    const fn = spec.engineFn()
     if (typeof fn !== "function") {
       return { status: 503, body: { error: engineErrorsText() } }
     }
-    creditsBusy = true
+    spec.busy.v = true
     try {
-      const r = await fn(acct, engineOpts())
-      if (r?.ok && r?.credits && typeof r.credits === "object") {
-        creditsCache[uid] = r.credits
-        saveCredits()
-        // 可选实时事件（前端不依赖；SSE 订阅方可以借此刷新积分卡片）
-        broadcast({ kind: "credits", uid })
-        return { status: 200, body: { ok: true, uid, nickname, credits: r.credits } }
+      const r = await fn(acct, spec.optsFor(acct))
+      const payload = spec.payloadOf(r)
+      if (payload) {
+        spec.cache[uid] = payload
+        spec.save()
+        if (spec.onCached) spec.onCached(uid)
+        return { status: 200, body: spec.body.ok(uid, nickname, payload) }
       }
-      // 上游失败：200 + ok:false，错误文本过 scrub；旧缓存原样保留并一并带回。
-      const body = { ok: false, uid, nickname, error: scrub(String(r?.error || r?.msg || "积分拉取失败")) }
-      if (r?.needRelogin) body.needRelogin = true
-      if (cached) body.credits = cached
-      return { status: 200, body }
+      // 上游失败：200 + ok:false|error，错误文本过 scrub；旧缓存原样保留并一并带回。
+      return {
+        status: 200,
+        body: spec.body.failed(r, uid, nickname, cached, scrub(String(r?.error || r?.msg || spec.fallbackMsg))),
+      }
     } catch (e) {
-      const body = { ok: false, uid, nickname, error: shortErr(e) }
-      if (cached) body.credits = cached
-      return { status: 200, body }
+      return { status: 200, body: spec.body.failed(null, uid, nickname, cached, shortErr(e)) }
     } finally {
-      creditsBusy = false
+      spec.busy.v = false
     }
   }
 
-  // ---- 连登管家（CONTRACT §10.2）-----------------------------------------------------------
-  // GET /api/streak：engine/streak.fetchStreakState 的只读封装 + state/streak.json
-  // 缓存（uid -> streak state），新鲜期 10 分钟（CREDITS_TTL_MS，与 /api/credits
-  // 同口径）。节流口径与 credits 相同：
-  //   · 缓存新鲜且未强制 refresh → 直接回缓存，一次上游都不发；
-  //   · 要拉取时 job 在跑（或已在拉取中）→ 409 busy；但「有缓存且未 refresh」
-  //     时仍直接回缓存（哪怕已过期）—— 展示优先，绝不硬闯；
-  //   · refresh=1 → 无视 TTL 强制拉取（busy 时仍 409）。
-  // /api/state 的 accounts[].streak 只读投影缓存（cachedStreakOf），绝不为它打上游。
-  let streakBusy = false
+  // 三端点的差异注入表。这些是**真实差异**，不是文案：
+  //   · 新鲜期依据：credits 缓存带 updatedAt（毫秒数值），streak/campaign 带
+  //     updatedISO（ISO 8601，引擎各自落的查询时刻）—— 两种时间戳形状并存；
+  //   · engineOpts 参数：credits 的引擎调用不带账号（fetchCredits 历史口径），
+  //     streak/campaign 带 acct（附 mp 锁回调）；
+  //   · 响应体形状：credits 带 {ok, uid, nickname} 信封（§3）且失败透传
+  //     needRelogin；streak/campaign 带 {uid, cached} 布尔（§10.2/§11.1），
+  //     campaign 失败透传 restricted（账号级风控信号，credits/streak 无此字段）；
+  //   · credits 成功后广播 {kind:"credits"} 给 SSE 订阅方（前端借此刷新积分卡片，
+  //     可选事件；streak/campaign 的看板列由 /api/state 轮询驱动，不需要事件）。
+  const creditsBusy = { v: false }
+  const streakBusy = { v: false }
+  const campaignBusy = { v: false }
+
+  const CACHED_READER_SPECS = {
+    credits: {
+      engineFn: () => engine?.credits?.fetchCredits,
+      optsFor: () => engineOpts(),
+      cacheOf: cachedCreditsOf,
+      cache: creditsCache,
+      save: saveCredits,
+      busy: creditsBusy,
+      isFresh: (c) => Number(c?.updatedAt) > 0 && now() - Number(c?.updatedAt) < CREDITS_TTL_MS,
+      payloadOf: (r) => (r?.ok && r?.credits && typeof r.credits === "object" ? r.credits : null),
+      onCached: (cachedUid) => broadcast({ kind: "credits", uid: cachedUid }),
+      fallbackMsg: "积分拉取失败",
+      body: {
+        cachedHit: (uid, nickname, cached) => ({ ok: true, uid, nickname, credits: cached }),
+        ok: (uid, nickname, payload) => ({ ok: true, uid, nickname, credits: payload }),
+        failed: (r, uid, nickname, cached, message) => {
+          const body = { ok: false, uid, nickname, error: message }
+          if (r?.needRelogin) body.needRelogin = true
+          if (cached) body.credits = cached
+          return body
+        },
+      },
+    },
+    streak: {
+      engineFn: () => engine?.streak?.fetchStreakState,
+      optsFor: (acct) => engineOpts(acct),
+      cacheOf: cachedStreakOf,
+      cache: streakCache,
+      save: saveStreak,
+      busy: streakBusy,
+      isFresh: (c) => {
+        const atMs = Date.parse(String(c?.updatedISO ?? ""))
+        return Number.isFinite(atMs) && now() - atMs < CREDITS_TTL_MS
+      },
+      payloadOf: (r) => (r?.ok ? r : null),
+      fallbackMsg: "连登状态查询失败",
+      body: {
+        cachedHit: (uid, _nickname, cached) => ({ uid, cached: true, streak: cached }),
+        ok: (uid, _nickname, payload) => ({ uid, cached: false, streak: payload }),
+        failed: (_r, uid, _nickname, cached, message) => {
+          const body = { uid, cached: false, error: message }
+          if (cached) body.streak = cached
+          return body
+        },
+      },
+    },
+    campaign: {
+      engineFn: () => engine?.campaign?.fetchCampaignState,
+      optsFor: (acct) => engineOpts(acct),
+      cacheOf: cachedCampaignOf,
+      cache: campaignCache,
+      save: saveCampaign,
+      busy: campaignBusy,
+      isFresh: (c) => {
+        const atMs = Date.parse(String(c?.updatedISO ?? ""))
+        return Number.isFinite(atMs) && now() - atMs < CREDITS_TTL_MS
+      },
+      payloadOf: (r) => (r?.ok ? r : null),
+      fallbackMsg: "活动任务读取失败",
+      body: {
+        cachedHit: (uid, _nickname, cached) => ({ uid, cached: true, campaign: cached }),
+        ok: (uid, _nickname, payload) => ({ uid, cached: false, campaign: payload }),
+        failed: (r, uid, _nickname, cached, message) => {
+          const body = { uid, cached: false, error: message }
+          if (r?.restricted) body.restricted = true
+          if (cached) body.campaign = cached
+          return body
+        },
+      },
+    },
+  }
+
+  const fetchCreditsForUid = (uid, force = false) => fetchCachedForUid(CACHED_READER_SPECS.credits, uid, force)
+  const fetchStreakForUid = (uid, force = false) => fetchCachedForUid(CACHED_READER_SPECS.streak, uid, force)
+  const fetchCampaignForUid = (uid, force = false) => fetchCachedForUid(CACHED_READER_SPECS.campaign, uid, force)
+
+  // ---- 连登管家（CONTRACT §10.2）-------------------------------------------
+  // GET /api/streak 走 fetchCachedForUid 公共骨架（见上方三端点注释）；
+  // state/streak.json 缓存（uid -> streak state），新鲜期 10 分钟
+  //（CREDITS_TTL_MS，与 /api/credits 同口径）。/api/state 的 accounts[].streak
+  // 只读投影缓存（cachedStreakOf），绝不为它打上游。
 
   // 连登缓存的单条读取：形状不对（手改坏文件）视作没有，绝不下发垃圾。
   function cachedStreakOf(uid) {
@@ -1914,59 +2097,40 @@ export async function startDaemon(opts = {}) {
     return c && typeof c === "object" && !Array.isArray(c) ? c : null
   }
 
-  async function fetchStreakForUid(uid, force = false) {
-    // 可参与口径与 eligibleAccounts 一致：找不到 / API key / 企业号 / 已停用
-    // 一律 404（intl 与企业版账号在 accountByUid 里就已经是「找不到」）；
-    // 企业版专属文案与 /api/credits 同一段（§10.8 镜像口径）。
-    const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
-    if (raw) {
-      return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
-    }
-    const acct = accountByUid(uid)
-    if (!acct || acct.isApiKey || acct.tasksEnabled === false) {
-      return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
-    }
-    const cached = cachedStreakOf(uid)
-    // 新鲜期依据 state.updatedISO（ISO 8601，fetchStreakState 落的查询时刻）
-    const atMs = Date.parse(String(cached?.updatedISO ?? ""))
-    const fresh = !!cached && Number.isFinite(atMs) && now() - atMs < CREDITS_TTL_MS
-    if (cached && !force && fresh) {
-      return { status: 200, body: { uid, cached: true, streak: cached } }
-    }
-    if (runner?.current() || streakBusy) {
-      if (cached && !force) return { status: 200, body: { uid, cached: true, streak: cached } }
-      return { status: 409, body: { error: "busy" } }
-    }
-    const fn = engine?.streak?.fetchStreakState
-    if (typeof fn !== "function") {
-      return { status: 503, body: { error: engineErrorsText() } }
-    }
-    streakBusy = true
-    try {
-      const state = await fn(acct, engineOpts(acct))
-      if (state?.ok) {
-        streakCache[uid] = state
-        saveStreak()
-        return { status: 200, body: { uid, cached: false, streak: state } }
-      }
-      // 上游失败：200 + error，旧缓存原样保留并一并带回（streak 字段，若有）
-      const body = { uid, cached: false, error: scrub(String(state?.error || state?.msg || "连登状态查询失败")) }
-      if (cached) body.streak = cached
-      return { status: 200, body }
-    } catch (e) {
-      const body = { uid, cached: false, error: shortErr(e) }
-      if (cached) body.streak = cached
-      return { status: 200, body }
-    } finally {
-      streakBusy = false
-    }
+  // ---- 「跑一轮」双胞胎的公共骨架（POST /api/streak/run §10.2、
+  // ---- /api/campaign/run §11.1）--------------------------------------------
+  // runKindForUids(uids, spec)：两段近乎逐字的重复块收敛成一处 —— 缺省目标/截断/
+  // 冻结/账号间隔这些口径只改这里。各端点只注入差异（RUN_KIND_SPECS）：引擎函数、
+  // 冻结文案、restricted 条目的附加字段（campaign 附 detail，streak 不附 —— 原两
+  // 份的真实差异，照原样保留）与结果解读（interpret，两腿的 outcome/message/detail
+  // 口径本就不同）。控制流（与原两份逐字等价）：
+  //   · 引擎能力缺失 → 抛 engineErrorsText（manualOp 转 500）；
+  //   · 缺省/空 uids = 全部「未冻结 + tasksEnabled」账号（eligibleNow 已排除冻结），
+  //     显式清单截前 20 个；
+  //   · 找不到账号 → failed 条目；显式点名的冻结账号如实失败（CONTRACT §10.5），
+  //     不静默跳过；
+  //   · restricted（403/11140）→ 当场冻结该账号（spec.freezeMsg 进 frozen.json）+
+  //     failed 条目；
+  //   · 引擎失败（ok !== true）→ failed + 最后一条 log（scrub 后）；
+  //   · 成功 → spec.interpret(r, uid) 出 outcome/earned/message/detail；
+  //   · 账号之间 1500 ms（手动手感，同 /api/checkin）。
+  const RUN_KIND_SPECS = {
+    streak: {
+      engineFn: () => engine?.streak?.runStreakSteward,
+      freezeMsg: "连登管家触发风控限制 (403/11140)",
+      restrictedExtra: () => ({}),
+      interpret: streakRunInterpret,
+    },
+    campaign: {
+      engineFn: () => engine?.campaign?.runCampaignTasks,
+      freezeMsg: "活动任务触发风控限制 (403/11140)",
+      restrictedExtra: (r) => ({ detail: campaignRunDetail(r) }),
+      interpret: campaignRunInterpret,
+    },
   }
 
-  // POST /api/streak/run：手动跑一轮连登管家（补签 → 礼包/补偿 → 兑换 → 抽奖）。
-  // 缺省/空 uids = 全部「未冻结 + tasksEnabled」账号（eligibleNow 已排除冻结）；
-  // 账号之间 1500 ms（手动手感，同 /api/checkin）；restricted 当场冻结该账号。
-  async function doStreakRun(uids) {
-    const fn = engine?.streak?.runStreakSteward
+  async function runKindForUids(uids, spec) {
+    const fn = spec.engineFn()
     if (typeof fn !== "function") throw new Error(engineErrorsText())
     const explicit = Array.isArray(uids) && uids.length
     const targets = (explicit ? uids.map(String) : eligibleNow().map((a) => a.uid)).slice(0, 20)
@@ -1990,45 +2154,17 @@ export async function startDaemon(opts = {}) {
       try {
         const r = await fn(acct, engineOpts(acct))
         if (r?.restricted) {
-          freezeAccount(uid, { code: 11140, message: "连登管家触发风控限制 (403/11140)" })
+          freezeAccount(uid, { code: 11140, message: spec.freezeMsg })
           out.push({
             uid,
             outcome: "failed",
             earned: Number(r.earned) || 0,
             message: "触发风控限制（403/11140），账号已冻结；确认无风险后在账号行点「恢复」",
+            ...spec.restrictedExtra(r),
           })
           continue
         }
-        const d = r?.actions ?? {}
-        const detail = {
-          days: Number(r?.streak?.days ?? 0) || 0,
-          makeupCards: Number(r?.streak?.makeupCards ?? 0) || 0,
-          lotteryChances: Number(r?.streak?.lotteryChances ?? 0) || 0,
-          makeupUsed: d.makeup?.used === true,
-          makeupDate: d.makeup?.date ?? "",
-          gifts: (Array.isArray(d.gifts) ? d.gifts : []).map((g) => ({ name: g?.name ?? "", credit: Number(g?.credit) || 0 })),
-          redeemed: Array.isArray(d.redeemed) ? d.redeemed : [],
-          drawn: Number(d.drawn) || 0,
-        }
-        if (r?.ok !== true) {
-          const why = scrub(String(r?.logs?.slice(-1)[0] ?? "连登管家执行失败"))
-          out.push({ uid, outcome: "failed", earned: Number(r?.earned) || 0, message: why, detail })
-          continue
-        }
-        const parts = [`连登 ${detail.days} 天`]
-        if (detail.makeupUsed) parts.push(`已补签 ${detail.makeupDate}`)
-        if (detail.gifts.length) parts.push(`礼包 ×${detail.gifts.length}`)
-        if (detail.redeemed.length) parts.push(`兑换 ${detail.redeemed.join("/")}`)
-        if (detail.drawn) parts.push(`抽奖 ${detail.drawn} 次`)
-        out.push({
-          uid,
-          outcome: r?.logs?.some((l) => l.includes("跳过")) && !detail.makeupUsed && !detail.gifts.length && !detail.redeemed.length && !detail.drawn
-            ? "skipped"
-            : "ok",
-          earned: Number(r.earned) || 0,
-          message: parts.join(" / ") + `，+${Number(r.earned) || 0} 积分`,
-          detail,
-        })
+        out.push(spec.interpret(r, uid))
       } catch (e) {
         out.push({ uid, outcome: "failed", earned: 0, message: shortErr(e) })
       }
@@ -2037,17 +2173,16 @@ export async function startDaemon(opts = {}) {
     return out
   }
 
+  // POST /api/streak/run：手动跑一轮连登管家（补签 → 礼包/补偿 → 兑换 → 抽奖）。
+  async function doStreakRun(uids) {
+    return runKindForUids(uids, RUN_KIND_SPECS.streak)
+  }
+
   // ---- 运营活动任务（CONTRACT §11.1）---------------------------------------
-  // GET /api/campaign：engine/campaign.fetchCampaignState 的只读封装 +
+  // GET /api/campaign 走 fetchCachedForUid 公共骨架（见上方三端点注释）；
   // state/campaign.json 缓存（uid -> campaign state），新鲜期 10 分钟
-  //（CREDITS_TTL_MS）。节流口径与 GET /api/streak **完全一致**（镜像，§11.1）：
-  //   · 缓存新鲜且未强制 refresh → 直接回缓存，一次上游都不发；
-  //   · 要拉取时 job 在跑（或已在拉取中）→ 409 busy；但「有缓存且未 refresh」
-  //     时仍直接回缓存（哪怕已过期）—— 展示优先，绝不硬闯；
-  //   · refresh=1 → 无视 TTL 强制拉取（busy 时仍 409）。
-  // /api/state 的 accounts[].campaign 只读投影缓存（cachedCampaignOf），
-  // 绝不为它打上游。
-  let campaignBusy = false
+  //（CREDITS_TTL_MS）。/api/state 的 accounts[].campaign 只读投影缓存
+  //（cachedCampaignOf），绝不为它打上游。
 
   // 活动缓存的单条读取：形状不对（手改坏文件）视作没有，绝不下发垃圾。
   function cachedCampaignOf(uid) {
@@ -2055,118 +2190,68 @@ export async function startDaemon(opts = {}) {
     return c && typeof c === "object" && !Array.isArray(c) ? c : null
   }
 
-  async function fetchCampaignForUid(uid, force = false) {
-    // 可参与口径与 /api/streak 一致：找不到 / API key / 企业号 / 已停用一律 404，
-    // 企业版专属文案同段镜像（§10.8 口径）。
-    const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
-    if (raw) {
-      return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
+  // POST /api/campaign/run：手动跑一轮运营活动任务（viewed → 判据发射 → 领奖，
+  // 全部由 engine/campaign.runCampaignTasks 按 §11.1 口径执行）。
+  async function doCampaignRun(uids) {
+    return runKindForUids(uids, RUN_KIND_SPECS.campaign)
+  }
+
+  // streakRunInterpret(r, uid)：把引擎 runStreakSteward 的结果收敛成 §10.2 的
+  // results 条目 —— detail 是连登专属形状（天数/补签卡/抽奖机会/礼包/兑换/抽奖），
+  // outcome 的 skipped 判据 = 引擎全程「跳过」且没有任何实际动作。
+  function streakRunInterpret(r, uid) {
+    const d = r?.actions ?? {}
+    const detail = {
+      days: Number(r?.streak?.days ?? 0) || 0,
+      makeupCards: Number(r?.streak?.makeupCards ?? 0) || 0,
+      lotteryChances: Number(r?.streak?.lotteryChances ?? 0) || 0,
+      makeupUsed: d.makeup?.used === true,
+      makeupDate: d.makeup?.date ?? "",
+      gifts: (Array.isArray(d.gifts) ? d.gifts : []).map((g) => ({ name: g?.name ?? "", credit: Number(g?.credit) || 0 })),
+      redeemed: Array.isArray(d.redeemed) ? d.redeemed : [],
+      drawn: Number(d.drawn) || 0,
     }
-    const acct = accountByUid(uid)
-    if (!acct || acct.isApiKey || acct.tasksEnabled === false) {
-      return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
+    if (r?.ok !== true) {
+      const why = scrub(String(r?.logs?.slice(-1)[0] ?? "连登管家执行失败"))
+      return { uid, outcome: "failed", earned: Number(r?.earned) || 0, message: why, detail }
     }
-    const cached = cachedCampaignOf(uid)
-    // 新鲜期依据 state.updatedISO（ISO 8601，fetchCampaignState 落的查询时刻）
-    const atMs = Date.parse(String(cached?.updatedISO ?? ""))
-    const fresh = !!cached && Number.isFinite(atMs) && now() - atMs < CREDITS_TTL_MS
-    if (cached && !force && fresh) {
-      return { status: 200, body: { uid, cached: true, campaign: cached } }
-    }
-    if (runner?.current() || campaignBusy) {
-      if (cached && !force) return { status: 200, body: { uid, cached: true, campaign: cached } }
-      return { status: 409, body: { error: "busy" } }
-    }
-    const fn = engine?.campaign?.fetchCampaignState
-    if (typeof fn !== "function") {
-      return { status: 503, body: { error: engineErrorsText() } }
-    }
-    campaignBusy = true
-    try {
-      const state = await fn(acct, engineOpts(acct))
-      if (state?.ok) {
-        campaignCache[uid] = state
-        saveCampaign()
-        return { status: 200, body: { uid, cached: false, campaign: state } }
-      }
-      // 上游失败：200 + error，旧缓存原样保留并一并带回（campaign 字段，若有）
-      const body = { uid, cached: false, error: scrub(String(state?.error || state?.msg || "活动任务读取失败")) }
-      if (state?.restricted) body.restricted = true
-      if (cached) body.campaign = cached
-      return { status: 200, body }
-    } catch (e) {
-      const body = { uid, cached: false, error: shortErr(e) }
-      if (cached) body.campaign = cached
-      return { status: 200, body }
-    } finally {
-      campaignBusy = false
+    const parts = [`连登 ${detail.days} 天`]
+    if (detail.makeupUsed) parts.push(`已补签 ${detail.makeupDate}`)
+    if (detail.gifts.length) parts.push(`礼包 ×${detail.gifts.length}`)
+    if (detail.redeemed.length) parts.push(`兑换 ${detail.redeemed.join("/")}`)
+    if (detail.drawn) parts.push(`抽奖 ${detail.drawn} 次`)
+    return {
+      uid,
+      outcome: r?.logs?.some((l) => l.includes("跳过")) && !detail.makeupUsed && !detail.gifts.length && !detail.redeemed.length && !detail.drawn
+        ? "skipped"
+        : "ok",
+      earned: Number(r.earned) || 0,
+      message: parts.join(" / ") + `，+${Number(r.earned) || 0} 积分`,
+      detail,
     }
   }
 
-  // POST /api/campaign/run：手动跑一轮运营活动任务（viewed → 判据发射 → 领奖，
-  // 全部由 engine/campaign.runCampaignTasks 按 §11.1 口径执行）。
-  // 缺省/空 uids = 全部「未冻结 + tasksEnabled」账号（eligibleNow 已排除冻结）；
-  // 账号之间 1500 ms（手动手感，同 /api/streak/run）；restricted 当场冻结该账号。
-  async function doCampaignRun(uids) {
-    const fn = engine?.campaign?.runCampaignTasks
-    if (typeof fn !== "function") throw new Error(engineErrorsText())
-    const explicit = Array.isArray(uids) && uids.length
-    const targets = (explicit ? uids.map(String) : eligibleNow().map((a) => a.uid)).slice(0, 20)
-    const out = []
-    for (const uid of targets) {
-      const acct = accountByUid(uid)
-      if (!acct) {
-        out.push({ uid, outcome: "failed", earned: 0, message: "找不到账号" })
-        continue
-      }
-      // 显式指定的冻结账号如实失败（CONTRACT §10.5），不静默跳过
-      if (isFrozenUid(uid)) {
-        out.push({
-          uid,
-          outcome: "failed",
-          earned: 0,
-          message: `账号已冻结（11140）：${frozenMessageOf(uid)}；确认无风险后在账号行点「恢复」`,
-        })
-        continue
-      }
-      try {
-        const r = await fn(acct, engineOpts(acct))
-        if (r?.restricted) {
-          freezeAccount(uid, { code: 11140, message: "活动任务触发风控限制 (403/11140)" })
-          out.push({
-            uid,
-            outcome: "failed",
-            earned: Number(r.earned) || 0,
-            message: "触发风控限制（403/11140），账号已冻结；确认无风险后在账号行点「恢复」",
-            detail: campaignRunDetail(r),
-          })
-          continue
-        }
-        const detail = campaignRunDetail(r)
-        const acted = Number(r?.claimed?.length ?? detail.claimed.length)
-        const touched =
-          detail.claimed.length + detail.unavailable.length ||
-          (detail.activities ?? []).reduce((s, a) => s + (a.viewed || 0) + (a.fired || 0), 0)
-        if (r?.ok !== true) {
-          const why = scrub(String(r?.logs?.slice(-1)[0] ?? "活动任务执行失败"))
-          out.push({ uid, outcome: "failed", earned: Number(r?.earned) || 0, message: why, detail })
-          continue
-        }
-        const nActivities = (detail.activities ?? []).filter((a) => !a.error).length
-        const parts = [`活动 ${nActivities} 项`, `已领 ${detail.claimed.length}`]
-        out.push({
-          uid,
-          outcome: acted > 0 || touched > 0 || (Number(r?.earned) || 0) > 0 ? "ok" : "skipped",
-          earned: Number(r.earned) || 0,
-          message: parts.join(" · ") + `，+${Number(r.earned) || 0} 积分`,
-          detail,
-        })
-      } catch (e) {
-        out.push({ uid, outcome: "failed", earned: 0, message: shortErr(e) })
-      }
-      await sleepFn(1500) // 账号间隔（手动节奏，同 /api/streak/run）
+  // campaignRunInterpret(r, uid)：把引擎 runCampaignTasks 的结果收敛成 §11.1 的
+  // results 条目 —— outcome 判据 = 有领取/触达/收益任一即 ok，否则 skipped。
+  function campaignRunInterpret(r, uid) {
+    const detail = campaignRunDetail(r)
+    const acted = Number(r?.claimed?.length ?? detail.claimed.length)
+    const touched =
+      detail.claimed.length + detail.unavailable.length ||
+      (detail.activities ?? []).reduce((s, a) => s + (a.viewed || 0) + (a.fired || 0), 0)
+    if (r?.ok !== true) {
+      const why = scrub(String(r?.logs?.slice(-1)[0] ?? "活动任务执行失败"))
+      return { uid, outcome: "failed", earned: Number(r?.earned) || 0, message: why, detail }
     }
-    return out
+    const nActivities = (detail.activities ?? []).filter((a) => !a.error).length
+    const parts = [`活动 ${nActivities} 项`, `已领 ${detail.claimed.length}`]
+    return {
+      uid,
+      outcome: acted > 0 || touched > 0 || (Number(r?.earned) || 0) > 0 ? "ok" : "skipped",
+      earned: Number(r.earned) || 0,
+      message: parts.join(" · ") + `，+${Number(r.earned) || 0} 积分`,
+      detail,
+    }
   }
 
   // campaignRunDetail(r)：把引擎 runCampaignTasks 的结果收敛成 §11.1 的 detail
@@ -2447,13 +2532,45 @@ export async function startDaemon(opts = {}) {
 </body></html>`
   }
 
+  // B5：解码后相对路径的显式拒绝表（serveStatic 自己的第二道闸；第一道在
+  // handler 的原始请求行预检）。跨平台一致：POSIX 上也不给 Windows 语义留缝。
+  //   - ".." 点段：目录穿越本体（normalize+prefix 兜底之外再显式拦一道）
+  //   - 反斜杠：Windows 分隔符 / UNC 前缀（\\server\share）；POSIX 上同样是
+  //     合法文件名字符，一律拒绝以免平台语义分叉
+  //   - 盘符前缀（C:/ c:/）：Windows 绝对路径
+  //   - 解码后以 "/" 开头：绝对路径（%2F 编码绕过开头斜杠剥离的形状）
+  //   - 空串："//"、"///" 剥掉开头斜杠后的残值
+  // 正常看板资产（/、/app.js、/style.css、/logo-mark.png、子目录资源）都不含
+  // 这些形状。normalize+startsWith(dashDir+sep) 前缀校验仍是最终兜底，原样保留。
+  function unsafeDecodedStaticPath(p) {
+    if (p === "") return true
+    if (p.startsWith("/")) return true
+    if (p.includes("\\")) return true
+    if (/^[A-Za-z]:/.test(p)) return true
+    return p.split("/").includes("..")
+  }
+
   function serveStatic(req, res, pathname) {
     if (req.method !== "GET" && req.method !== "HEAD") {
       json(res, 405, { error: "只支持 GET" })
       return
     }
     const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "")
-    const full = normalize(join(dashDir, decodeURIComponent(rel)))
+    let decoded
+    try {
+      decoded = decodeURIComponent(rel)
+    } catch {
+      // B5：不完整/畸形百分位编码（如 /%E0%A4%A）decodeURIComponent 抛 URIError，
+      // 旧版被最外层 catch 吞成 500「守护进程内部错误」；这是客户端输入错误，
+      // 必须回 400（显式错误响应，不外泄堆栈细节）。
+      json(res, 400, { error: "URL 编码不合法" })
+      return
+    }
+    if (unsafeDecodedStaticPath(decoded)) {
+      json(res, 403, { error: "路径不合法" })
+      return
+    }
+    const full = normalize(join(dashDir, decoded))
     if (full !== dashDir && !full.startsWith(dashDir + sep)) {
       json(res, 403, { error: "路径不合法" })
       return
@@ -2490,7 +2607,15 @@ export async function startDaemon(opts = {}) {
     }
     const text = Buffer.concat(chunks).toString("utf8").trim()
     if (!text) return {}
-    return JSON.parse(text)
+    const parsed = JSON.parse(text) // 解析失败照旧抛出：调用方统一映射 400
+    // B7 归一：JSON 字面量 null / 数字 / 字符串 / 布尔解析成功但不是对象 —— 旧版
+    // 原样返回，下游 body.uid / body.activityCode 一类属性读取直接 TypeError，
+    // 被最外层 catch 吞成 500「守护进程内部错误」；合法请求应按业务语义响应。
+    // 归一为 {}（与「空 body」同一形状）。**数组与对象原样返回**：
+    // /api/accounts/import 接受裸数组 body（typeof [] === "object"），绝不能把
+    // 数组吞成 {}。
+    if (parsed === null || typeof parsed !== "object") return {}
+    return parsed
   }
 
   // ---- POST /api/accounts/import（契约 §9：两段式，预览默认不写盘）----------
@@ -2611,7 +2736,12 @@ export async function startDaemon(opts = {}) {
     const p = u.pathname
 
     if (p === "/api/hello") {
-      json(res, 200, { name: PLUGIN_NAME, version: VERSION, ready: !!engine?.ok })
+      // pid（2026-11 生产缺陷修复）：探测方拿它做「身份校验」——B6 写前复查必须
+      // 确认「端口上应答的守护进程就是 daemon.json 记的那个」，否则 bind 后的
+      // 自探（陈旧 daemon.json + 探到自己健康）会被旧谓词误判成外来双开，新进程
+      // 自己把自己劝退、永远起不来（见 foreignLiveDaemonInDaemonJson 注释）。
+      // 老版本 hello 没有 pid 字段，探测方对缺 pid 的响应保守判冲突（升级期兼容）。
+      json(res, 200, { name: PLUGIN_NAME, version: VERSION, pid: process.pid, ready: !!engine?.ok })
       return
     }
 
@@ -2633,7 +2763,11 @@ export async function startDaemon(opts = {}) {
       })
       res.write("retry: 3000\n\n")
       sseClients.add(res)
-      req.on("close", () => sseClients.delete(res))
+      sseStartPing() // P3-3 keepalive：首个客户端连上才起表（见 SSE 一节的口径）
+      req.on("close", () => {
+        sseClients.delete(res)
+        sseStopPingIfIdle() // 最后一个客户端断开 → 停表（无客户端不空转、不泄漏）
+      })
       return
     }
 
@@ -2846,7 +2980,12 @@ export async function startDaemon(opts = {}) {
       if (typeof body.scheduler === "boolean") settings.scheduler = body.scheduler
       if (typeof body.claim === "boolean") settings.claim = body.claim
       if (Array.isArray(body.legs)) settings.legs = body.legs.filter((l) => LEGS.includes(l))
-      if (Number.isFinite(Number(body.gapMs))) settings.gapMs = Math.min(10000, Math.max(500, Number(body.gapMs)))
+      // gapMs 写入下限 = 红线下限（MIN_UPSTREAM_GAP_MS=1000，旧下限 500 已封死）：
+      // 实际生效值经 upstreamGapMs() 永远 ≥1000ms，若旋钮还收 500，看板就在
+      // 承诺一个会被内部悄悄改写的值（能设的 ≠ 实际生效的，属于骗人）。下限
+      // 抬到 1000 后两边一致。上限 10000 不变；非有限数值忽略该键（沿用旧行为）。
+      if (Number.isFinite(Number(body.gapMs)))
+        settings.gapMs = Math.min(10000, Math.max(MIN_UPSTREAM_GAP_MS, Number(body.gapMs)))
       if (Array.isArray(body.jitterMs)) {
         const [a, b] = body.jitterMs.map(Number)
         if (Number.isFinite(a) && Number.isFinite(b)) settings.jitterMs = [Math.max(0, a), Math.max(a, b)]
@@ -3006,7 +3145,46 @@ export async function startDaemon(opts = {}) {
     json(res, 404, { error: `未知 API：${req.method} ${p}`, hint: UNKNOWN_API_HINT })
   }
 
+  // B5：原始请求行的静态路径预检（在 new URL 之前）。
+  // 必要性（实测 WHATWG URL 的行为，测试已钉死）：
+  //   - "/../x"、"/%2e%2e/x" 会被 new URL **原地规范化**成 "/x" —— 点段穿越在
+  //     u.pathname 里根本看不到，必须在 URL 解析前拦；
+  //   - "//x" 被解析成协议相对地址（host 变成 "x"、path 变成 "/"），"//" 直接
+  //     抛 Invalid URL —— 语义完全跑偏，也必须在解析前拦；
+  //   - "/%E0%A4%A" 这类不完整 UTF-8 百分位序列会让 decodeURIComponent 抛
+  //     URIError，旧版被最外层 catch 吞成 500「守护进程内部错误」，应为 400。
+  // 只对非 /api/ 路径生效：API 路由只做字符串匹配、不碰文件系统，保持原样。
+  // 合法浏览器/HTTP 客户端发不出这些形状（发送前就已规范化、% 一律编码），
+  // 命中只可能是手工构造的探测/攻击报文。
+  function unsafeRawStaticPath(rawPath) {
+    let decoded
+    try {
+      decoded = decodeURIComponent(rawPath)
+    } catch {
+      return { bad: "encoding" } // 畸形百分位编码（不完整 UTF-8 序列等）→ 400
+    }
+    // 反斜杠统一按分隔符对待（Windows 分隔符 / UNC 前缀；POSIX 上也不留平台缝）
+    const segments = decoded.replace(/\\/g, "/").split("/")
+    if (decoded.startsWith("//")) return { bad: "traversal" } // "//"、"///x"、协议相对
+    if (segments.includes("..")) return { bad: "traversal" } // ../ 与 %2e%2e（解码后）
+    if (segments.some((s) => /^[A-Za-z]:/.test(s))) return { bad: "traversal" } // 盘符 C:\、C:/
+    return null
+  }
+
   const handler = async (req, res) => {
+    // B5：静态路径预检（见 unsafeRawStaticPath 注释）。
+    const rawPath = String(req.url ?? "/").split("?")[0]
+    if (!rawPath.startsWith("/api/")) {
+      const unsafe = unsafeRawStaticPath(rawPath)
+      if (unsafe?.bad === "encoding") {
+        json(res, 400, { error: "URL 编码不合法" })
+        return
+      }
+      if (unsafe) {
+        json(res, 403, { error: "路径不合法" })
+        return
+      }
+    }
     let u
     try {
       u = new URL(req.url ?? "/", "http://localhost")
@@ -3070,6 +3248,80 @@ export async function startDaemon(opts = {}) {
     writeDaemonInfo(stateDir, { pid: process.pid, port, key, version: VERSION, startedAt, host })
     try {
       writeFileSync(join(stateDir, "daemon.heartbeat"), String(now()), "utf8")
+    } catch {}
+  }
+
+  // ---- B6 双开 TOCTOU 防护：daemon.json 写前复查 --------------------------------
+  //
+  // 拒双开原有两道：bind 前的「读 daemon.json → pidAlive → probeDaemon」门与
+  // 端口占用顺延。但检查发生在 **bind 之前**：两个 ensureDaemon 在同一两秒窗口
+  // 各自通过检查 → 第一个绑 4390、第二个绑 4391 → 两个进程都活着，每 5s 交替
+  // 覆写 daemon.json，跨进程 spacer 互不知晓（单 job 闸门失效、0ms 间隔撞风控）。
+  //
+  // 修法（任务给的两个方案里选「写前复查」）：把**同一谓词**（pid 存活 +
+  // /api/hello 健康，与 bind 前的门完全同款）搬到 daemon.json 的每次写回之前 ——
+  // 初始 claim 在 bind 之后、首次写盘之前；此后每次 5s 心跳写盘前同样复查。
+  // 发现外来活守护进程 → 本进程优雅退出且**不覆盖 daemon.json**（让位方退出后
+  // 文件仍指向幸存者，宿主/看板读到的始终是活进程）。
+  // 不选 O_EXCL 锁文件的理由：新状态文件 + 陈旧锁回收（pid 复用、崩溃残留）+
+  // 优雅退场摘锁三条都要自己维护，而 daemon.json 本来就是每 5s 必写的协调点，
+  // 复用它的探测谓词零新增状态；残留窗口（同瞬双写）由写后自检 + 双方下一轮
+  // 心跳在 ≤5s 内收敛，见 heartbeatGuarded 注释。
+  //
+  // 判别函数：daemon.json 是否指向「别的、活着的、健康的」守护进程。探活失败
+  // （进程活着但 /api/hello 不通 —— 正常重启/退场窗口、端口被占的残留条目）
+  // **不算**接管 → 放行覆写，正常重启与端口顺延路径行为不变。
+  //
+  // 身份校验（2026-11 生产缺陷修复）：探到的必须是 daemon.json 记的那个守护进程
+  // （alive.pid === prev.pid）才算冲突。原因：本复查发生在**本进程 bind 之后**，
+  // daemon.json 记的 pid 又可能是僵尸/复用残留（kill(pid,0) 假阳性，见
+  // lifecycle.pidAlive）——此时 probeDaemon(prev.port) 探到的是**本进程自己**
+  // （端口正是本进程刚绑上的）。旧谓词「有人应答即外来」就把自探误判成外来
+  // 守护进程：新进程自己把自己劝退、daemon.json 永远不清、守护进程永远起不来
+  // （生产现象：plugins.json off→on 后宿主反复报「已拉起…等待就绪…」→「未能在
+  // 时限内就绪」）。加了 pid 的自探结果 alive.pid = 本进程 ≠ prev.pid → 不冲突
+  // → 放行覆写。真双开竞态不受影响：输家探到的是**赢家**（赢家已把自己的
+  // {pid,port} 写进 daemon.json，alive.pid === prev.pid）→ 照旧拦截。兼容口径：
+  // 老版本守护进程的 hello 没有 pid 字段 → 保守判冲突（升级期绝不误放，行为
+  // 与旧谓词一致）。
+  async function foreignLiveDaemonInDaemonJson() {
+    const prev = readDaemonInfo(stateDir)
+    if (!prev || prev.pid === process.pid || !pidAlive(prev.pid)) return null
+    const alive = await probeDaemon(prev.port, prev.key).catch(() => null)
+    if (!alive) return null
+    if (alive.pid == null) return prev // 老版本 hello 无 pid：保守判冲突（升级期兼容）
+    return Number(alive.pid) === Number(prev.pid) ? prev : null // 探到自己/别的进程 → 不算接管
+  }
+
+  // 守护化心跳：写前复查 → 写 → 写后自检。生产定时器（every 5000）用它；
+  // heartbeat() 保持原样（ticks.heartbeat 兼容测试注入）。
+  async function heartbeatGuarded() {
+    try {
+      const foreign = await foreignLiveDaemonInDaemonJson()
+      if (foreign) {
+        log(
+          `[daemon.json] 检测到另一守护进程已在运行（pid ${foreign.pid}，端口 ${foreign.port}）——` +
+            `本进程（pid ${process.pid}，端口 ${port}）优雅退出，不覆盖 daemon.json`,
+        )
+        shutdown("daemon.json 已被另一守护进程接管（双开保护写前复查）")
+        return
+      }
+    } catch (e) {
+      log("[daemon.json] " + shortErr(e))
+    }
+    heartbeat()
+    // 写后自检：极小概率两边同瞬通过写前复查并先后写回 —— 立即重读，发现被
+    // 别的进程覆写就让位退出（此前的覆写无法预知，退出后由幸存者下一次心跳
+    // 把 daemon.json 修正回自己的 pid；整体收敛 ≤ 一个心跳周期 5s）。
+    try {
+      const after = await foreignLiveDaemonInDaemonJson()
+      if (after) {
+        log(
+          `[daemon.json] 写后自检发现 daemon.json 立即被另一守护进程（pid ${after.pid}，端口 ${after.port}）覆写 —— ` +
+            `本进程（pid ${process.pid}，端口 ${port}）让位退出`,
+        )
+        shutdown("daemon.json 写后被另一守护进程覆写（双开保护写后自检）")
+      }
     } catch {}
   }
 
@@ -3157,6 +3409,12 @@ export async function startDaemon(opts = {}) {
     stopped = true
     log("[shutdown] " + reason)
     for (const t of timers) clearInterval(t)
+    // SSE 心跳定时器（P3-3）：已随 timers 清掉，这里补置空 + 显式停表，保证
+    // shutdown 后 ssePingTimer 一定不活着（与「最后客户端断开停表」同一状态机）。
+    if (ssePingTimer) {
+      clearInterval(ssePingTimer)
+      ssePingTimer = null
+    }
     broadcast({ kind: "scheduler", event: "shutdown", reason: scrub(reason) })
     for (const res of [...sseClients]) {
       try {
@@ -3181,9 +3439,28 @@ export async function startDaemon(opts = {}) {
   // ---- 启动落盘 + 定时器 -----------------------------------------------------
 
   const startedAt = nowIso()
+  // B6 初始 claim：bind 成功后、**首次写 daemon.json 之前**再读一次 —— 若别的
+  // 进程刚抢先写入且其守护进程健康（双启动竞态的输家视角），本进程不写盘、
+  // 直接以与 bind 前拒双开门相同的错误码退场（脚本模式下走「启动失败」退出；
+  // ensureDaemon 侧子进程退出 → 等待循环按「起来又倒了」收口）。
+  const claimConflict = await foreignLiveDaemonInDaemonJson().catch(() => null)
+  if (claimConflict) {
+    try {
+      server.close()
+    } catch {}
+    log(
+      `[daemon.json] bind 后写前复查发现守护进程已在运行（pid ${claimConflict.pid}，端口 ${claimConflict.port}）——` +
+        `本进程（pid ${process.pid}，端口 ${port}）不启动、不覆盖 daemon.json`,
+    )
+    const err = new Error(
+      `已有守护进程在运行（pid ${claimConflict.pid}，端口 ${claimConflict.port}；bind 后写前复查发现），拒绝重复启动，避免双写凭据`,
+    )
+    err.code = "WB_DAEMON_ALREADY_RUNNING"
+    throw err
+  }
   heartbeat()
   if (opts.noTimers !== true) {
-    every(5000, heartbeat)
+    every(5000, heartbeatGuarded)
     every(5000, checkControl)
     every(10000, checkPluginsFile)
     every(15000, checkMagpie)
@@ -3214,12 +3491,16 @@ export async function startDaemon(opts = {}) {
     // 测试钩子：手动驱动各路检查（noTimers 模式下用）
     ticks: {
       heartbeat,
+      heartbeatGuarded, // B6：带写前复查/写后自检的心跳（生产 every 5000 用的那份）
       checkControl,
       checkPluginsFile,
       checkMagpie,
       checkScheduler,
       watchJob: watchJobTick,
+      ssePing, // P3-3：手动驱动一次 SSE 注释心跳行
     },
+    // P3-3 测试钩子：SSE 心跳定时器当前是否活着（起表/停表生命周期断言用）
+    ssePingActive: () => !!ssePingTimer,
   }
 }
 

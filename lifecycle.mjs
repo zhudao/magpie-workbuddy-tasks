@@ -154,14 +154,39 @@ export function bindHint(host) {
 
 // ---- 进程与健康探测 ----------------------------------------------------
 
+// pidAlive：kill(pid, 0) 成功 ≠ 活着。僵尸进程（已退出、等父进程收尸）和 pid
+// 复用后的无关进程都会让 kill(pid,0) 假阳性 —— 而这里它被用来判「daemon.json
+// 记的是不是我们的守护进程还活着」（ensureDaemon 的复用门、daemon 拒双开门、
+// B6 写前复查都以它为第一道闸）：僵尸永远不会再服务端口，判成「活着」会让
+// 陈旧 daemon.json 走进 bind 后的自探死局 —— 新守护进程 bind 同一端口后探测
+// 探到自己健康，叠加「记的 pid 看着还活着」就被误判成外来双开、自己把自己
+// 劝退，守护进程永远起不来（2026-11 生产缺陷）。所以 Linux 上 kill(0) 成功后
+// 再读 /proc/<pid>/stat 的进程状态位：Z（僵尸）/ X（已死）→ 判为不存活；
+// ENOENT（读的瞬间该 pid 已消失/被收尸）→ 判为不存活 —— 但仅当 /proc 本身
+// 可用（/proc/self/stat 存在）时才这么判，最小容器没挂 procfs 时 kill(0) 的
+// 结论仍是唯一依据；其余读不到的情况（Windows/macOS、hidepid 等权限差异）
+// 退回 kill(0) 的结论（保守：与旧口径一致）。
 export function pidAlive(pid) {
   const p = Number(pid)
   if (!Number.isFinite(p) || p <= 0) return false
   try {
     process.kill(p, 0)
-    return true
   } catch (e) {
     return e?.code === "EPERM" // 存在但无权发信号，也算活着
+  }
+  if (process.platform !== "linux") return true
+  try {
+    const stat = readFileSync(`/proc/${p}/stat`, "utf8")
+    // stat 格式：pid (comm) state ppid ...（proc(5)）。comm 可含空格与 ')'，
+    // 状态位取最后一个 ')' 之后的第一个字段。
+    const state = stat
+      .slice(stat.lastIndexOf(")") + 1)
+      .trim()
+      .split(/\s+/)[0]
+    return !(state === "Z" || state === "X" || state === "x")
+  } catch (e) {
+    if (e?.code === "ENOENT" && existsSync("/proc/self/stat")) return false // 进程已消失
+    return true // 读不到（无 procfs/权限等）：退回 kill(0) 的结论
   }
 }
 

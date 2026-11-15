@@ -4,6 +4,7 @@
 // 凭据不外泄：这里只读/写文件，绝不把 token 打进日志；调用方拿到的 Account
 // 只有在内存里才有完整 token。
 
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -193,34 +194,97 @@ function writeJsonAtomic(file, value) {
   return statSync(file);
 }
 
-// saveAccountRefresh(cfg, acctKey, patch) -> void
+// ---- B3 写前竞态复查原语 -------------------------------------------------------
+//
+// sha256Hex(text)：对文件**原文**取 SHA-256。与 daemon.mjs handleAccountsImport
+// 的「导入确认写前竞态复查」（lastImportPreview.hash / sha256Hex + 写前重读比对）
+// 是**同一口径的等价实现**——那份原语闭在 startDaemon 闭包里挪不出来，这里按
+// 同一思路落地：比较的都是「读到的字节原文哈希」，文件不存在时按空串哈希
+// （daemon 侧同款：sha256Hex(auth.ok ? auth.text : "")）。两边任一方改口径
+// （比如换成 mtime）必须同步，否则两类写者的竞态窗口口径不一致。
+function sha256Hex(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+// 读一份「快照」：{data, hash}。复用 readAuthDocument（daemon 导入路径用的同一
+// 读原语）：坏 JSON / 顶层不是对象 → 抛「拒绝回写」（绝不冒覆盖风险，与旧版
+// saveAccountRefresh 的行为逐字一致）；文件不存在按空文档（导入空库合法场景）。
+function readSnapshotForWrite(cfg) {
+  const r = readAuthDocument(cfg);
+  if (r.ok) return { data: r.data, hash: sha256Hex(r.text) };
+  if (r.missing) return { data: {}, hash: sha256Hex("") };
+  throw new Error(`${r.error}，拒绝回写以免丢数据`);
+}
+
+// 把 patch 盖进 acctKey 那一条（纯函数）：只碰 TOKEN_FIELDS，其余字段（包括
+// 未知字段）与所有兄弟条目原样保留 —— 与旧版逐字段语义一致。
+function mergeRefreshPatch(raw, acctKey, patch) {
+  const doc = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const entry =
+    doc[acctKey] && typeof doc[acctKey] === "object" && !Array.isArray(doc[acctKey])
+      ? { ...doc[acctKey] }
+      : {};
+  for (const field of TOKEN_FIELDS) {
+    if (patch && patch[field] !== undefined) entry[field] = patch[field];
+  }
+  return { ...doc, [acctKey]: entry };
+}
+
+// saveAccountRefresh(cfg, acctKey, patch, opts?) -> void
 //
 // 读-改-写：只把 patch 里出现的 TOKEN_FIELDS 盖进 acctKey 那一条，其余字段
 // （包括未知字段）与所有兄弟条目（其它 provider / 其它账号）原样保留；tmp +
 // rename 原子落盘，mode 600。patch 里 undefined 的键不碰旧值，绝不把别人的
 // 账号冲掉。
-export function saveAccountRefresh(cfg, acctKey, patch) {
+//
+// B3 写前竞态复查（写者至少三类：daemon 的 runner 刷新、magpie 宿主自身覆写、
+// daemon 导入确认；裸 read-modify-write 在「A 读 → B 写（含轮换后的新 refresh）
+// → A 整文档写回」的交错下会把 B 刚轮换的 refresh 冲掉 → refresh 轮换型上游
+// 直接掉登录）。流程与 daemon 导入确认路径同一口径：
+//   快照（读原文 → SHA-256）→ 合并 → **写前重读比对**；
+//   不符 → 显式上报冲突（onConflict）→ 重读、以新文档为底重试**一轮**；
+//   仍不符 → 放弃写并抛 WB_AUTH_WRITE_CONFLICT（宁可少一次回写并留下显式日志，
+//   也不把别人刚写入的新凭据冲掉；调用方 runner 会把该账号这一步记为失败，
+//   下次刷新自然重试）。
+//
+// opts（全部可选；生产调用方 daemon.mjs 的 runnerCtx.saveRefresh 只传 onConflict）：
+//   onConflict(info) —— 每次检测到冲突时调用（info: {attempt, stage, file,
+//     acctKey}；stage="retry" 表示将重读重试，"giveup" 表示放弃写入）。缺省
+//     console.warn（独立使用本模块时的兜底出口；daemon 侧会注入自己的 log）。
+//   interpose(attempt) —— **仅供测试注入**：在「读完快照」与「写前复查」的间隙
+//     调用一次，模拟第三方写者改写文件；生产代码不传，行为与无缝完全一致。
+export function saveAccountRefresh(cfg, acctKey, patch, opts = {}) {
   const file = authFile(cfg);
-  let raw = {};
-  if (existsSync(file)) {
-    try {
-      raw = JSON.parse(readFileSync(file, "utf8"));
-    } catch (err) {
-      throw new Error(`plugin-auth.json 解析失败，拒绝回写以免丢数据: ${String(err?.message || err)}`);
+  const interpose = typeof opts.interpose === "function" ? opts.interpose : null;
+  const onConflict =
+    typeof opts.onConflict === "function"
+      ? opts.onConflict
+      : (info) =>
+          console.warn(
+            `[store] plugin-auth.json 并发写冲突（acctKey=${acctKey}，第 ${info?.attempt} 轮写前复查不符，stage=${info?.stage}）` +
+              `：第三方可能刚轮换过 refresh token，本次回写${info?.stage === "giveup" ? "已放弃" : "将重读重试"}，避免覆盖新凭据`,
+          );
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const snap = readSnapshotForWrite(cfg);
+    const merged = mergeRefreshPatch(snap.data, acctKey, patch);
+    interpose?.(attempt);
+    // 写前复查：文件必须仍是刚才合并所依据的那一份（与导入路径的
+    // sha256Hex(re.ok ? re.text : "") !== hash 同款比对）
+    const verify = readSnapshotForWrite(cfg);
+    if (verify.hash === snap.hash) {
+      writeJsonAtomic(file, merged);
+      return;
     }
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      throw new Error("plugin-auth.json 顶层不是对象，拒绝回写");
-    }
+    onConflict({ attempt, stage: attempt < 2 ? "retry" : "giveup", file, acctKey });
   }
-  const entry =
-    raw[acctKey] && typeof raw[acctKey] === "object" && !Array.isArray(raw[acctKey])
-      ? { ...raw[acctKey] }
-      : {};
-  for (const field of TOKEN_FIELDS) {
-    if (patch && patch[field] !== undefined) entry[field] = patch[field];
-  }
-  raw[acctKey] = entry;
-  writeJsonAtomic(file, raw);
+  throw Object.assign(
+    new Error(
+      `plugin-auth.json 写前复查连续两轮不符（其他写入者正在并发改写，可能刚轮换过 refresh token），` +
+        `已放弃本次回写以免丢失新凭据；请稍后重试（acctKey=${acctKey}）`,
+    ),
+    { code: "WB_AUTH_WRITE_CONFLICT" },
+  );
 }
 
 // ---- 账号 JSON 导入/导出用的文件原语（engine/accountio.mjs 复用，契约 §9）----

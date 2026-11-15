@@ -21,7 +21,7 @@
 //（POST /api/account/unfreeze）能解除，绝不自动恢复。
 
 import { runBuddyOpen } from "./buddy.mjs";
-import { runCampaignTasks } from "./campaign.mjs"; // 运营活动任务腿（CONTRACT §11.1）
+import { isCampaignActivityCode, runCampaignTasks } from "./campaign.mjs"; // 运营活动任务腿（CONTRACT §11.1）
 import { DEFAULT_GAP_MS, REFRESH_LEAD_MS } from "./constants.mjs";
 import { reportDailyActivity } from "./daily.mjs"; // 每日活跃（点亮成长中心连登，CONTRACT §7）
 import { uuidHex } from "./fingerprint.mjs";
@@ -387,19 +387,24 @@ export class JobRunner {
         // 刷新调用」与这一条腿分属两个节奏器（legOpts 每腿新建）—— 这里补一拍
         // gap，保证跨边界的两次上游调用也 ≥1s（宁可多等，绝不硬闯）。
         await this._sleep(Math.max(0, Number(this.opts.gap ?? DEFAULT_GAP_MS)));
-        // 任务级勾选（CONTRACT §3/§11.6）：codes 是**两套命名空间混在一个清单**里的 ——
-        // 成长/小程序的裸 code，以及活动任务的 `<activityCode>:<taskCode>`（**含冒号**）。
-        // 各腿只认自己那套，别把对面那套当「不存在的任务」去警告。
+        // 任务级勾选（CONTRACT §3/§11.6）：codes 是**多套命名空间混在一个清单**里的 ——
+        // 成长任务的裸 code、MP 专属码、活动任务的裸 `<activityCode>`（命中
+        // CAMPAIGN_SPECS，§11.1 旧口径 = 整个活动）与 `<activityCode>:<taskCode>`
+        //（**含冒号**）。各腿只认自己那套，别把对面那套当「不存在的任务」去警告。
         // 筛完为空 = 该账号选中的任务都不属于这条腿 → 整腿跳过；**绝不能传空数组**：
         // 引擎把「空/未传」一律当「全部」，传下去会跑光所有任务（用户只勾了活动任务，
         // 却把所有成长任务跑一遍 —— 这是不可接受的反向放大）。
         const legCodes = (() => {
           const all = job.spec.taskCodes?.[acct.uid];
           if (!Array.isArray(all) || !all.length) return null; // 未勾选 = 全部
-          const isCampaignCode = (c) => String(c).includes(":");
+          // campaign 码判定与 campaignSelection 同一判定源（isCampaignActivityCode，
+          // engine/campaign.mjs 导出）：裸活动码（如 campaign_starbucks_2026）+
+          // 含冒号的 `<活动>:<任务>` pair 码。0.3.6 曾写死「含冒号」→ 裸活动码被
+          // 踢去 growth 腿（报「不在任务表中」）、campaign 腿整腿 skip。
+          const isCampaignCode = (c) => isCampaignActivityCode(c) || String(c).includes(":");
           // 三套命名空间各归各腿，别把别人的码当自己的（2026-11-14 实测：只勾了一个成长任务，
           // mp 腿也拿到那串码 → 空跑一遍却显示「完成」，用户以为小程序任务被跑了）：
-          //   campaign 腿 = 含冒号的 `<活动>:<任务>`
+          //   campaign 腿 = 裸活动码（isCampaignActivityCode）或含冒号的 `<活动>:<任务>`
           //   mp 腿       = MP 专属码（Sequential_Tasks_* / school_season，走 isMPCode 同一判定源）
           //   growth 腿   = 其余（**但当本次 job 含 mp 腿时，MP 专属码让给 mp 腿**，
           //                 否则给 growth —— 那时它内部的 2b 分支会处理小程序任务）

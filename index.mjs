@@ -39,7 +39,7 @@ import {
   writeControl,
 } from "./lifecycle.mjs"
 
-const VERSION = "0.3.6"
+const VERSION = "0.3.7"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）

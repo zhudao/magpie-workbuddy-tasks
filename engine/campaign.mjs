@@ -81,6 +81,20 @@ export const CAMPAIGN_SPECS = [
   },
 ];
 
+// isCampaignActivityCode(code) —— 裸 `<activityCode>` 是否为活动任务码（命中
+// CAMPAIGN_SPECS）。这是**唯一判定源**，两处共用：
+//   - 本模块 campaignSelection 的裸 code 分支（§11.1 旧口径：裸活动码 = 整个
+//     活动，向后兼容保留）；
+//   - runner.mjs 的 campaign 腿过滤（0.3.6 回归修复：之前写死「含冒号才算
+//     campaign 码」，裸活动码被踢去 growth 腿 → growth 报「不在任务表中」、
+//     campaign 腿整腿 skip，文档化的裸码能力成了死路径）。
+// 口径与 campaignSelection 一致：trim 后整串比对 sp.code（不认大小写变体、
+// 不认前缀 —— 活动码清单是封闭的，多一个字符就不是它）。
+export function isCampaignActivityCode(code) {
+  const c = String(code ?? "").trim();
+  return CAMPAIGN_SPECS.some((sp) => sp.code === c);
+}
+
 // hub CAMPAIGN_CASES 逐字拷贝：desktop 类判据的内置案例（活动判据认产物目录名，
 // 不认注册表 slug 或中文名）。
 export const CAMPAIGN_CASES = {

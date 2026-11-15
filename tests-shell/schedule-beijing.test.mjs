@@ -154,9 +154,12 @@ describe("checkScheduler 北京时间口径（生产 UTC 容器 bug 回归）", 
       assert.equal(h.ticks.checkScheduler(Date.UTC(2026, 8, 16, 1, 30)), null, "新北京日同样只触发一次")
 
       const fired = JSON.parse(readFileSync(join(stateDir, "lastFired.json"), "utf8"))
-      assert.ok(fired["travel@9@2026-09-15"])
-      assert.ok(fired["travel@21@2026-09-15"])
-      assert.ok(fired["travel@9@2026-09-16"], "跨北京日的键按北京日期分立")
+      assert.ok(fired["travel@9@2026-09-16"], "跨北京日的键按北京日期分立（当日键保留）")
+      // P3-2：写键时顺带剔除早于北京「今天」的陈旧条目 —— 09-15 的两个键随 09-16
+      // 的写入被清掉（日期段已过，永远不可能再命中任何 fireKey，纯垃圾；文件不再
+      // 随天数增长）。分立语义本身由上面的重新触发行为（job3 成功）钉死。
+      assert.equal(fired["travel@9@2026-09-15"], undefined, "昨日键随跨日写入被剔除（P3-2）")
+      assert.equal(fired["travel@21@2026-09-15"], undefined, "昨日键随跨日写入被剔除（P3-2）")
     } finally {
       await h.stop()
     }
@@ -181,8 +184,10 @@ describe("checkScheduler 北京时间口径（生产 UTC 容器 bug 回归）", 
       await tick()
 
       const fired = JSON.parse(readFileSync(join(stateDir, "lastFired.json"), "utf8"))
-      assert.ok(fired["night@1@2026-09-15"])
-      assert.ok(fired["night@1@2026-09-16"])
+      assert.ok(fired["night@1@2026-09-16"], "当日键保留")
+      // P3-2：昨日（09-15）键随 09-16 的写入被剔除 —— job2 能重新触发本身就证明
+      // 09-15 键不再命中；文件按「当日键 + lastCycle」收敛。
+      assert.equal(fired["night@1@2026-09-15"], undefined, "昨日键随跨日写入被剔除（P3-2）")
     } finally {
       await h.stop()
     }

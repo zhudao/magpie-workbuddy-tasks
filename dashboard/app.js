@@ -28,8 +28,10 @@
 //   GET  /api/events           -> SSE {kind:'job'|'step'|'log'|'scheduler'|'accounts'}（只读流）
 //   GET  /api/history?limit=   -> {rows:[{at,uid,nickname,leg,state,detail,credit,energy,jobId,trigger}]}
 //   POST /api/run {uids?,legs?,claim?,codes?} -> {job} | 409 busy | 400 无账号 | 503 引擎不可用
-//        codes 可选：string[]（对所有账号）或 {[uid]: string[]}（按账号）。看板只发按 uid 的对象，
-//        且只把「该账号有勾选任务」的 uid 放进去 —— 未出现的账号 = 不限制（全部任务）。
+//        codes 可选：string[]（对所有账号）或 {[uid]: string[]}（按账号）。看板发的是按 uid 的对象：
+//        2026-11-14 起勾选 = 本轮 job 的全局任务范围 —— 任一账号有勾选，就把「全账号勾选并集」
+//        下发给每一个目标账号（见 selectionBody）；完全无勾选才发 {}（不提交 codes）。
+//        未出现 codes 的账号 = 不限制（全部任务）。
 //   POST /api/stop             -> {job} | 404 没有任务在跑
 //   POST /api/task/accept {uid,codes[]}   -> {accepted,already,failed}
 //   POST /api/task/claim  {uid,code}      -> {ok,credit,energy,via("chat"|"web"|""),reason}
@@ -46,7 +48,8 @@
 //        后端尚未落地/字段缺失（undefined）时一律按 null 处理 —— 显示「未查询」，不抛错。
 //   POST /api/streak/run  {uids?}         -> {results:[{uid,outcome:"ok"|"skipped"|"failed",
 //                                                   earned, message, detail:{…}}]}
-//        缺省/空 uids = 全部「未冻结 + tasksEnabled」账号；账号间隔 1500ms；
+//        缺省/空 uids = 全部「未冻结 + tasksEnabled」账号；账号与账号之间间隔 1500ms
+//        （accountGapMs("manual") —— 账号节奏，勿与 settings.gapMs 的「上游调用间距」混为一谈）；
 //        冻结账号 → outcome "failed" + 冻结提示（CONTRACT §10.2/§10.5）。
 //   POST /api/account/unfreeze {uid} | {uids} -> {ok, unfrozen:[…], missing:[…]}
 //        missing = 本来就没冻结（幂等）。冻结不再自动解除，只有这个接口（或看板「恢复」）能解。
@@ -63,7 +66,8 @@
 //   POST /api/campaign/run  {uids?}       -> {results:[{uid, outcome:"ok"|"skipped"|"failed",
 //                                                   earned, message, detail:{activities:[…],
 //                                                   claimed:[…], unavailable:[…]}}]}
-//        缺省/空 uids = 全部「未冻结 + tasksEnabled」账号；账号间隔 1500ms；
+//        缺省/空 uids = 全部「未冻结 + tasksEnabled」账号；账号与账号之间间隔 1500ms
+//        （accountGapMs("manual") —— 账号节奏，勿与 settings.gapMs 的「上游调用间距」混为一谈）；
 //        冻结账号 → outcome "failed" + 冻结提示（CONTRACT §11.1/§10.5）。
 //        活动任务与成长任务解耦：独立跑、独立记账（成长清单为空/失败时活动照跑）。
 //   POST /api/settings    (部分字段)       -> 完整 settings {scheduler,claim,legs,gapMs,hours,host}
@@ -93,9 +97,41 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+// 把属性值安全地拼进 CSS 选择器（P3-a）。上游 uid 可能含 `"` / `]` / `\` 等字符，
+// 直接写 `[data-x="${uid}"]` 会让 querySelector 抛 SyntaxError —— updateCampaignArea /
+// updateCreditsCell 等没有 try 包裹，异常会把整个 promise 变 reject（在 refreshSnap 里
+// 被误报成「刷新快照失败」）。浏览器走原生 CSS.escape（按 CSSOM 规范转义）；
+// Node 下 import 本模块时没有 CSS → 用守卫式兜底（仅需让 import/调用不抛错，
+// 单元测试只验证转义结果，不真去 querySelector）。属性选择器的值用双引号包裹，
+// 因此兜底只需转义 `"` 和 `\` 等非 [a-zA-Z0-9_-]/非 ASCII 字符即安全。
+export function cssEscape(v) {
+  const s = String(v ?? "");
+  if (typeof CSS !== "undefined" && CSS && typeof CSS.escape === "function") return CSS.escape(s);
+  return s.replace(/[^a-zA-Z0-9_\u00a0-\uffff-]/g, (ch) => "\\" + ch);
+}
+
+// 稳定序列化（内容指纹用）：对象键排序后拼接，键顺序无关 —— 同一份数据必得同一字符串，
+// 任一「被渲染字段」变化即得到不同字符串。纯函数、零依赖（指纹比对见 acctFingerprint）。
+export function stableSig(v) {
+  if (v === undefined) return "undefined";
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return "[" + v.map(stableSig).join(",") + "]";
+  const keys = Object.keys(v).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableSig(v[k])).join(",") + "}";
+}
+
+// requestAnimationFrame 守卫（F2-3）：浏览器用它把同一帧内的多次重渲染合并成一次；
+// Node 下 import（单元测试）没有它 → 退化到 setTimeout(0)，语义等价、不抛错。
+const raf = typeof requestAnimationFrame === "function" ? (cb) => requestAnimationFrame(cb) : (cb) => setTimeout(cb, 0);
+
 // ---- 文案映射（领域词汇对齐 daemon/engine 与 CONTRACT） -----------------------
 
-const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", campaign: "活动任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
+export const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", campaign: "活动任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
+// 腿名单值常量：触发一轮 job（runStreakSelected / runCampaignOne）与 job 步骤过滤都按腿名字符串
+// 匹配。散落字面量写着容易手滑、也和 LEG_NAMES 的键 / POINTS_LEGS / DEFAULT_LEGS 脱节。
+// 取值必须与三者是同一套腿名（有测试钉住一致性）。
+export const LEG_CAMPAIGN = "campaign";
+export const LEG_STREAK = "streak";
 const ACCEPT_NAMES = {
   not_accepted: "未接取",
   accepted: "已接取",
@@ -117,11 +153,21 @@ const TRIGGER_NAMES = { manual: "手动", schedule: "排程" };
 // failed=失败。pending 不是成功，绝不显示成「已签到」。
 const OUTCOME_NAMES = { claimed: "已签到", done: "今日已签", pending: "处理中，可重试", failed: "失败" };
 
+// 上游调用间距（settings.gapMs）的红线下限 1000ms —— 按值镜像后端
+// engine/constants.mjs 的 MIN_UPSTREAM_GAP_MS（=1000）。注意别把三个「1500/1000」混了：
+//   · MIN_UPSTREAM_GAP_MS = 1000 —— 硬下限（本常量镜像的就是它）；
+//   · DEFAULT_GAP_MS = 1000     —— 同值，但语义是「没配置时的默认值」；
+//   · daemon.mjs DEFAULT_SETTINGS.gapMs = 1500 —— settings 字段的出厂默认值，
+//     不是上面任何一个常量，只是「settings 里没这个键」时落在 settings 上的初值。
+// 浏览器版 app.js 零依赖、不 import 后端文件，故只能按值镜像；后端红线再动，
+// tests/dashboard-gap-floor.test.mjs 会先红。
+const MIN_UPSTREAM_GAP_MS = 1000;
+
 const LS_THEME = "wbt.theme"; // 主题：localStorage 持久化
 
 // ---- 全局状态 ------------------------------------------------------------------
 
-const state = {
+export const state = {
   hello: null,
   helloBusy: false, // /api/hello 首次拉取中（防并发；拿到后不再重复请求）
   conn: "checking", // checking | online | down | stopped
@@ -155,6 +201,12 @@ const state = {
   jobSeenAt: new Map(), // jobId -> ms：前端首次看到该 job 在跑的时刻（job.startedAt 缺失时兜底计时）
   stepSeenAt: new Map(), // `${jobId}#${idx}` -> ms：前端首次看到该步骤 running 的时刻（step.at 缺失时兜底）
   history: { rows: [], page: 0, pageSize: 25, limit: 200 },
+  // F2/P3-b：日志面板的增量渲染状态 —— 把「已 append 到第几行 / 是否贴底 / 具体 scrollTop」
+  // 记在 state 里。重建（或增量）后按存值恢复滚动，只有用户本来就贴底时才自动滚底。
+  log: { jobId: "", shown: 0, atBottom: true, scrollTop: 0, suppress: false },
+  renderRaf: 0, // F2-3：同一帧内多次重渲染的合并句柄（0 = 无待处理帧）
+  jobDirty: false, // 待重渲染整个实时进度区
+  logDirty: false, // 待增量更新日志面板
 };
 
 // ---- DOM 小工具（所有服务端文本只走 textContent，天然免注入） --------------------
@@ -308,7 +360,7 @@ export function expiryInfo(a) {
 
 // ---- API 层 -----------------------------------------------------------------------
 
-class ApiError extends Error {
+export class ApiError extends Error {
   constructor(status, data) {
     super((data && typeof data.error === "string" && data.error) || `HTTP ${status}`);
     this.status = status;
@@ -823,11 +875,24 @@ function isPicked(uid, code) {
   return !!set && set.has(String(code ?? ""));
 }
 
-// 快照里仍可勾选的任务：有 code 且未锁定（locked 只来自后端字段，老后端 = false）；
+// 快照任务是否已领奖：acceptStatus === "claimed"。这是快照腿的「已领奖」真相源 ——
+// 与 fillSnapGroup（已完成折叠块）/ claimableTask / 统计口径同一判断，勿另造一套。
+// 活动腿的对应真相源是 campaignTaskClaimed（claimedAt 非空），两腿各自对齐。
+function snapTaskClaimed(t) {
+  return String(t?.acceptStatus ?? "") === "claimed";
+}
+
+// 快照里仍可勾选的任务：有 code 且未锁定、未领奖（锁定只来自后端 locked 字段，老后端 = false；
+// 已领奖的行界面上没有勾选框 —— stripPickCell，故绝不能计入可选码）。
 // 再加上活动任务的可勾选码（CONTRACT §11.6：活动任务行与成长/小程序任务共用同一套勾选 state）。
-function selectableCodes(a) {
+// 两腿都排除已领奖：快照腿用 snapTaskClaimed，活动腿用 campaignPickCodes（内部走 campaignTaskClaimed）。
+// 导出仅为 Node 下单元验证；浏览器里 <script type="module"> 不受影响。
+export function selectableCodes(a) {
   const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : [];
-  const snap = tasks.filter((t) => !taskFlags(t).locked).map((t) => String(t?.code ?? "")).filter(Boolean);
+  const snap = tasks
+    .filter((t) => !taskFlags(t).locked && !snapTaskClaimed(t))
+    .map((t) => String(t?.code ?? ""))
+    .filter(Boolean);
   return [...snap, ...campaignPickCodes(a)];
 }
 
@@ -861,21 +926,26 @@ function pickedUnion() {
   return out;
 }
 
-// 快照刷新后把已选集合里「已锁定」的任务码剔除（只剔这些，不动用户其它勾选）。
-// 没有快照可比对时什么都不做。
-function pruneLockedPicks(uid) {
+// 快照刷新后把已选集合里「不再可勾选」的任务码剔除：已锁定 / 已领奖（两者都不可再操作，
+// 界面上也都没有勾选框）。只剔这些，不动用户其它勾选；没有快照可比对时什么都不做。
+// 与 selectableCodes 的可选口径保持一致 —— 否则已领奖的码会滞留在勾选集合里，
+// pickedUnion() 仍非空（界面上无对应勾选框，用户无从取消），批量操作便会带上一轮空跑范围。
+function pruneStalePicks(uid) {
   const set = pickedSet(uid);
   if (!set || !set.size) return;
   const a = accountByUid(uid);
   const tasks = Array.isArray(a?.snapshot?.tasks) ? a.snapshot.tasks : null;
   if (!tasks) return;
-  const locked = new Set(
-    tasks.filter((t) => taskFlags(t).locked).map((t) => String(t?.code ?? "")).filter(Boolean),
+  const stale = new Set(
+    tasks
+      .filter((t) => taskFlags(t).locked || snapTaskClaimed(t))
+      .map((t) => String(t?.code ?? ""))
+      .filter(Boolean),
   );
-  if (!locked.size) return;
+  if (!stale.size) return;
   let changed = false;
   for (const c of [...set]) {
-    if (locked.has(c)) {
+    if (stale.has(c)) {
       set.delete(c);
       changed = true;
     }
@@ -924,8 +994,8 @@ function taskRowBoxes(uid) {
 
 // 同步某账号的勾选控件（行 checkbox / 表头与提示条的「全选」/ 已选计数），不整页重绘
 function updateTaskSelUI(uid) {
-  // 快照刷新后锁定的任务码从内存勾选里剔除（只剔锁定项，其它勾选保持原样）
-  pruneLockedPicks(uid);
+  // 快照刷新后已锁定 / 已领奖的任务码从内存勾选里剔除（只剔这些，其它勾选保持原样）
+  pruneStalePicks(uid);
   const set = pickedSet(uid);
   const avail = selectableCodes(accountByUid(uid));
   const availSet = new Set(avail);
@@ -1553,7 +1623,7 @@ async function refreshSnap(uid, btn) {
     await queryCampaign(uid);
   } catch (e) {
     humanErr(e, "刷新快照失败");
-    const b = $(`[data-snap-refresh="${uid}"]`);
+    const b = $(`[data-snap-refresh="${cssEscape(uid)}"]`);
     if (b) {
       b.disabled = false;
       b.textContent = "刷新快照";
@@ -1603,22 +1673,42 @@ async function toggleTasksEnabled(uid, want) {
   }
 }
 
+// 单行凭据状态的「纯」投影（不建 DOM）：指纹比对（acctFingerprint）也要用它，
+// 所以先算出 {text, cls, sub, subWarn}，再由 accountBadge 建成节点。绝不在指纹里建 DOM。
+function badgeView(a) {
+  const isApiKey = String(a?.masked ?? "").startsWith("API key");
+  const info = expiryInfo(a);
+  const expired = !isApiKey && info.text === "凭据已过期";
+  let text;
+  let cls;
+  if (isApiKey) {
+    text = "API key";
+    cls = "badge-quiet";
+  } else if (expired) {
+    text = "凭据已过期";
+    cls = "badge-warn";
+  } else {
+    text = "已登录";
+    cls = "badge-strong";
+  }
+  return {
+    isApiKey,
+    expired,
+    text,
+    cls,
+    sub: isApiKey ? "无有效期" : expired ? "需要重新登录" : info.text,
+    subWarn: !isApiKey && !expired && info.cls === "badge-warn",
+    title: isApiKey ? null : info.title,
+  };
+}
+
 // 单行状态：只给一枚徽章（凭据状态），剩余时间作为 --ink3 次要文本；
 // 不再把「已登录 / 有效期未知 / 不参与任务」叠成多枚徽章。
 function accountBadge(a) {
-  const isApiKey = String(a.masked ?? "").startsWith("API key");
-  const info = expiryInfo(a);
-  const expired = !isApiKey && info.text === "凭据已过期";
-  let node;
-  if (isApiKey) node = badge("API key", "badge-quiet");
-  else if (expired) node = badge("凭据已过期", "badge-warn");
-  else node = badge("已登录", "badge-strong");
-  if (!isApiKey && info.title) node.title = info.title;
-  return {
-    node,
-    sub: isApiKey ? "无有效期" : expired ? "需要重新登录" : info.text,
-    subWarn: !isApiKey && !expired && info.cls === "badge-warn",
-  };
+  const v = badgeView(a);
+  const node = badge(v.text, v.cls);
+  if (v.title) node.title = v.title;
+  return { node, sub: v.sub, subWarn: v.subWarn };
 }
 
 // 账号任务总量【统一口径】（成长 + 小程序 + 活动）—— 账号行进度条 / 账号行「待接取 · 待领奖」/
@@ -1708,7 +1798,61 @@ function snapBrief(a) {
   return parts.join(" · ");
 }
 
-function accountRow(a) {
+// 「任务明细」详情体的内容指纹（F3）：只覆盖详情体里渲染的那些输入
+// （快照 / 活动 / 连登 / 各查询错误与最近一次结果）。账号行内容变了、但详情体没变时，
+// 增量重绘可以把旧的 .acct-tasks-body 整棵子树搬过来复用（重活不重做）。
+export function taskBodyFingerprint(a) {
+  const uid = String(a?.uid ?? "");
+  return stableSig({
+    uid,
+    snapshot: a?.snapshot ?? null,
+    campaign: campaignOf(a),
+    streak: streakOf(a),
+    streakErr: state.streakErrors.get(uid) ?? null,
+    streakRun: state.streakRuns.get(uid) ?? null,
+    campaignErr: state.campaignErrors.get(uid) ?? null,
+    campaignRun: state.campaignRuns.get(uid) ?? null,
+  });
+}
+
+// 一行账号 DOM 的「内容指纹」（F3）：把 accountRow 真正会渲染出来的输入归约成一个字符串。
+// 轮询拿到的新数据指纹与上一轮相同 → 整行 DOM 原样跳过重建（不丢勾选 / 展开 / 焦点 / 滚动）。
+// 关键：排除 expiresInMs 原始毫秒 —— 后端 expiresInMs = expires - now()，每轮 /api/state
+// 都在变；只保留它渲染出的「桶」（expiryInfo 的 text/cls）。其余可见字段一旦变化，
+// 指纹即不同 → 该行才重建（必要时重建内层子块）。
+export function acctFingerprint(a) {
+  const uid = String(a?.uid ?? "");
+  const v = badgeView(a);
+  return stableSig({
+    uid,
+    nickname: a?.nickname ?? null,
+    masked: a?.masked ?? null,
+    domain: a?.domain ?? null,
+    eligible: !!a?.eligible,
+    tasksEnabled: a?.tasksEnabled !== false,
+    imported: !!a?.imported,
+    // 只留有效期渲染桶，落掉每轮都变的原始毫秒（见上）
+    badgeText: v.text,
+    badgeCls: v.cls,
+    badgeSub: v.sub,
+    badgeSubWarn: !!v.subWarn,
+    frozen: frozenOf(a),
+    selected: state.selected.has(uid),
+    toggling: state.toggling.has(uid),
+    totals: taskTotals(a),
+    credits: a?.credits ?? null,
+    creditBusy: state.creditBusy.has(uid),
+    creditErr: state.creditErrors.get(uid) ?? null,
+    campaignBusy: state.campaignBusy.has(uid),
+    expanded: state.expanded.has(uid),
+    taskSel: [...(state.taskSel[uid] ?? [])].map(String).sort(),
+    body: taskBodyFingerprint(a),
+  });
+}
+
+// opts.body：可复用的旧 .acct-tasks-body 子树（F3 增量重绘时把内容未变的详情体整棵搬过来，
+// 省掉重建上百行任务明细的开销）。srcUid 仅为可读性，uid 从 a 取。
+function accountRow(a, opts = {}) {
   const isApiKey = String(a.masked ?? "").startsWith("API key");
   const uid = String(a.uid ?? "");
   const name = String(a.nickname || uid || "（无昵称）");
@@ -1853,6 +1997,20 @@ function accountRow(a) {
   const snapMetaText = a.snapshot
     ? `${expired ? "已过期" : "快照"} · ${fmtTime(a.snapshot.updatedISO)}`
     : "未读取";
+  const bodyFp = taskBodyFingerprint(a);
+  const open = state.expanded.has(uid);
+  // 任务明细详情体：默认收起 → **惰性构建**（收起态绝不为它建 DOM，长清单不再拖慢轮询）。
+  // 用户展开、或调用方把内容未变的旧详情体搬过来（opts.body）时才真正构建内容。
+  const body =
+    opts.body && opts.body.dataset && opts.body.dataset.fp === bodyFp
+      ? opts.body
+      : el("div", { class: "acct-tasks-body", dataset: { fp: bodyFp } });
+  const buildBody = () => {
+    if (body.dataset.built === "1") return;
+    body.dataset.built = "1";
+    body.append(snapMetrics(a), heatPanel(a), taskTable(a));
+  };
+  if (open && body.dataset.built !== "1") buildBody();
   const tasks = el(
     "details",
     { class: "acct-tasks" },
@@ -1868,14 +2026,16 @@ function accountRow(a) {
       }),
       el("span", { class: "acct-tasks-meta", text: snapMetaText }),
     ),
-    // 连登日历搬进「任务明细」详情里（任务表上方，0.3.4）：它是「这个账号最近发生了什么」
-    // 的明细，和任务表同属展开区；账号行只留昵称右侧那两行数字 + 档位。
-    el("div", { class: "acct-tasks-body" }, snapMetrics(a), heatPanel(a), taskTable(a)),
+    body,
   );
-  if (state.expanded.has(uid)) tasks.open = true;
+  tasks.open = open;
   tasks.addEventListener("toggle", () => {
-    if (tasks.open) state.expanded.add(uid);
-    else state.expanded.delete(uid);
+    if (tasks.open) {
+      state.expanded.add(uid);
+      buildBody(); // 首次展开才建详情体（惰性）
+    } else {
+      state.expanded.delete(uid);
+    }
   });
 
   return el(
@@ -1991,9 +2151,114 @@ function renderEnterpriseNote() {
   box.hidden = false;
 }
 
+// ---- 账号行的 keyed 增量重绘（F3） -------------------------------------------------
+// 旧做法：每轮 renderAccounts 都 box.replaceChildren() 后为每个账号 append(accountRow(a))
+// —— 整棵「账号 × 任务树」全量重建，长清单卡顿，且会丢勾选 / 展开 / 焦点 / 滚动。
+// 新做法：按 uid 复用已存在的账号行 DOM（只为新增 uid 建 DOM、只为消失的 uid 移除），
+// 行内容用 acctFingerprint 做门控：
+//   · 指纹未变 → 整行原样跳过（最常见：轮询没有新数据，一次结构操作都不做）；
+//   · 指纹变了 → 只重建这一行，且尽量把「内容未变」的重活（.acct-tasks-body 详情体 /
+//     上百行任务明细）整棵搬过来复用；重建前后保留行内焦点与滚动。
+// 账号增删才动结构顺序（insertBefore / remove）。
+
+// 在一行 DOM 内记录「当前焦点元素的路径 + 选区」，重建后可恢复到同一元素（行内没有文本输入，
+// 主要是 checkbox / 按钮的焦点环，以及将来可能的输入控件）。
+function domPath(root, node) {
+  const segs = [];
+  let cur = node;
+  while (cur && cur !== root && cur.parentNode) {
+    segs.push(Array.prototype.indexOf.call(cur.parentNode.childNodes, cur));
+    cur = cur.parentNode;
+  }
+  return segs.reverse();
+}
+function nodeByPath(root, path) {
+  let cur = root;
+  for (const i of path || []) {
+    cur = cur && cur.childNodes ? cur.childNodes[i] : null;
+    if (!cur) return null;
+  }
+  return cur;
+}
+function captureFocus(scope) {
+  const doc = typeof document !== "undefined" ? document : null;
+  const ae = doc ? doc.activeElement : null;
+  if (!ae || !scope || typeof scope.contains !== "function" || !scope.contains(ae)) return null;
+  return { path: domPath(scope, ae), start: ae.selectionStart ?? null, end: ae.selectionEnd ?? null };
+}
+function restoreFocus(scope, snap) {
+  if (!snap || !scope) return;
+  const node = nodeByPath(scope, snap.path);
+  if (node && typeof node.focus === "function") {
+    try {
+      node.focus();
+      if (snap.start != null && typeof node.setSelectionRange === "function") {
+        node.setSelectionRange(snap.start, snap.end ?? snap.start);
+      }
+    } catch {}
+  }
+}
+
+// 账号行内部的可滚动区（任务明细详情体）的滚动位置：重建前后保留。
+function captureRowScroll(scope) {
+  const body = scope && scope.querySelector ? scope.querySelector(".acct-tasks-body") : null;
+  return body ? { top: body.scrollTop } : null;
+}
+function restoreRowScroll(scope, snap) {
+  if (!snap || !scope || typeof scope.querySelector !== "function") return;
+  const body = scope.querySelector(".acct-tasks-body");
+  if (body) body.scrollTop = snap.top;
+}
+
+// 构建一行（必要时复用旧行的详情体子树，并保留旧行的焦点 / 滚动）。
+function buildAccountRow(a, oldRow) {
+  const oldBody = oldRow && typeof oldRow.querySelector === "function" ? oldRow.querySelector(".acct-tasks-body") : null;
+  const reusable =
+    oldBody && oldBody.dataset && oldBody.dataset.fp === taskBodyFingerprint(a) && oldBody.dataset.built === "1"
+      ? oldBody
+      : null;
+  const focus = oldRow ? captureFocus(oldRow) : null;
+  const scroll = oldRow ? captureRowScroll(oldRow) : null;
+  const fresh = accountRow(a, { body: reusable });
+  restoreFocus(fresh, focus);
+  restoreRowScroll(fresh, scroll);
+  return fresh;
+}
+
+function reconcileAccountRows(box, accounts) {
+  const existing = new Map();
+  for (const node of Array.from(box.children)) {
+    const uid = node.dataset ? node.dataset.acct : undefined;
+    if (uid !== undefined) existing.set(uid, node);
+  }
+  let ref = box.firstElementChild; // 正在期望的下一个既有节点（keyed diff 的移动指针）
+  for (const a of accounts) {
+    const uid = String(a.uid ?? "");
+    const fp = acctFingerprint(a);
+    let row = existing.get(uid);
+    if (!row) {
+      row = accountRow(a); // 新账号：建 DOM
+      row.__acctFp = fp;
+    } else if (row.__acctFp !== fp) {
+      row = buildAccountRow(a, row); // 内容变了：只重建这一行
+      row.__acctFp = fp;
+    }
+    if (ref === row) {
+      ref = row.nextElementSibling; // 位置已正确 → 指针后移
+    } else {
+      box.insertBefore(row, ref); // 新增 / 乱序 → 插到期望位置（同一节点实例，状态不丢）
+    }
+  }
+  while (ref) {
+    // 账号已消失：移除尾部残留行
+    const next = ref.nextElementSibling;
+    ref.remove();
+    ref = next;
+  }
+}
+
 function renderAccounts() {
   const box = $("#accountsList");
-  box.replaceChildren();
   const accounts = state.data?.accounts ?? [];
   const head = $("#acctHead");
   if (head) head.hidden = accounts.length === 0;
@@ -2006,7 +2271,7 @@ function renderAccounts() {
   renderEnterpriseNote();
   renderFrozenNote();
   if (!accounts.length) {
-    box.append(
+    box.replaceChildren(
       el(
         "div",
         { class: "empty" },
@@ -2029,12 +2294,12 @@ function renderAccounts() {
     updateSelectionUI();
     return;
   }
-  for (const a of accounts) box.append(accountRow(a));
+  reconcileAccountRows(box, accounts);
   // 清掉已不存在的勾选（账号级 / 任务级都按 uid 收口）
   const uids = new Set(accounts.map((a) => a.uid));
   for (const s of [...state.selected]) if (!uids.has(s)) state.selected.delete(s);
   for (const uid of Object.keys(state.taskSel)) if (!uids.has(uid)) delete state.taskSel[uid];
-  // 重建 DOM 后把勾选控件同步回 state（表头全选/半选、已选计数）
+  // 复用后的 DOM 把勾选控件同步回 state（表头全选/半选、已选计数）
   for (const a of accounts) updateTaskSelUI(a.uid);
   updateSelectionUI();
 }
@@ -2224,13 +2489,22 @@ function creditsCell(a) {
   );
 }
 
+// 就地修补某列后，把该行的缓存指纹同步到当前 state —— 否则下一轮 poll 会因指纹「看似变了」
+// 白白重建整行（F3）。
+function syncRowFp(uid) {
+  const acct = accountByUid(uid);
+  const row = $(`[data-acct="${cssEscape(uid)}"]`);
+  if (acct && row) row.__acctFp = acctFingerprint(acct);
+}
+
 // 只重绘积分列（不整页 renderAccounts），避免轮询/查询时打断任务勾选与展开状态。
 function updateCreditsCell(uid) {
-  const cell = $(`[data-credits-cell="${uid}"]`);
+  const cell = $(`[data-credits-cell="${cssEscape(uid)}"]`);
   if (!cell) return;
   const acct = accountByUid(uid);
   if (!acct) return;
   cell.replaceChildren(...creditsCellContent(acct));
+  syncRowFp(uid);
 }
 
 function applyCredits(uid, credits, nickname) {
@@ -2805,7 +3079,8 @@ function streakTierBadges(st) {
 }
 
 // 连登日历：纯 CSS grid 小格子（7 列 = 周一…周日），默认折叠（避免账号行过高）。
-// 上游一次给一整年（365 格），全渲染。
+// 上游一次给一整年（365 格），但这里**不全渲染**：只画最近 HEAT_WINDOW_DAYS 天
+//（见下方 HEAT_WINDOW_DAYS 的定义与说明），否则会变成 53 行、807px 高的细长条。
 // 每格 title = 日期 + score；score=0 淡色，>0 按固定阈值分 3 档深浅（阈值写死在 heatLevel，
 // 与上游数值量级无关，只做视觉分档）。日历数据只读后端给的 heatmap 数组，前端不自己算区间。
 const HEAT_WEEK = ["一", "二", "三", "四", "五", "六", "日"];
@@ -2982,10 +3257,11 @@ function streakCellBlock(a) {
 function updateStreakArea(uid) {
   const acct = accountByUid(uid);
   if (!acct) return;
-  const box = $(`[data-streak-cell="${uid}"]`);
+  const box = $(`[data-streak-cell="${cssEscape(uid)}"]`);
   if (box) box.replaceWith(streakCellBlock(acct));
-  const heat = $(`[data-heat-cell="${uid}"]`);
+  const heat = $(`[data-heat-cell="${cssEscape(uid)}"]`);
   if (heat) heat.replaceWith(heatPanel(acct));
+  syncRowFp(uid);
 }
 
 function applyStreak(uid, streak) {
@@ -3096,6 +3372,35 @@ export function streakResultText(r, who) {
 //（rememberStreakStep / settleTrackedJob），不再有 /api/streak/run 的 results[] 可合并 —— 原
 // mergeStreakDetail / rememberStreakRun 随之删除。streakResultText 保留为契约形状的纯函数出口。
 
+// 组装 POST /api/run 的请求体（runFull / runStreakSelected / runCampaignOne 三处共用的收尾流程）。
+// 口径：legs 必给；uids / codes 只在非空时才带 —— 不带 = 后端按「全部可参与账号 / 全部任务」处理
+//（老口径，不能塞空数组把它覆盖成「什么都不做」）；claim 只在调用方确实要表达时才带
+//（undefined = 不带，区别于显式 false）。纯函数，便于行为断言（见 tests/dashboard-run-job.test.mjs）。
+export function runRequestBody({ legs, uids, codes, claim } = {}) {
+  const body = { legs };
+  if (Array.isArray(uids) && uids.length) body.uids = [...uids];
+  if (codes) body.codes = codes;
+  if (claim !== undefined) body.claim = claim;
+  return body;
+}
+
+// 触发一轮 job 的共同流程（runFull / runStreakSelected / runCampaignOne 三处原本逐行相同）：
+// POST /api/run（body 由 runRequestBody 组装）→ onStarted(r)（调用方在此记 jobId / 写状态文案，
+// 保住重构前「拿到响应后、清收尾标记前」的先后顺序）→ 清掉上一轮收尾标记 state.lastFinished
+// → 重新拉 state → 重连 SSE。返回 api() 的响应，供调用方按需取 job.id。
+// deps 仅供测试注入（生产不传 = 真实 api / loadState / connectSSE），与 behavior 完全一致。
+export async function startRunJob(desc, onStarted, deps = {}) {
+  const doApi = deps.api ?? api;
+  const doLoad = deps.loadState ?? loadState;
+  const doSSE = deps.connectSSE ?? connectSSE;
+  const r = await doApi("api/run", { method: "POST", body: runRequestBody(desc) });
+  if (onStarted) onStarted(r);
+  state.lastFinished = null;
+  await doLoad();
+  doSSE();
+  return r;
+}
+
 // 0.3.4：账号行里的「连登管家」按钮已删（用户口径：连登管家在批量条上已经有一个了）。
 // 单账号要跑就连登写清 uid 走批量接口 POST /api/streak/run {uids:[uid]}；界面入口统一在批量条。
 
@@ -3105,17 +3410,13 @@ export function streakResultText(r, who) {
 async function runStreakSelected() {
   await withBusy(async () => {
     const uids = [...state.selected];
-    const body = { legs: ["streak"] };
-    if (uids.length) body.uids = uids;
     setBatchStatus(`正在启动连登管家：${uids.length ? `${uids.length} 个账号` : "全部可参与账号"}（补签 → 礼包/补偿 → 档位兑换 → 抽奖）…`);
     try {
-      const r = await api("api/run", { method: "POST", body });
-      const jobId = r?.job?.id ? String(r.job.id) : "";
-      state.streakJobId = jobId; // 收尾时按该轮的 streak 腿步骤回填各行最近一次结果
-      setBatchStatus(`已启动 ${jobId || "连登管家"}：进度见「实时进度」区（SSE 推送）。`);
-      state.lastFinished = null;
-      await loadState();
-      connectSSE();
+      await startRunJob({ legs: [LEG_STREAK], uids }, (r) => {
+        const jobId = r?.job?.id ? String(r.job.id) : "";
+        state.streakJobId = jobId; // 收尾时按该轮的 streak 腿步骤回填各行最近一次结果
+        setBatchStatus(`已启动 ${jobId || "连登管家"}：进度见「实时进度」区（SSE 推送）。`);
+      });
     } catch (e) {
       setBatchStatus("");
       humanErr(e, "启动连登管家失败");
@@ -3343,14 +3644,18 @@ function campaignRunButton(a) {
   });
 }
 
-// 活动数据更新时就地重绘该账号的账号行：活动明细现在只在任务明细「活动任务」分组里，重绘整
-// 账号行最省事。勾选 / 任务明细展开 / 「已完成」折叠 / 连登日历展开等状态都记在 state 里，
-// 重绘即还原，不打散用户正在做的事（[data-acct="uid"] 锚点在 accountRow 上）。
+// 活动数据更新时就地重绘该账号的账号行：活动明细现在只在任务明细「活动任务」分组里，重绘该
+// 行最省事。勾选 / 任务明细展开 / 「已完成」折叠 / 连登日历展开等状态都记在 state 里，
+// 重建即还原；且走 buildAccountRow —— 内容未变的 .acct-tasks-body 整棵复用，并保留行内焦点 /
+// 滚动，不打散用户正在做的事（[data-acct] 锚点在 accountRow 上；uid 先经 cssEscape 转义，P3-a）。
 function updateCampaignArea(uid) {
   const acct = accountByUid(uid);
   if (!acct) return;
-  const row = $(`[data-acct="${uid}"]`);
-  if (row) row.replaceWith(accountRow(acct));
+  const row = $(`[data-acct="${cssEscape(uid)}"]`);
+  if (!row) return;
+  const fresh = buildAccountRow(acct, row);
+  fresh.__acctFp = acctFingerprint(acct);
+  row.replaceWith(fresh);
 }
 
 function applyCampaign(uid, campaign) {
@@ -3469,16 +3774,16 @@ function campaignJobRunning(uid) {
   const tracked = state.campaignJobIds.get(key);
   if (tracked && tracked === String(j.id ?? "")) return true;
   const legs = Array.isArray(j.spec?.legs) ? j.spec.legs : Array.isArray(j.legs) ? j.legs : [];
-  if (!legs.length || legs.some((l) => l !== "campaign")) return false;
+  if (!legs.length || legs.some((l) => l !== LEG_CAMPAIGN)) return false;
   const uids = Array.isArray(j.spec?.uids) ? j.spec.uids.map(String) : null;
   if (uids && uids.includes(key)) return true;
-  return Array.isArray(j.steps) && j.steps.some((s) => String(s?.uid ?? "") === key && String(s?.leg ?? "") === "campaign");
+  return Array.isArray(j.steps) && j.steps.some((s) => String(s?.uid ?? "") === key && String(s?.leg ?? "") === LEG_CAMPAIGN);
 }
 
 // 用 job 步骤回填「该账号最近一次活动任务结果」那一行（批量条那套手法：结果来自 job.steps，不再是 results[]）。
 function rememberCampaignStep(uid, job, who) {
   const key = String(uid ?? "").trim();
-  const step = jobStepFor(job, uid, "campaign");
+  const step = jobStepFor(job, uid, LEG_CAMPAIGN);
   if (!key || !step) return null;
   const stateName = String(step.state ?? "");
   const detail = String(step.detail ?? "").trim();
@@ -3491,7 +3796,7 @@ function rememberCampaignStep(uid, job, who) {
 // 「连登管家」job 收尾：把该轮 streak 腿步骤回填到各账号的最近一次结果行（保住既有那行，不因改走 job 而空掉）。
 function rememberStreakStep(uid, job, who) {
   const key = String(uid ?? "").trim();
-  const step = jobStepFor(job, uid, "streak");
+  const step = jobStepFor(job, uid, LEG_STREAK);
   if (!key || !step) return null;
   const stateName = String(step.state ?? "");
   const detail = String(step.detail ?? "").trim();
@@ -3519,7 +3824,7 @@ function settleTrackedJob(job) {
     state.streakJobId = "";
     const steps = Array.isArray(job.steps) ? job.steps : [];
     for (const s of steps) {
-      if (String(s?.leg ?? "") !== "streak") continue;
+      if (String(s?.leg ?? "") !== LEG_STREAK) continue;
       const uid = String(s?.uid ?? "");
       if (!uid) continue;
       rememberStreakStep(uid, job, accountByUid(uid)?.nickname || uid);
@@ -3547,12 +3852,10 @@ async function runCampaignOne(uid) {
   state.campaignBusy.add(uid); // 起 job 的这次请求期间先显示「运行中…」，拿到 job id 后交给 job 状态驱动
   updateCampaignArea(uid);
   try {
-    const r = await api("api/run", { method: "POST", body: { uids: [uid], legs: ["campaign"] } });
-    const jobId = r?.job?.id ? String(r.job.id) : "";
-    if (jobId) state.campaignJobIds.set(String(uid), jobId);
-    state.lastFinished = null;
-    await loadState();
-    connectSSE();
+    await startRunJob({ uids: [uid], legs: [LEG_CAMPAIGN] }, (r) => {
+      const jobId = r?.job?.id ? String(r.job.id) : "";
+      if (jobId) state.campaignJobIds.set(String(uid), jobId);
+    });
   } catch (e) {
     // 已有 job 在跑（409）沿用与「批量做任务」一致的提示口径（humanErr 统一处理）。
     if (e instanceof ApiError && e.status === 409) {
@@ -3732,6 +4035,13 @@ function pruneElapsedSeen() {
   state.stepSeenAt.clear();
 }
 
+// 「该账号选中的任务都不属于这条腿」的跳过行（runner 的固定文案）：用户没勾那类任务时
+// 的必然结果 —— 每次都在实时进度里占一行纯属噪音，用户 2026-11-14 要求不显示。
+// **只过滤展示**：job.log 与 /api/history 里的记录原样保留（回溯/排障要用）。
+function isNoTaskLegSkip(s) {
+  return String(s?.state ?? "") === "skip" && /不属于这条腿/.test(String(s?.detail ?? ""));
+}
+
 function stepRow(s, idx, job) {
   const gain = [];
   if (Number(s.credit) > 0) gain.push(`+${fmtNum(s.credit)} 积分`);
@@ -3763,14 +4073,85 @@ function stepRow(s, idx, job) {
   );
 }
 
+// 日志面板单块最大保留行数（环形裁剪上限，F2-1）：客户端自保 —— 不假设后端一定给完整历史
+// （同事正在给 job.log 加长度上限），超出即从头部裁掉最旧的行。
+const LOG_MAX_LINES = 2000;
+
+// 判定「用户停在底部」（阈值 30px）：只有贴底时才自动滚底，否则维持用户当前位置（P3-b）。
+function isLogAtBottom(pane) {
+  return pane.scrollHeight - pane.scrollTop - pane.clientHeight < 30;
+}
+
+// 日志面板的增量更新计划（F2-1）：纯函数，只算「从哪一行起 append 多少 / 头部裁多少」，
+// 绝不整段 replaceChildren 重建全部日志行。
+//   rendered = 面板上次对应到的数组长度；total = 本次数组长度；cap = 保留行数上限。
+//   · total < rendered → 来源收缩（后端加了 log 上限 / 换了 job）→ reset，整段重建；
+//   · 否则只 append [rendered, total) 的新行。
+export function logWindowPlan(rendered, total, cap) {
+  const capN = Number.isFinite(Number(cap)) && Number(cap) > 0 ? Math.floor(Number(cap)) : 0;
+  const r = Math.max(0, Math.floor(Number(rendered) || 0));
+  const t = Math.max(0, Math.floor(Number(total) || 0));
+  if (t < r) return { reset: true, appendFrom: 0, appendCount: 0, dropOldest: 0, keep: Math.min(t, capN) };
+  const existing = Math.min(r, capN); // 面板当前节点数（此前已被裁到 ≤cap）
+  const appendCount = t - r;
+  const nodesAfter = existing + appendCount;
+  const keep = Math.min(nodesAfter, capN);
+  return { reset: false, appendFrom: r, appendCount, dropOldest: nodesAfter - keep, keep };
+}
+
+// 面板滚动状态落 state（P3-b）：贴底与否 + 具体 scrollTop 都记下，重建/增量后按存值恢复。
+function wireLogScroll(pane) {
+  if (pane.__logWired) return;
+  pane.__logWired = true;
+  pane.addEventListener("scroll", () => {
+    if (state.log.suppress) return; // 程序化重建期间的瞬时事件不采信
+    state.log.atBottom = isLogAtBottom(pane);
+    state.log.scrollTop = pane.scrollTop;
+  });
+}
+function captureLogScroll() {
+  const pane = $("#jobLogPane");
+  if (!pane) return;
+  state.log.atBottom = isLogAtBottom(pane);
+  state.log.scrollTop = pane.scrollTop;
+}
+
 function renderJobLogs() {
   const pane = $("#jobLogPane");
   if (!pane) return;
-  const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 30;
   const job = state.data?.job ?? state.lastFinished;
+  const jobId = String(job?.id ?? "");
   const lines = Array.isArray(job?.log) ? job.log : [];
-  pane.replaceChildren(...lines.map((l) => document.createTextNode(String(l) + "\n")));
-  if (atBottom) pane.scrollTop = pane.scrollHeight;
+  const st = state.log;
+  if (st.jobId !== jobId) {
+    // 换了 job：清空旧内容、从零开始（下一段按增量 append）
+    st.jobId = jobId;
+    st.shown = 0;
+    pane.replaceChildren();
+  }
+  const plan = logWindowPlan(st.shown, lines.length, LOG_MAX_LINES);
+  let shift = 0; // 头部裁剪导致的向上落差（px），用于修正非贴底时的 scrollTop
+  if (plan.reset) {
+    const start = Math.max(0, lines.length - plan.keep);
+    const frag = document.createDocumentFragment();
+    for (let i = start; i < lines.length; i++) frag.append(document.createTextNode(String(lines[i]) + "\n"));
+    pane.replaceChildren(frag);
+    st.shown = lines.length;
+  } else if (plan.appendCount > 0) {
+    const beforeH = pane.scrollHeight;
+    const frag = document.createDocumentFragment();
+    for (let i = plan.appendFrom; i < plan.appendFrom + plan.appendCount; i++) {
+      frag.append(document.createTextNode(String(lines[i] ?? "") + "\n"));
+    }
+    pane.append(frag); // 只 append 新增行，不重建旧行
+    for (let d = plan.dropOldest; d > 0 && pane.firstChild; d--) pane.removeChild(pane.firstChild);
+    st.shown = lines.length;
+    shift = beforeH - pane.scrollHeight;
+  }
+  // 只有用户本来就贴底时才自动滚底；否则恢复到存值（并抵消头部裁剪造成的上移）
+  if (st.atBottom) pane.scrollTop = pane.scrollHeight;
+  else pane.scrollTop = Math.max(0, st.scrollTop - Math.max(0, shift));
+  st.scrollTop = pane.scrollTop;
 }
 
 function renderJob() {
@@ -3780,6 +4161,9 @@ function renderJob() {
   const job = state.data?.job ?? state.lastFinished;
 
   if (!job) {
+    // 没有 job：重置日志增量状态（下次新 job 从零 append），并停掉秒级计时器
+    state.log.jobId = "";
+    state.log.shown = 0;
     box.replaceChildren(
       el(
         "div",
@@ -3842,7 +4226,10 @@ function renderJob() {
   );
 
   const steps = Array.isArray(job.steps) ? job.steps : [];
-  const stepsTable = steps.length
+  // 展示用列表：去掉「没勾那类任务」的跳过行，但**保留原索引**（stepRow 的计时依赖
+  // job.steps 下标）。全部被过滤掉时回落到「还没有步骤产出」那句。
+  const shownSteps = steps.map((s, i) => ({ s, i })).filter(({ s }) => !isNoTaskLegSkip(s));
+  const stepsTable = shownSteps.length
     ? el(
         "div",
         { class: "tbl-wrap" },
@@ -3859,23 +4246,66 @@ function renderJob() {
               el("th", { text: "时间", class: "num" }),
             ),
           ),
-          el("tbody", {}, steps.map((s, i) => stepRow(s, i, job))),
+          el("tbody", {}, shownSteps.map(({ s, i }) => stepRow(s, i, job))),
         ),
       )
     : el("p", { class: "muted", text: "还没有步骤产出。" });
 
-  const logPane = el("div", { class: "logpane", id: "jobLogPane", "aria-label": "运行日志" });
+  // 复用同一个日志面板节点（不每次新建空节点）：已 append 的日志行保留下来，
+  // renderJobLogs 只增量补新行；滚动位置先存进 state，重建后按存值恢复（P3-b）。
+  captureLogScroll();
+  let logPane = $("#jobLogPane");
+  if (!logPane) {
+    logPane = el("div", { class: "logpane", id: "jobLogPane", "aria-label": "运行日志" });
+    wireLogScroll(logPane);
+  }
 
-  box.replaceChildren(
-    meta,
-    totalsBar,
-    el("div", { class: "subhead" }, el("span", { class: "label", text: "步骤" })),
-    stepsTable,
-    el("div", { class: "subhead" }, el("span", { class: "label", text: "日志" })),
-    logPane,
-  );
+  // 重建期间抑制 scroll 监听采信（节点移动可能触发瞬时的 scroll 事件）
+  state.log.suppress = true;
+  try {
+    box.replaceChildren(
+      meta,
+      totalsBar,
+      el("div", { class: "subhead" }, el("span", { class: "label", text: "步骤" })),
+      stepsTable,
+      el("div", { class: "subhead" }, el("span", { class: "label", text: "日志" })),
+      logPane,
+    );
+  } finally {
+    state.log.suppress = false;
+  }
   renderJobLogs();
   syncElapsedTimer(); // 运行中 → 秒级计时器接管时长文本；已结束 → 停表
+}
+
+// F2-2：step 事件只 append 对应那一行（步骤是追加式的 —— daemon 只在步骤「新增」时推 step），
+// 不再重建整张步骤表。表还没建（这是第一条步骤，之前是「还没有步骤产出」空态）→ 返回 false，
+// 交给整段 renderJob（由 scheduleRender 合并调度）。
+function appendStepRow(step) {
+  const job = state.data?.job;
+  const box = $("#jobBody");
+  if (!job || !box) return false;
+  const tbody = $("table.tbl-steps tbody", box);
+  if (!tbody) return false;
+  const idx = (Array.isArray(job.steps) ? job.steps.length : 1) - 1;
+  tbody.append(stepRow(step, idx, job));
+  return true;
+}
+
+// F2-3：用 rAF 把同一帧内的多次重渲染合并成一次（step / log 突发事件一次补多步时，不同步重排 N 次）。
+// job 级重绘优先于纯日志更新（renderJob 收尾会顺带把日志也更新一遍）。
+function scheduleRender(kind) {
+  if (kind === "log") state.logDirty = true;
+  else state.jobDirty = true;
+  if (state.renderRaf) return;
+  state.renderRaf = raf(() => {
+    state.renderRaf = 0;
+    const jobDirty = state.jobDirty;
+    state.jobDirty = false;
+    state.logDirty = false;
+    if (jobDirty) renderJob();
+    else renderJobLogs();
+  });
 }
 
 // ---- 批量操作 ------------------------------------------------------------------------------
@@ -3888,10 +4318,10 @@ function setBatchStatus(text) {
 // settings.legs 缺失/为空时回退到出厂默认。0.3.3（CONTRACT §10.3）起的默认腿是
 // ["growth","streak","travel"]（连登管家是幂等纯收益，默认做）—— 老后端不给 legs 时
 // 前端兜底同一份默认；用户存过 legs 的实例由服务端值决定，不受这里影响。
-const DEFAULT_LEGS = ["growth", "streak", "travel"];
+export const DEFAULT_LEGS = ["growth", LEG_STREAK, "travel"];
 // 「积分任务」胶囊（value="points"）= 一次控制 growth + mp + campaign 三条腿：
 // 界面上是一个胶囊，settings.legs 里仍写真实腿名，/api/run 的 legs 也仍是三个名字。
-const POINTS_LEGS = ["growth", "mp", "campaign"];
+export const POINTS_LEGS = ["growth", "mp", LEG_CAMPAIGN];
 let syncedLegsKey = null; // 最近一次从 settings.legs 同步到顶部的值（排序后拼接）
 
 function legsFromSettings(v) {
@@ -3951,19 +4381,15 @@ async function runFull() {
     // 小程序链式任务由 growth 腿内嵌执行（2b），不作为独立腿提交。
     const codes = selectionBody(targetAccounts());
     const picked = pickedUnion().size;
-    const body = { legs, claim: $("#claimToggle").checked };
-    if (uids.length) body.uids = uids;
-    if (picked) body.codes = codes;
+    const claim = $("#claimToggle").checked;
     setBatchStatus(
       `正在启动批量任务：${legs.map(legName).join(" + ")}，${uids.length ? `${uids.length} 个账号` : "全部可参与账号"}，` +
-        `${picked ? `仅选中任务（${picked} 项 · 本轮所有目标账号只做这些），` : ""}${body.claim ? "自动领奖" : "手动领奖（做完不领，之后可「只领奖」）"}…`,
+        `${picked ? `仅选中任务（${picked} 项 · 本轮所有目标账号只做这些），` : ""}${claim ? "自动领奖" : "手动领奖（做完不领，之后可「只领奖」）"}…`,
     );
     try {
-      const r = await api("api/run", { method: "POST", body });
-      setBatchStatus(`已启动 ${r?.job?.id ?? "批量任务"}：进度见「实时进度」区（SSE 推送）。`);
-      state.lastFinished = null;
-      await loadState();
-      connectSSE();
+      await startRunJob({ legs, claim, uids, codes: picked ? codes : undefined }, (r) => {
+        setBatchStatus(`已启动 ${r?.job?.id ?? "批量任务"}：进度见「实时进度」区（SSE 推送）。`);
+      });
     } catch (e) {
       setBatchStatus("");
       humanErr(e, "启动批量任务失败");
@@ -3984,6 +4410,34 @@ async function refreshSnapshotNow(uid) {
 async function ensureSnapshot(a) {
   if (a.snapshot) return a;
   return (await refreshSnapshotNow(a.uid)) ?? a;
+}
+
+// 「有勾选但按当前快照筛不出可接/可领项」时的共同处理（acceptSelected / claimSelected 原本逐行重复）：
+// 本地快照可能停在旧状态（上游已接取/已完成，快照仍显示未接）→ 强制刷新一次最新快照再重判。
+// 返回三选一，调用方按标记 dispatch：
+//   { conflict: true }  → 命中 409（已有批量任务在跑）；内部已 setBatchStatus(conflictMsg)，调用方直接 return；
+//   { skipped: true }   → 刷新失败 / 账号消失；已往 notes 落一条说明，调用方 continue；
+//   { account: fresh }  → 刷新成功，调用方用 fresh 按最新快照重算可接/可领项。
+// errNote(e) 只在 accept 侧用来把 humanizeApiErr 的提示拼进失败说明；claim 侧不传 → 用默认文案。
+// opts.refresh / opts.setStatus 仅供测试注入（生产不传 = 真实 refreshSnapshotNow / setBatchStatus）。
+export async function refreshForReselect(a, notes, { conflictMsg, errNote, refresh = refreshSnapshotNow, setStatus = setBatchStatus } = {}) {
+  const who = a.nickname || a.uid;
+  let fresh = null;
+  try {
+    fresh = await refresh(a.uid);
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 409) {
+      setStatus(conflictMsg);
+      return { conflict: true };
+    }
+    notes.push(errNote ? `${who}：${errNote(e)}` : `${who}：快照刷新失败`);
+    return { skipped: true };
+  }
+  if (!fresh) {
+    notes.push(`${who}：快照刷新失败`);
+    return { skipped: true };
+  }
+  return { account: fresh };
 }
 
 async function acceptSelected() {
@@ -4025,22 +4479,13 @@ async function acceptSelected() {
       // 有勾选但按当前快照筛不出可接项：本地快照可能停在旧状态（上游已接取、快照仍显示
       // 未接）。强制刷新一次最新快照再判断；已有可接项 / 本来就没有待接项时不做无谓刷新。
       if (hadPick && !codes.length && plan.pending > 0) {
-        let fresh = null;
-        try {
-          fresh = await refreshSnapshotNow(a.uid);
-        } catch (e) {
-          if (e instanceof ApiError && e.status === 409) {
-            setBatchStatus("已有批量任务在跑，接取中止（守护进程限速保护）。");
-            return;
-          }
-          notes.push(`${a.nickname || a.uid}：快照刷新失败（${humanizeApiErr(e.message, e.data?.hint)}）`);
-          continue;
-        }
-        if (!fresh) {
-          notes.push(`${a.nickname || a.uid}：快照刷新失败`);
-          continue;
-        }
-        a = fresh;
+        const rr = await refreshForReselect(a, notes, {
+          conflictMsg: "已有批量任务在跑，接取中止（守护进程限速保护）。",
+          errNote: (e) => `快照刷新失败（${humanizeApiErr(e.message, e.data?.hint)}）`,
+        });
+        if (rr.conflict) return;
+        if (rr.skipped) continue;
+        a = rr.account;
         refreshed = true;
         plan = acceptPlan(a.snapshot?.tasks);
         // 刷新后重读并集（renderAll 可能把锁定项剔除）；并集空了 = 无待接项，不退回全部
@@ -4134,22 +4579,10 @@ async function claimSelected() {
       // （上游已完成、快照仍是 accepted 0/N）。强制刷新一次最新快照再判断；
       // 已有可领项时绝不额外刷新（避免每次「只领奖」都多打一次上游）。
       if (hadPick && !scoped.length) {
-        let fresh = null;
-        try {
-          fresh = await refreshSnapshotNow(a.uid);
-        } catch (e) {
-          if (e instanceof ApiError && e.status === 409) {
-            setBatchStatus("已有批量任务在跑，领奖中止。");
-            return;
-          }
-          failNotes.push(`${a.nickname || a.uid}：快照刷新失败`);
-          continue;
-        }
-        if (!fresh) {
-          failNotes.push(`${a.nickname || a.uid}：快照刷新失败`);
-          continue;
-        }
-        a = fresh;
+        const rr = await refreshForReselect(a, failNotes, { conflictMsg: "已有批量任务在跑，领奖中止。" });
+        if (rr.conflict) return;
+        if (rr.skipped) continue;
+        a = rr.account;
         // 刷新后重读并集（renderAll 可能把锁定项剔除）；并集空了 = 无可领项，不退回全部
         const union2 = pickedUnion();
         pick = union2.size ? union2 : null;
@@ -4804,7 +5237,11 @@ function renderScheduler() {
   setVal($("#hoursBuddy"), (hours.buddy ?? []).join(","));
   setVal($("#hoursTravel"), (hours.travel ?? []).join(","));
   setChecked($("#defClaim"), settings.claim);
-  setVal($("#gapMs"), settings.gapMs);
+  // gapMs = 上游调用间距（风控红线：任意两次上游调用 ≥1s）。回填与后端 upstreamGapMs()
+  // 逐字同口径：max(MIN_UPSTREAM_GAP_MS, Number(gapMs) || MIN_UPSTREAM_GAP_MS) —— 两个兜底
+  // 都是 MIN_UPSTREAM_GAP_MS(1000)，**不是** daemon 的 DEFAULT_SETTINGS.gapMs(1500)。
+  // 老 settings.json 里存的 500 会被抬到 1000，缺失/非法也显示 1000，与后端生效值一致。
+  setVal($("#gapMs"), Math.max(MIN_UPSTREAM_GAP_MS, Number(settings.gapMs) || MIN_UPSTREAM_GAP_MS));
   // 顶部任务腿跟 settings.legs 同步（唯一选择源；不再有独立的默认腿控件）
   syncLegChecks(settings.legs);
 
@@ -5166,16 +5603,17 @@ function handleSSE(evt) {
   if (evt.kind === "step" && evt.step) {
     const j = state.data?.job;
     if (j) {
-      j.steps = [...(j.steps ?? []), evt.step];
-      renderJob();
+      (j.steps ??= []).push(evt.step); // 追加，不整数组重建
+      // 表已存在 → 只 append 这一行；否则（首条步骤）交给合并调度的整段重绘
+      if (!appendStepRow(evt.step)) scheduleRender("job");
     }
     return;
   }
   if (evt.kind === "log") {
     const j = state.data?.job;
     if (j) {
-      j.log = [...(j.log ?? []), String(evt.line ?? "")];
-      renderJobLogs();
+      (j.log ??= []).push(String(evt.line ?? "")); // 追加，不整数组重建
+      scheduleRender("log"); // rAF 合并同帧多次日志更新，renderJobLogs 只增量 append
     }
     return;
   }

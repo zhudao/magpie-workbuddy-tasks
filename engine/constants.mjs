@@ -41,6 +41,13 @@ export const REFRESH_SOURCE_CN = "workbuddy";
 // ---- 防风控节奏（铁律 4）----------------------------------------------------
 // 任何两次上游调用之间的最小间隔（毫秒）；wb_tasks 的 gap=1.0（秒）。
 export const DEFAULT_GAP_MS = 1000;
+// 同一数值的「红线下限」语义（与 DEFAULT_GAP_MS 同值，但二者含义不同，刻意
+// 分开命名）：DEFAULT_GAP_MS 是「没配置时的默认值」，MIN_UPSTREAM_GAP_MS 是
+// 「配置了也不许低于的硬下限」—— 任意两次上游调用之间的实际间隔（铁律 4
+// 红线）永远 ≥ 此值，用户旋钮（settings.gapMs）只能把节奏调得更保守。daemon
+// 侧读 settings.gapMs 交给 spacer/engineOpts/runnerCtx 的路径一律经
+// upstreamGapMs()（daemon.mjs）收敛到这里；/api/settings 的写入下限与之对齐。
+export const MIN_UPSTREAM_GAP_MS = 1000;
 // 上报后等上游落账的固定间隔（wb_tasks._progress_one 的 time.sleep(1.5)）。
 export const REPORT_SETTLE_MS = 1500;
 // 进度在涨时的再等间隔（time.sleep(2.5)）。
