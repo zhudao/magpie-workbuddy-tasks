@@ -52,7 +52,7 @@
           <h2 class="wb-label" id="wbDashTitle">看板</h2>
           <p class="wb-hint">账号列表、任务进度、批量操作、实时步骤、排程与历史都在独立看板里。</p>
         </div>
-        <span class="wb-dash-note">地址按当前访问 magpie 的主机自动推导，可用插件选项 <code>dashboardUrl</code> 覆盖</span>
+        <span class="wb-dash-note">地址按当前访问 magpie 的主机自动推导；端口默认 <code>4390</code>，可用插件选项 <code>port</code> 固定，也可用 <code>dashboardUrl</code> 覆盖整条地址</span>
       </div>
 
       <div class="wb-url-row">
@@ -69,6 +69,11 @@
         <p class="wb-hint" id="tunnelHint" hidden>
           SSH 隧道映射后仍可用 <code id="tunnelUrl">127.0.0.1:4390</code> 打开看板，无需改
           <code>dashboardUrl</code>。
+        </p>
+        <p class="wb-hint" id="portHint">
+          端口来自插件选项 <code>port</code>；守护进程端口被占用时会自动顺延（最多 +9，再不行用随机端口），
+          此时卡片上的端口可能与实际不同 —— 以 <code>&lt;state&gt;/daemon.json</code> 里的 <code>port</code>
+          或 magpie 日志中「看板地址：…」那行为准；想固定就把实际端口填进插件选项 <code>port</code>。
         </p>
       </div>
     </section>
@@ -102,7 +107,8 @@
             建隧道：<code>ssh -L &lt;port&gt;:&lt;容器IP&gt;:&lt;port&gt; &lt;user&gt;@&lt;NAS地址&gt;</code>，
             映射后仍可用 <code>http://127.0.0.1:&lt;port&gt;/</code> 打开。实际端口与绑定 host 由守护进程写在
             <code>state/daemon.json</code>；看板页面不再显示访问地址，需要时直接看该文件里的
-            <code>host</code> 与 <code>port</code>。
+            <code>host</code> 与 <code>port</code>。端口也可用插件选项 <code>port</code>
+            （默认 <code>4390</code>）固定，地址用 <code>dashboardUrl</code> 覆盖。
           </p>
         </div>
       </details>
@@ -141,7 +147,7 @@
     </section>
 
     <footer class="wb-foot">
-      <span class="wb-mono" id="wbVersion">v0.3.7</span>
+      <span class="wb-mono" id="wbVersion">v0.3.8</span>
       <span>纯本地守护进程 · 数据不出本机 · token 永不出现在页面</span>
     </footer>
   </main>

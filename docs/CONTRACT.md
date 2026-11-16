@@ -341,6 +341,13 @@ enterpriseId 都不给）。两个计数按 provider 分域、各自独立：国
 包括写入凭据与下载 token；README 安全段如实写明风险与建议；真实绑定 host 由 daemon 心跳写进
 `daemon.json` 的 `host`，三处日志/提示同口径）。
 
+配置端口来源：`options.port`（插件选项，经 `lifecycle.normalizePort` 归一，1–65535，
+非法/留空 = 默认）→ `--port`/`WB_DAEMON_PORT` → 默认 `4390`；被占用顺延（+1..+9，再不行
+随机端口）。**实际绑定端口可能因顺延与配置值不同**（`state.port` 已说明）；顺延结果不回灌
+成偏好 —— `daemon.json` 里的 `port` 只是上次实际绑定的观察值，不是取值链的一环，下次启动
+的期望端口仍按上面的来源链算（issue #5 回归口径）；实际绑定端口以 `daemon.json`（心跳写回）
+与启动日志为唯一真相。
+
 ```
 GET  /api/hello                 -> {name, version, pid, ready}
                                     // pid = 应答进程的 process.pid（2026-11 起）：探测方
@@ -579,7 +586,7 @@ SSE 事件是看板实时进度的唯一来源；断线时看板回退到 `GET /
 
 - `index.mjs` 被宿主加载时（= 插件已启用且 magpie 用到了它）：
   1. 读 `state/control.json` 的 `desired`（`'on'|'off'`）；
-  2. `desired!=='off'` → `ensureDaemon()`：探测端口健康 → 不健康才 spawn `Bun.spawn([bunPath,'daemon.mjs'], {detach:true, stdio:'ignore'})`，env 传 `WB_CONFIG_DIR`、`WB_DAEMON_KEY`、`WB_DAEMON_PORT`；
+  2. `desired!=='off'` → `ensureDaemon()`（0.3.8 起，issue #5）：期望端口 = 显式传入的 `port`（插件选项 `options.port` 经 `normalizePort` 归一，非法/未传 = 默认 4390）——**绝不取自 daemon.json**（它的 `port` 是上次实际绑定的观察值/复用探测线索，不是偏好，顺延结果不回灌）。先探测 `daemon.json` 记的守护进程是否健康（`pidAlive` + `probeDaemon`）：健康则复用并返回（实际端口 ≠ 期望端口时打一行日志说清，绝不重启它）；不健康才 spawn `Bun.spawn([bunPath,'daemon.mjs'], {detach:true, stdio:'ignore'})`，env 传 `WB_CONFIG_DIR`、`WB_DAEMON_KEY`、`WB_DAEMON_PORT`（= 期望端口，顺延由 daemon 侧自行处理）；
   3. 注册 `process.on('exit'|'SIGINT'|'SIGTERM')` → 若我们是 owner 则 `POST /api/shutdown` 通知 daemon 退出。
 - `daemon.mjs` 自持生命周期，不依赖宿主存活假设：
   1. 每 10 s 读 magpie `plugins.json`：本插件条目 `off:true` → 优雅退出；

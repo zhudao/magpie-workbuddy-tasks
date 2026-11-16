@@ -6,9 +6,11 @@
 //   - control.json（唯一意图来源：desired = 'on' | 'off'）的读写
 //   - daemon.json（pid/port/key/version/startedAt，权限 0600）的读写
 //     （key 字段向后兼容保留：老版本看板/探测逻辑会读；免密钥口径下它不是
-//      访问凭据，daemon 的任何接口都不校验它）
+//      访问凭据，daemon 的任何接口都不校验它。port 是**观察值**——daemon
+//      实际绑定的端口，给复用探测当线索，绝不回灌成下次启动的偏好，issue #5）
 //   - 探测守护进程健康（GET /api/hello）
-//   - ensureDaemon()：健康则复用，不健康才 spawn（detached + stdio ignore + unref）
+//   - ensureDaemon()：健康则复用，不健康才 spawn（detached + stdio ignore + unref）；
+//     期望端口只来自调用方显式传入的 port（normalizePort 归一），绝不取自 daemon.json
 //   - shutdownDaemon()：POST /api/shutdown 通知退出
 //   - registerExitHooks()：宿主退出/信号时收尾
 
@@ -22,6 +24,31 @@ import { fileURLToPath } from "node:url"
 export const PLUGIN_NAME = "workbuddy-tasks"
 export const DEFAULT_PORT = 4390
 const SPAWN_BUDGET_MS = 8000
+
+// normalizePort(v) -> 1–65535 的整数端口 | null（导出：index.mjs 与本文件共用同一套
+// 边界，避免两处各写一份口径漂移）。取舍：
+//   - 只认 number 与纯数字 string（trim 后必须 /^\d+$/）——magpie 的插件 options
+//     里用户可能填 "4390" 或 4390，两种都收；"4390abc"/"4390.5"/"abc" 一律 null
+//     （宁可忽略回默认端口，也不猜用户想填什么）；
+//   - 0 / 负数 / >65535 / 非有限数（NaN/Infinity）→ null（0 留给「系统挑端口」的
+//     daemon --port 0 语义，插件选项不开放它）；
+//   - 布尔/null/undefined/对象 → null；空串与纯空白 → null（= 未配置）。
+//   - 前导零的纯数字串（"04390"）按十进制数值收（= 4390）：options 不是 HTTP 头，
+//     不需要 sanitizeServeHost 那套防前导零歧义的白名单。
+export function normalizePort(v) {
+  let s
+  if (typeof v === "number") {
+    if (!Number.isFinite(v)) return null
+    s = String(v)
+  } else if (typeof v === "string") {
+    s = v.trim()
+  } else {
+    return null
+  }
+  if (!s || !/^\d+$/.test(s)) return null
+  const n = Number(s)
+  return n >= 1 && n <= 65535 ? n : null
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -225,11 +252,21 @@ export function interpreter() {
 
 // ---- ensureDaemon：健康则复用，不健康才拉起 -----------------------------
 //
+// 端口口径（issue #5 回归修复，2026-11）：期望端口**只**来自调用方显式传入的
+// port（number|string，index.mjs 里源头是插件选项 options.port）——归一失败或
+// 未传 = 默认 4390。daemon.json 里的 port 是**观察值**（上一次实际绑定的端口，
+// 端口被占用顺延后可能 ≠ 4390）+ 复用探测的线索，**绝不当作偏好继承**：旧版
+// `prev?.port || DEFAULT_PORT` 会把历史上任何一次顺延（+1..+9 或随机端口）永久
+// 记住，4390 空出来了也回不去（生产症状：daemon.json 停在 8761，重启后仍是
+// 8761，插件入口卡按 4390 推导永远打不开）。prev 只有两个用途：
+//   ① key 沿用（复用同一份 daemon.json 的 key 字段，向后兼容形状不变）；
+//   ② 若它指向的守护进程健康（pidAlive + probeDaemon）→ 复用并返回，绝不重启。
+//
 // 返回 { info, spawned, error?, off? }：
 //   off      —— control.json.desired === 'off'，宿主不该拉起
 //   spawned  —— 本次是否由我们 spawn（exit 钩子据此决定要不要叫它退场）
 //   info     —— 就绪守护进程的 {pid,port,key,...}；没就绪时为 null
-export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs = SPAWN_BUDGET_MS, addr = "" } = {}) {
+export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs = SPAWN_BUDGET_MS, addr = "", port = "" } = {}) {
   if (!cfgDir) {
     return { info: null, spawned: false, error: "无法定位 magpie 配置目录（可设 MAGPIE_CONFIG_DIR 环境变量）" }
   }
@@ -242,11 +279,22 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
     return { info: null, spawned: false, off: true }
   }
 
-  // 已有一个健康的？直接复用（拒绝重复拉起是 daemon 自己也会把守的另一道门）
+  const wantPort = normalizePort(port) ?? DEFAULT_PORT
+
+  // 已有一个健康的？直接复用（拒绝重复拉起是 daemon 自己也会把守的另一道门）。
+  // prev.port 只用来探活；它 ≠ wantPort 时说明留的是旧顺延结果 —— 如实说清，
+  // 本进程照常复用（绝不重启健康进程），下次它退场后新进程才会绑回 wantPort。
   const prev = readDaemonInfo(stateDir)
   if (prev && pidAlive(prev.pid)) {
     const hello = await probeDaemon(prev.port, prev.key).catch(() => null)
-    if (hello) return { info: prev, spawned: false }
+    if (hello) {
+      if (prev.port !== wantPort) {
+        log(
+          `已有守护进程在 ${prev.port}（期望 ${wantPort}）：本次复用 ${prev.port}，看板地址用 ${prev.port}；重启后会回到 ${wantPort}`,
+        )
+      }
+      return { info: prev, spawned: false }
+    }
   }
 
   const daemonPath = join(pluginDir, "daemon.mjs")
@@ -255,13 +303,12 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
   }
 
   const key = prev?.key || daemonKey()
-  const port = prev?.port || DEFAULT_PORT
   const env = {
     ...process.env,
     WB_CONFIG_DIR: cfgDir,
     WB_STATE_DIR: stateDir,
     WB_DAEMON_KEY: key,
-    WB_DAEMON_PORT: String(port),
+    WB_DAEMON_PORT: String(wantPort),
     ...(addr ? { WB_DAEMON_ADDR: String(addr) } : {}),
     WB_MANAGED: "1", // 由 magpie 宿主拉起：plugins.json 里条目消失时允许自杀
   }

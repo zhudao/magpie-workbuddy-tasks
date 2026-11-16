@@ -28,6 +28,7 @@ import {
   daemonKey,
   ensureDaemon,
   interpreter,
+  normalizePort,
   pidAlive,
   probeDaemon,
   readControl,
@@ -39,7 +40,7 @@ import {
   writeControl,
 } from "./lifecycle.mjs"
 
-const VERSION = "0.3.7"
+const VERSION = "0.3.8"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）
@@ -260,11 +261,22 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
   const dashboardUrl = typeof options?.dashboardUrl === "string" ? options.dashboardUrl : ""
   // Docker 里容器内回环外部不可达：options.listenAddress 可写 "0.0.0.0"（只到容器网桥）
   const listenAddress = typeof options?.listenAddress === "string" ? options.listenAddress.trim() : ""
+  // 期望端口（issue #5 的「能指定端口」入口）：options.port 收 number|string，
+  // 空/未配置 = 默认 4390（被占用顺延）；非法值不猜、记一行日志后按默认处理。
+  // 这是端口偏好的**唯一**来源 —— daemon.json 里的 port 是观察值，绝不回灌。
+  const portOpt = normalizePort(options?.port)
+  if (portOpt == null && options?.port != null && String(options.port).trim() !== "") {
+    log(`插件选项 port 不是 1–65535 的端口，已忽略：${String(options.port).slice(0, 50)}`)
+  }
+  const wantPort = portOpt ?? DEFAULT_PORT
 
   // 拉起守护进程（不阻塞插件加载太久：ensureDaemon 自带 8s 预算，失败也不炸）
   // A：就绪日志打印真实绑定地址（daemon.json 的 host，由 daemon 心跳写入），
   // 绑定 0.0.0.0/:: 时补一句与 daemon 启动日志 / reachableHint 相同口径的提示。
-  const boot = ensureDaemon({ cfgDir, pluginDir: dir, log, addr: listenAddress })
+  // issue #5：实际端口 ≠ 期望端口（被占用顺延 / 复用了别端口上的旧进程）时补
+  // 一行差异说明 —— 入口卡默认按「访问 magpie 的主机 + 端口」推导，顺延后打
+  // 不开时把实际端口填进插件选项 port（或用 dashboardUrl 给完整地址）即可对齐。
+  const boot = ensureDaemon({ cfgDir, pluginDir: dir, log, addr: listenAddress, port: portOpt })
     .then((r) => {
       if (r?.error) log("守护进程：" + r.error)
       else if (r?.info) {
@@ -272,6 +284,14 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
         log(`守护进程就绪：${bindHost}:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
         const hint = bindHint(bindHost)
         if (hint) log(`监听 ${bindHost}:${r.info.port}：${hint}`)
+        if (r.info.port !== wantPort) {
+          const why = r.spawned ? "期望端口被占用已顺延" : "复用了已有守护进程"
+          log(
+            `实际端口 ${r.info.port} ≠ 期望端口 ${wantPort}（${why}）：` +
+              `想固定端口就在插件选项 port 里填 ${r.info.port}（或用 dashboardUrl 填完整地址）；` +
+              `想回到 ${wantPort} 就先停掉占用 ${wantPort} 的进程/旧守护进程再重启插件`,
+          )
+        }
       }
       return r
     })
@@ -286,8 +306,8 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
   const client = makeDaemonClient(async () => {
     const r = await boot
     if (r?.info) return r.info
-    // 第一次没起来，给一次快速重试的机会
-    const retry = await ensureDaemon({ cfgDir, pluginDir: dir, log, budgetMs: 3000, addr: listenAddress }).catch(() => null)
+    // 第一次没起来，给一次快速重试的机会（port 口径与首次 boot 完全一致）
+    const retry = await ensureDaemon({ cfgDir, pluginDir: dir, log, budgetMs: 3000, addr: listenAddress, port: portOpt }).catch(() => null)
     if (retry?.info) return retry.info
     return null
   })
@@ -573,5 +593,6 @@ export const _internal = {
   makeDaemonClient,
   hereDir,
   bindHint,
+  normalizePort, // 与 lifecycle.mjs 共用的端口归一（透传引用，单一实现）
   _sleepUntil: sleepUntil,
 }

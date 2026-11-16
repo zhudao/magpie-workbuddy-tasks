@@ -28,8 +28,11 @@
 //
 // 注：进程内 startDaemon 无法确定性构造「自探」——bind 前无法预知自己绑到的端口，
 // daemon.json 又必须写在 bind 之前；只有「指定端口 + 子进程」才能让 daemon.json 的
-// port 与子进程实际 bind 的端口严格一致（WB_DAEMON_PORT 由 ensureDaemon 从陈旧
-// daemon.json 的 prev.port 传下去，正是生产链路本身）。
+// port 与子进程实际 bind 的端口严格一致。0.3.8 起（issue #5 回归修复）ensureDaemon
+// **不再从陈旧 daemon.json 继承端口**（daemon.json 的 port 是观察值/复用线索，不是
+// 偏好，顺延结果不回灌），所以本用例**显式传 port**（= 陈旧条目记的同一个端口）
+// 给 ensureDaemon、由它经 WB_DAEMON_PORT 传给子进程：既保住「自探」形状的确定性
+// （用例原始目的：僵尸/残留 pid 不再让新进程自锁），又顺带钉住「显式端口生效」。
 
 import { test, describe, after } from "node:test"
 import assert from "node:assert/strict"
@@ -106,17 +109,19 @@ describe("生产死局回归：陈旧 daemon.json（pid 活着但不是守护进
       JSON.stringify({ pid: process.pid, port, key: KEY, version: "x", startedAt: new Date().toISOString(), host: "127.0.0.1" }),
     )
     // 生产同款通道（plugins.json off→on 后宿主走的 ensureDaemon）：正常启动，
-    // skipExistingCheck 不设（= false，bind 前的门也开着，正是生产参数）
+    // skipExistingCheck 不设（= false，bind 前的门也开着，正是生产参数）。
+    // port 显式传入（0.3.8 起端口不从 daemon.json 继承，见文件顶部注释）
     const logs = []
-    const r = await ensureDaemon({ cfgDir, pluginDir: PLUGIN_ROOT, log: (...a) => logs.push(a.join(" ")), budgetMs: 20000 })
+    const r = await ensureDaemon({ cfgDir, pluginDir: PLUGIN_ROOT, log: (...a) => logs.push(a.join(" ")), budgetMs: 20000, port })
     try {
       // 修复前这里 error = 「守护进程未能在时限内就绪…」（子进程自探命中自己后
       // 以 WB_DAEMON_ALREADY_RUNNING 退场）—— 生产死局的直接复现
       assert.equal(r.error, undefined, `ensureDaemon 不应报错：${r.error ?? ""}`)
       assert.equal(r.spawned, true)
       assert.ok(r.info, "应返回就绪守护进程的信息")
-      // 守护进程起来并就绪（/api/hello 可达），且它绑的就是陈旧条目记的那个端口
-      assert.equal(r.info.port, port, "新守护进程应绑上陈旧 daemon.json 记的端口（自探形状的前提）")
+      // 守护进程起来并就绪（/api/hello 可达），且绑的就是显式传入的端口
+      //（= 陈旧条目记的端口，自探形状的前提）
+      assert.equal(r.info.port, port, "新守护进程应绑上显式传入的 port（而非从陈旧条目继承或另行顺延）")
       const hello = await fetch(`http://127.0.0.1:${r.info.port}/api/hello`)
       assert.equal(hello.status, 200)
       const body = await hello.json()

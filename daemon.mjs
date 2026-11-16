@@ -13,6 +13,8 @@
 //   WB_DAEMON_KEY   仅作为 daemon.json 的 key 字段写入（向后兼容保留，不是访问凭据，
 //                   任何接口都不校验它）；缺省时随机生成
 //   WB_DAEMON_PORT  期望端口；缺省 4390，被占用则向后找，再不行用随机端口
+//                   （由 lifecycle.ensureDaemon 从插件选项 options.port 传入；
+//                   daemon.json 里的 port 是实际绑定的观察值，不参与下次取值）
 //   WB_DAEMON_ADDR  监听地址；缺省 127.0.0.1（Docker 内可设 0.0.0.0，只到容器网桥）
 //   WB_MANAGED      =1 表示由 magpie 宿主拉起（plugins.json 条目消失时允许自杀）
 //   MAGPIE_ADDR     magpie 网关地址（host:port），如 127.0.0.1:3499
@@ -77,9 +79,9 @@ import { beijingDateKey, beijingHour, DEFAULT_GAP_MS, MIN_UPSTREAM_GAP_MS } from
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.7")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.8")
   } catch {
-    return "0.3.7"
+    return "0.3.8"
   }
 })()
 
@@ -660,7 +662,10 @@ export async function startDaemon(opts = {}) {
   const dashDir = join(PLUGIN_DIR, "dashboard")
 
   // 端口优先级：opts.port（测试注入）> --port > WB_DAEMON_PORT > 默认 4390；
-  // 0 = 让操作系统挑一个空闲端口
+  // 0 = 让操作系统挑一个空闲端口。daemon.json 里的 port **不在取值链上** ——
+  // 它是上次实际绑定的观察值（issue #5：顺延结果不回灌成偏好），本次的真实
+  // 绑定端口以 bind() 结果为准并经心跳写回 daemon.json（唯一真相）。
+  // 宿主链路：插件选项 options.port → ensureDaemon 的 WB_DAEMON_PORT → 这里。
   const wantPort = Number.isFinite(opts.port)
     ? opts.port
     : args.port !== undefined
@@ -3469,6 +3474,12 @@ export async function startDaemon(opts = {}) {
   }
 
   log(`守护进程就绪：http://${host}:${port}（state: ${stateDir}）`)
+  // issue #5：期望 vs 实际不一致（占用顺延）必须一眼可见 —— 看板/入口卡地址跟
+  // 实际端口走，别让用户拿着配置值对不上。wantPort=0（系统挑端口）没有「期望」
+  // 可言，不打这条。
+  if (wantPort > 0 && port !== wantPort) {
+    log(`期望端口 ${wantPort} 被占用，实际绑定 ${port}；看板地址用 ${port}（state/daemon.json 的 port 是唯一真相）`)
+  }
   // A：绑定为通配地址时必须给出明确提示（与 index.mjs / reachableHint 同一句口径）
   const bindWarn = bindHint(host)
   if (bindWarn) log(`监听 ${host}:${port}：${bindWarn}`)
