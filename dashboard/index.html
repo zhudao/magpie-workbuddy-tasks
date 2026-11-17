@@ -6,7 +6,7 @@
   <meta name="robots" content="noindex">
   <!-- 静态文件版本：必须与 package.json 的 version 一致（后端测试比对四处：
        package.json / index.mjs 的 VERSION / page 页脚 / 这个 meta）。app.js 读它做版本一致性检查。 -->
-  <meta name="wb-version" content="0.3.8">
+  <meta name="wb-version" content="0.3.9">
   <title>WorkBuddy 任务 · 看板</title>
   <link rel="icon" href="logo-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
@@ -365,6 +365,27 @@
         <div class="credits-metrics" id="creditsMetrics" hidden></div>
 
         <div class="credits-usage" id="creditsUsage" hidden></div>
+
+        <!-- 用量明细（GET /api/usage）：独立于权益包明细的只读区块。成本纪律——
+             只有用户点「查询/刷新用量」或切换窗口才打上游（每次 1–2 次分页调用），
+             绝不在 3 秒重绘里轮询。上游行里的 prompt 原文后端已丢弃，这里只显示
+             日期 / 模型 / 积分 / 请求数四项聚合。 -->
+        <section class="credits-usage-detail" id="creditsUsageDetail" aria-labelledby="creditsUsageDetailTitle">
+          <div class="usage-detail-head">
+            <h3 class="usage-detail-title" id="creditsUsageDetailTitle">用量明细</h3>
+            <div class="usage-detail-tools">
+              <div class="usage-days-tabs" role="group" aria-label="用量统计窗口">
+                <button type="button" class="credits-filter is-active" data-usage-days="7" aria-pressed="true">近 7 天</button>
+                <button type="button" class="credits-filter" data-usage-days="30" aria-pressed="false">近 30 天</button>
+                <button type="button" class="credits-filter" data-usage-days="90" aria-pressed="false">近 90 天</button>
+              </div>
+              <button type="button" class="ghost-btn" id="usageRefreshBtn">查询用量</button>
+            </div>
+          </div>
+          <p class="usage-detail-note" id="usageDetailNote" hidden></p>
+          <p class="credits-status usage-detail-status" id="usageDetailStatus" role="status" aria-live="polite" hidden></p>
+          <div class="usage-detail-body" id="usageDetailBody" hidden></div>
+        </section>
 
         <div class="credits-filters" id="creditsFilters" hidden>
           <div class="credits-filter-row">

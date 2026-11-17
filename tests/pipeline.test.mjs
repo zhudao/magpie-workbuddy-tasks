@@ -396,3 +396,207 @@ test("流水线：web 清单 locked:true 的任务整条跳过（不接取/不�
   const unlockedTask = unlockedBackend.state.tasks[0];
   assert.equal(unlockedTask.accept_status, "claimed", "解锁后接取→点亮→领奖全链路照常");
 });
+
+// ---- 只领奖兜底（0.3.9，progressTask.claimOnly）--------------------------------
+// 未收录（source:"none"）与 unforgeable 任务在领奖之前就 early-return；用户手动
+// 完成、上游显示 completed 时必须只领奖（绝不 accept/report，不伪造进度）。
+
+test("流水线：只领奖兜底 —— 未收录任务上游已完成 → 恰好一次 claim、零 accept/零 report", async () => {
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [task("brand_new_task", {
+      title: "上游新任务码", jump_url: "workbuddy://future-thing",
+      status: "completed", current: 1, target: 1, reward: 50,
+    })],
+    litRules: {},
+  });
+  const logs = [];
+  const result = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl,
+    log: (l) => typeof l === "string" && logs.push(l),
+  });
+  assert.equal(result.ok, true, logs.join("\n"));
+  assert.equal(result.earnedCredit, 50, "记账走领奖回执");
+  assert.equal(result.claimed, 1);
+  const claimCalls = backend.calls.filter((c) => c.path.endsWith("/claim"));
+  assert.equal(claimCalls.length, 1, "claimTask 恰好被调 1 次");
+  assert.equal(claimCalls[0].path, "/activity/growth/tasks/brand_new_task/claim");
+  assert.equal(
+    backend.calls.some((c) => c.path === "/v2/activity/growth/tasks/accept"), false,
+    "兜底绝不接取",
+  );
+  assert.equal(backend.state.reports.length, 0, "兜底绝不上报");
+  assert.ok(logs.join("\n").includes("未收录，但上游已显示完成 → 只领奖: +50 积分"), logs.join("\n"));
+});
+
+test("流水线：只领奖兜底 —— unforgeable（公众号）上游已完成 → 恰好一次 claim、零 accept/零 report", async () => {
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [task("wb_wechat_oa_subscribe_task", {
+      title: "关注官方公众号", jump_url: "https://www.workbuddy.cn/events/follow-guide/",
+      status: "completed", current: 1, target: 1, reward: 100,
+    })],
+    litRules: {},
+  });
+  const logs = [];
+  const result = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl,
+    log: (l) => typeof l === "string" && logs.push(l),
+  });
+  assert.equal(result.ok, true, logs.join("\n"));
+  assert.equal(result.earnedCredit, 100);
+  assert.equal(result.claimed, 1);
+  const claimCalls = backend.calls.filter((c) => c.path.endsWith("/claim"));
+  assert.equal(claimCalls.length, 1, "claimTask 恰好被调 1 次");
+  assert.equal(backend.calls.some((c) => c.path === "/v2/activity/growth/tasks/accept"), false);
+  assert.equal(backend.state.reports.length, 0);
+  assert.ok(logs.join("\n").includes("需真实操作完成，但上游已显示完成 → 只领奖: +100 积分"), logs.join("\n"));
+});
+
+test("流水线：只领奖兜底 —— 未收录但未完成 → 仍跳过、不发 claim", async () => {
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [task("brand_new_task", {
+      title: "brand_new_task", jump_url: "workbuddy://future-thing",
+      status: "not_accepted", current: 0, target: 1,
+    })],
+    litRules: {},
+  });
+  const logs = [];
+  const result = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl,
+    log: (l) => typeof l === "string" && logs.push(l),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.earnedCredit, 0);
+  assert.equal(backend.calls.filter((c) => c.path.endsWith("/claim")).length, 0, "没完成不发 claim");
+  assert.equal(backend.calls.some((c) => c.path === "/v2/activity/growth/tasks/accept"), false, "未收录绝不接取");
+  assert.equal(backend.state.reports.length, 0, "未收录绝不上报");
+  assert.ok(logs.join("\n").includes("跳过接取/上报/领奖"), "没完成仍按原样记「跳过」");
+});
+
+test("流水线：只领奖兜底 —— claim=false + completed → 零领奖/零接取/零上报，只记等待手动领取", async () => {
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [task("brand_new_task", {
+      title: "上游新任务码", jump_url: "workbuddy://future-thing",
+      status: "completed", current: 1, target: 1, reward: 50,
+    })],
+    litRules: {},
+  });
+  const logs = [];
+  const result = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl,
+    log: (l) => typeof l === "string" && logs.push(l),
+    claim: false, mpTasks: false, travel: false,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.earnedCredit, 0);
+  assert.equal(backend.calls.filter((c) => c.path.endsWith("/claim")).length, 0, "claim=false 零领奖请求");
+  assert.equal(backend.calls.some((c) => c.path === "/v2/activity/growth/tasks/accept"), false);
+  assert.equal(backend.state.reports.length, 0);
+  assert.ok(logs.join("\n").includes("已达成，等待手动领取"), logs.join("\n"));
+});
+
+test("流水线：只领奖兜底 —— claim 失败 → 不抛错、记 reason、earned 不变", async () => {
+  // 上游显示 completed 但进度未落账（current 0/5）→ 假后端领奖回 400
+  // "task not completed"（claimTask 会先试 chat 再试 web，都失败）
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [task("brand_new_task", {
+      title: "上游新任务码", jump_url: "workbuddy://future-thing",
+      status: "completed", current: 0, target: 5, reward: 50,
+    })],
+    litRules: {},
+  });
+  const logs = [];
+  const result = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl,
+    log: (l) => typeof l === "string" && logs.push(l),
+    mpTasks: false, travel: false,
+  });
+  assert.equal(result.ok, true, "领奖失败不判整轮失败、不抛错");
+  assert.equal(result.earnedCredit, 0, "earned 不变");
+  assert.equal(backend.state.claims.length, 0);
+  assert.equal(backend.calls.some((c) => c.path === "/v2/activity/growth/tasks/accept"), false);
+  assert.equal(backend.state.reports.length, 0);
+  assert.ok(logs.join("\n").includes("只领奖失败: task not completed"), logs.join("\n"));
+});
+
+test("流水线：只领奖兜底 —— claim 撞 restricted → 透传（runner 仍能冻结）", async () => {
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({
+    clock,
+    tasks: [task("brand_new_task", {
+      title: "上游新任务码", jump_url: "workbuddy://future-thing",
+      status: "completed", current: 1, target: 1, reward: 50,
+    })],
+    litRules: {},
+  });
+  // 只对 claim 端点回 403/11140（清单正常），风控不能被兜底吞掉
+  const inner = backend.fetchImpl;
+  const fetchImpl = async (url, init = {}) => {
+    const s = String(url);
+    if (s.includes("/claim")) {
+      // 手动记一笔（绕过了 wbBackend 的 fetchImpl，其 calls 台账不会自动记录）
+      const u = new URL(s);
+      backend.calls.push({
+        url: s, host: u.host, path: u.pathname,
+        method: String(init.method || "GET").toUpperCase(),
+        headers: init.headers ?? {}, body: null, at: clock.now(), uid: "",
+      });
+      return { status: 403, text: async () => JSON.stringify({ code: 11140, msg: "request illegal" }) };
+    }
+    return inner(url, init);
+  };
+  const logs = [];
+  const result = await runGrowthTasks(makeAcct(), {
+    now: clock.now, sleep: clock.sleep, fetch: fetchImpl,
+    log: (l) => typeof l === "string" && logs.push(l),
+    mpTasks: false, travel: false,
+  });
+  assert.equal(result.ok, false, "restricted 透传 → 整轮失败收场（runner 据此冻结）");
+  assert.equal(result.restricted, true);
+  assert.equal(result.earnedCredit, 0);
+  assert.equal(backend.state.reports.length, 0, "兜底绝不上报");
+  assert.equal(backend.calls.some((c) => c.path === "/v2/activity/growth/tasks/accept"), false, "兜底绝不接取");
+  assert.ok(backend.calls.some((c) => c.path.endsWith("/claim")), "确实尝试过只领奖");
+});
+
+test("流水线：只领奖兜底 —— mp 码 completed → 不在兜底里发 claim（交给小程序链路）", async () => {
+  // 防御口径与既有 mp 分支用例同源：web 清单串台出现 MP-only 任务时，progressTask
+  // 必须原样交给 runGrowthTasks 2b 的小程序链路 —— 即使上游显示 completed，
+  // web 侧也绝不代领（小程序头族链路自己会领）。
+  const clock = fakeClock(localTime(2026, 9, 15, 10, 0));
+  const backend = wbBackend({ clock, tasks: [], litRules: {} });
+  const logs = [];
+  const r = await progressTask(
+    makeAcct(),
+    {
+      code: "Sequential_Tasks_1",
+      title: "完成 1 次对话",
+      acceptStatus: "completed",
+      taskType: "single",
+      progress: { current: 1, target: 1 },
+      rewardCredit: 100,
+      rewardEnergy: 0,
+      jumpUrl: "",
+    },
+    logs,
+    { now: clock.now, sleep: clock.sleep, fetch: backend.fetchImpl },
+  );
+  assert.deepEqual(r, { credit: 0, energy: 0, lit: 0, claimed: 0 });
+  assert.ok(logs.join("\n").includes("小程序任务由小程序链路处理"), logs.join("\n"));
+  assert.equal(backend.state.reports.length, 0, "零事件上报");
+  assert.equal(backend.calls.filter((c) => c.path.endsWith("/claim")).length, 0, "零领奖（交给小程序链路）");
+  assert.equal(
+    backend.calls.filter((c) => c.path !== "/v2/activity/growth/tasks").length,
+    0,
+    "除清单外零上游调用（无 report/claim/accept）",
+  );
+});

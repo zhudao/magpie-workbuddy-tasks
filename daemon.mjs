@@ -79,9 +79,9 @@ import { beijingDateKey, beijingHour, DEFAULT_GAP_MS, MIN_UPSTREAM_GAP_MS } from
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.8")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.3.9")
   } catch {
-    return "0.3.8"
+    return "0.3.9"
   }
 })()
 
@@ -245,6 +245,7 @@ const API_ROUTE_AUTH = [
   { method: "GET", re: /^\/api\/state$/, path: "/api/state", note: "看板状态快照" },
   { method: "GET", re: /^\/api\/history$/, path: "/api/history", note: "历史记录" },
   { method: "GET", re: /^\/api\/credits$/, path: "/api/credits", note: "积分余额与套餐权益包明细（?uid=，?refresh=1 强制拉取）" },
+  { method: "GET", re: /^\/api\/usage$/, path: "/api/usage", note: "积分用量明细（?uid=&days=1-90 缺省 7，?refresh=1 强制拉取；只读，绝不回显 prompt）" },
   { method: "GET", re: /^\/api\/streak$/, path: "/api/streak", note: "连登状态查询（?uid=，?refresh=1 强制拉取）" },
   { method: "GET", re: /^\/api\/campaign$/, path: "/api/campaign", note: "运营活动任务状态查询（?uid=，?refresh=1 强制拉取，§11.1）" },
   { method: "GET", re: /^\/api\/jobs\/[A-Za-z0-9_-]+$/, path: "/api/jobs/job-1", note: "job 查询" },
@@ -598,7 +599,7 @@ export function computeServeUrl({ hostHeader, publicUrl, bindHost, port } = {}) 
 // ---- 引擎装载（engine/* 由另一个 agent 编写；缺失时全部优雅降级） ---------
 
 async function loadEngine(log) {
-  const eng = { store: null, runner: null, tasks: null, upstream: null, credits: null, miniprogram: null, errors: [] }
+  const eng = { store: null, runner: null, tasks: null, upstream: null, credits: null, miniprogram: null, usage: null, errors: [] }
   const want = [
     ["store", "./engine/store.mjs"],
     ["runner", "./engine/runner.mjs"],
@@ -613,6 +614,9 @@ async function loadEngine(log) {
     // POST /api/campaign/run 的引擎出口（fetchCampaignState / runCampaignTasks）。
     // 可选降级同上（503 引擎不可用，不影响其余功能）。
     ["campaign", "./engine/campaign.mjs"],
+    // 积分用量明细（B6）：GET /api/usage 的引擎出口（fetchUsageSummary）。
+    // 只读、按需拉取（只有显式请求 /api/usage 才打上游），可选降级同上。
+    ["usage", "./engine/usage.mjs"],
     // 小程序链式任务（0.3.0）：tasks.mjs 本就静态 import 它（缺文件时 tasks 也
     // 加载不了），这里单独登记是为了快照合并（fetchMPTasks）与 accept/claim
     // 分流（acceptMPTasks/claimMPTask）能拿到具名模块引用。
@@ -722,6 +726,11 @@ export async function startDaemon(opts = {}) {
   // state 形状。缓存/节流口径与 streak 完全一致（10 分钟新鲜期，CREDITS_TTL_MS）；
   // /api/state 的 accounts[].campaign 只读投影这份缓存，绝不为它打上游。
   const campaignFile = join(stateDir, "campaign.json")
+  // 积分用量明细缓存（B6）：uid -> {days, summary, updatedAt, updatedISO}。
+  // 新鲜期 10 分钟（CREDITS_TTL_MS，与 credits 同口径）；**days 变了 = 没有对应
+  // 缓存**（窗口不同不能互答）。缓存里只有归一后的聚合（prompt 原文在 engine/
+  // usage.mjs 内就被丢弃，见其文件头红线），绝不打上游除非显式请求 /api/usage。
+  const usageFile = join(stateDir, "usage.json")
   // 403/11140 冻结台账（CONTRACT §10.5）：uid -> {at:ISO, code, message}，tmp+
   // rename 原子写（与 daily-activity.json 同目录同原语）。冻结账号不进
   // eligibleNow()/排程选号/缺省目标，只有 POST /api/account/unfreeze 能解冻，
@@ -778,6 +787,10 @@ export async function startDaemon(opts = {}) {
   // 重新拉取）。
   let campaignCache = readJson(campaignFile, {})
   if (!campaignCache || typeof campaignCache !== "object" || Array.isArray(campaignCache)) campaignCache = {}
+  // 用量明细缓存：同款归一（损坏/非对象按 {} 起步，顶多下一次 GET /api/usage
+  // 重新拉取）。
+  let usageCache = readJson(usageFile, {})
+  if (!usageCache || typeof usageCache !== "object" || Array.isArray(usageCache)) usageCache = {}
   // 冻结台账（CONTRACT §10.5）：形状不对按空对象起步；条目逐条归一（at 统一成
   // ISO 串、message 截断），坏条目丢弃不阻断启动。台账是 daemon 侧冻结状态
   // 的单一事实：runner 启动时经 frozenMap 读入同一份数据，之后每次 freeze/
@@ -804,6 +817,7 @@ export async function startDaemon(opts = {}) {
   const saveCredits = () => writeJson(creditsFile, creditsCache)
   const saveStreak = () => writeJson(streakFile, streakCache)
   const saveCampaign = () => writeJson(campaignFile, campaignCache)
+  const saveUsage = () => writeJson(usageFile, usageCache)
   const saveFrozen = () => writeJson(frozenFile, frozenState)
   const saveMPLocks = () => writeJson(mpLocksFile, mpLocks)
 
@@ -1882,6 +1896,57 @@ export async function startDaemon(opts = {}) {
     return "failed"
   }
 
+  // B1 签到兜底链（CONTRACT §10.4）：主路径 404 / 网络层失败才换下一候选 ——
+  // 候选顺序 = 两种路径拼法 × 国内两域：
+  //   1. {bill}/billing/meter/daily-checkin        （主路径，旧版行为）
+  //   2. {bill}/v2/billing/meter/daily-checkin     （兄弟实现拼法）
+  //   3. {workbuddy 域}/billing/meter/daily-checkin
+  //   4. {workbuddy 域}/v2/billing/meter/daily-checkin
+  // 说明：
+  //   · **只有 HTTP 404 / 网络层失败（callJSON 的 error 字段）才换候选**；
+  //     401/403/11140/业务码一律不换 —— restricted/needRelogin/pending 的既有
+  //     口径原样保留（404 才说明「路径不存在」，别的错说明路径活着）。
+  //   · 域名互换是 **workbuddy.cn ↔ codebuddy.cn** 两个已知国内域之间的一次互换
+  //    （「兜底一次」）：本插件不解析账号 JWT 的 iss（凭据不出守护进程、绝不
+  //     解码 JWT），兜底域就是两域互换；billBase() 不是这两个域时给 null，不兜。
+  //   · 候选之间 await sleepFn(1000)（限速红线）；每次候选照走 engineOpts() 的
+  //     全局节流器，铁律 4 对整条链同样成立。
+  //   · 命中非主候选时返回值带 via（候选的 path），回执/日志如实记录用了哪条。
+  const CHECKIN_PATHS = ["/billing/meter/daily-checkin", "/v2/billing/meter/daily-checkin"]
+  function altBillBase(base) {
+    try {
+      const u = new URL(base)
+      if (/(^|\.)workbuddy\.cn$/i.test(u.hostname)) u.hostname = u.hostname.replace(/workbuddy\.cn$/i, "codebuddy.cn")
+      else if (/(^|\.)codebuddy\.cn$/i.test(u.hostname)) u.hostname = u.hostname.replace(/codebuddy\.cn$/i, "workbuddy.cn")
+      else return null
+      return u.toString().replace(/\/+$/, "")
+    } catch {
+      return null
+    }
+  }
+  async function checkinCall(acct) {
+    const up = engine?.upstream
+    if (typeof up?.callJSON !== "function" || typeof up?.billBase !== "function") {
+      throw new Error(engineErrorsText())
+    }
+    const base = up.billBase()
+    const alt = altBillBase(base)
+    const candidates = []
+    for (const path of CHECKIN_PATHS) candidates.push({ base, path, swapped: false })
+    if (alt) for (const path of CHECKIN_PATHS) candidates.push({ base: alt, path, swapped: true })
+    let last = null
+    for (let i = 0; i < candidates.length; i++) {
+      if (i > 0) await sleepFn(1000) // 限速红线：候选之间 ≥1s（全局节流器之外再垫一层）
+      last = await up.callJSON(acct, "billing", `${candidates[i].base}${candidates[i].path}`, { method: "POST" }, engineOpts())
+      const fallbackable = (last?.status === 404) || (last?.error != null)
+      if (!fallbackable) {
+        // 主候选之外的候选命中 → 回执带 via，让用户知道走了兜底
+        return i > 0 ? { ...last, via: candidates[i].path } : last
+      }
+    }
+    return last
+  }
+
   async function doCheckin(uids) {
     const up = engine?.upstream
     if (typeof up?.callJSON !== "function" || typeof up?.billBase !== "function") {
@@ -1905,31 +1970,67 @@ export async function startDaemon(opts = {}) {
         continue
       }
       try {
-        const r = await up.callJSON(acct, "billing", `${up.billBase()}/billing/meter/daily-checkin`, { method: "POST" }, engineOpts())
-        if (r?.ok && r?.code === 0) {
-          const d = r.data ?? {}
-          const already = d.already === true || d.signed === true || /已签/.test(String(r.msg ?? ""))
-          const outcome = classifyCheckin(r.code, r.msg, already)
-          out.push({
-            uid,
-            outcome,
-            // pending 不算成功：积分/连登不可信，一律不记（当天可重试）
-            credit: outcome === "pending" ? 0 : Number(d.credit ?? d.points ?? d.point ?? 0) || 0,
-            streak: outcome === "pending" ? undefined : d.streak ?? d.days,
-            message: scrub(r.msg ?? ""),
-          })
-        } else {
-          const outcome = classifyCheckin(r?.code, r?.msg, false)
-          out.push({
-            uid,
-            outcome,
-            // 10001 +「已签到」在上游可能不带 ok/code===0 信封（r.ok=false 但语义
-            // 是 done）—— 回执细分按 code/msg 判定，不迷信 HTTP 层
-            credit: outcome === "done" ? Number(r?.data?.credit ?? 0) || 0 : 0,
-            streak: outcome === "done" ? r?.data?.streak ?? r?.data?.days : undefined,
-            message: scrub(r?.msg || `HTTP ${r?.status ?? "?"} code ${r?.code ?? "?"}`),
-          })
+        // B1：签到请求走兜底链（主路径 404/网络失败才换，见 checkinCall 注释）
+        const r = await checkinCall(acct)
+        const d = r?.data ?? {}
+        const already = d.already === true || d.signed === true || /已签/.test(String(r?.msg ?? ""))
+        // 回执形状沿用原两分支口径（10001 +「已签到」在上游可能不带 ok/code===0
+        // 信封 —— 回执细分按 code/msg 判定，不迷信 HTTP 层；「失败」是唯一硬词）
+        const row = r?.ok && r?.code === 0
+          ? {
+              uid,
+              outcome: classifyCheckin(r.code, r.msg, already),
+              // pending 不算成功：积分/连登不可信，一律不记（当天可重试）
+              credit: classifyCheckin(r.code, r.msg, already) === "pending"
+                ? 0
+                : Number(d.credit ?? d.points ?? d.point ?? 0) || 0,
+              streak: classifyCheckin(r.code, r.msg, already) === "pending" ? undefined : d.streak ?? d.days,
+              message: scrub(r.msg ?? ""),
+            }
+          : {
+              uid,
+              outcome: classifyCheckin(r?.code, r?.msg, false),
+              credit: classifyCheckin(r?.code, r?.msg, false) === "done" ? Number(d.credit ?? 0) || 0 : 0,
+              streak: classifyCheckin(r?.code, r?.msg, false) === "done" ? d.streak ?? d.days : undefined,
+              message: scrub(r?.msg || `HTTP ${r?.status ?? "?"} code ${r?.code ?? "?"}`),
+            }
+        if (r?.via) row.via = r.via
+        // B1.2：领取后重查一次连登状态（只读 GET /activity/growth/streak），把
+        // streak_days / next_streak_day 一类**如实**回填到回执与日志 —— 拿不到
+        // 就说拿不到（绝不拿回执里的旧值冒充新值，也绝不为此多试第二次）。
+        // claimed 与 done（10001 已签到）都算「这一天已签」→ 都重查；pending/failed 不查。
+        if (row.outcome === "claimed" || row.outcome === "done") {
+          await sleepFn(1000) // 限速红线：与签到请求之间 ≥1s
+          try {
+            const s = await up.callJSON(acct, "chat", `${up.growthBase()}/activity/growth/streak`, {}, engineOpts())
+            if (s?.ok && s?.code === 0) {
+              const status = {}
+              const sd = Number(s.data?.streak?.days)
+              if (Number.isFinite(sd)) {
+                status.streakDays = sd
+                if (row.streak === undefined) row.streak = sd // 回执没带才回填（不覆盖回执值）
+              }
+              if (s.data?.streak?.next_tier != null) status.nextStreakDay = s.data.streak.next_tier
+              const ntr = Number(s.data?.streak?.next_tier_remaining)
+              if (Number.isFinite(ntr)) status.nextStreakRemaining = ntr
+              const tc = Number(s.data?.total_credits)
+              if (Number.isFinite(tc)) status.totalCredits = tc
+              if (Object.keys(status).length) {
+                row.status = status
+                log(`[checkin] ${uid} 签到成功（+${row.credit} 积分，连登 ${status.streakDays ?? "?"} 天）`)
+              } else {
+                log(`[checkin] ${uid} 签到成功（+${row.credit} 积分）；连登状态重查成功但没有可用字段`)
+              }
+            } else {
+              row.statusError = scrub(String(s?.msg || `HTTP ${s?.status ?? "?"}`))
+              log(`[checkin] ${uid} 签到成功（+${row.credit} 积分）；连登状态重查失败（${row.statusError}），拿不到就如实不填`)
+            }
+          } catch (e) {
+            row.statusError = shortErr(e)
+            log(`[checkin] ${uid} 签到成功（+${row.credit} 积分）；连登状态重查失败（${row.statusError}）`)
+          }
         }
+        out.push(row)
       } catch (e) {
         out.push({ uid, outcome: "failed", message: shortErr(e) })
       }
@@ -1956,7 +2057,7 @@ export async function startDaemon(opts = {}) {
   //   · 拉取成功 → 写缓存 + 落盘（credits 另发 SSE 提示）；失败/异常 → 200 +
   //     ok:false|error，错误文本过 scrub，旧缓存原样保留并一并带回；busy 盒子
   //     try/finally 保证并发闸不悬挂。
-  async function fetchCachedForUid(spec, uid, force = false) {
+  async function fetchCachedForUid(spec, uid, force = false, param = null) {
     const raw = loadAccountsAll().find((a) => a.uid === uid && isEnterpriseAcct(a))
     if (raw) {
       return { status: 404, body: { error: ENTERPRISE_NO_GROWTH_MSG } }
@@ -1966,12 +2067,14 @@ export async function startDaemon(opts = {}) {
       return { status: 404, body: { error: `找不到可参与任务的国内版账号：${uid}` } }
     }
     const nickname = acct.nickname || acct.accountId || uid
-    const cached = spec.cacheOf(uid)
-    if (cached && !force && spec.isFresh(cached)) {
-      return { status: 200, body: spec.body.cachedHit(uid, nickname, cached) }
+    // param（可选）：端点自己的查询参数（如 /api/usage 的 days）。缓存键/新鲜期/
+    // 响应体按它区分 —— credits/streak/campaign 不用参数，注入侧一律忽略。
+    const cached = spec.cacheOf(uid, param)
+    if (cached && !force && spec.isFresh(cached, param)) {
+      return { status: 200, body: spec.body.cachedHit(uid, nickname, cached, param) }
     }
     if (runner?.current() || spec.busy.v) {
-      if (cached && !force) return { status: 200, body: spec.body.cachedHit(uid, nickname, cached) }
+      if (cached && !force) return { status: 200, body: spec.body.cachedHit(uid, nickname, cached, param) }
       return { status: 409, body: { error: "busy" } }
     }
     const fn = spec.engineFn()
@@ -1980,21 +2083,21 @@ export async function startDaemon(opts = {}) {
     }
     spec.busy.v = true
     try {
-      const r = await fn(acct, spec.optsFor(acct))
-      const payload = spec.payloadOf(r)
+      const r = await fn(acct, spec.optsFor(acct, param), param)
+      const payload = spec.payloadOf(r, param)
       if (payload) {
         spec.cache[uid] = payload
         spec.save()
         if (spec.onCached) spec.onCached(uid)
-        return { status: 200, body: spec.body.ok(uid, nickname, payload) }
+        return { status: 200, body: spec.body.ok(uid, nickname, payload, param) }
       }
-      // 上游失败：200 + ok:false|error，错误文本过 scrub；旧缓存原样保留并一并带回。
+      // 上游失败：200 + ok:false|error，错误文本过 scrub，旧缓存原样保留并一并带回。
       return {
         status: 200,
-        body: spec.body.failed(r, uid, nickname, cached, scrub(String(r?.error || r?.msg || spec.fallbackMsg))),
+        body: spec.body.failed(r, uid, nickname, cached, scrub(String(r?.error || r?.msg || spec.fallbackMsg)), param),
       }
     } catch (e) {
-      return { status: 200, body: spec.body.failed(null, uid, nickname, cached, shortErr(e)) }
+      return { status: 200, body: spec.body.failed(null, uid, nickname, cached, shortErr(e), param) }
     } finally {
       spec.busy.v = false
     }
@@ -2013,6 +2116,7 @@ export async function startDaemon(opts = {}) {
   const creditsBusy = { v: false }
   const streakBusy = { v: false }
   const campaignBusy = { v: false }
+  const usageBusy = { v: false }
 
   const CACHED_READER_SPECS = {
     credits: {
@@ -2084,11 +2188,63 @@ export async function startDaemon(opts = {}) {
         },
       },
     },
+    // 积分用量明细（B6，CONTRACT §3 /api/usage）：param.days ∈ 1–90 决定查询窗口
+    // 与缓存键 —— **days 不同 = 没有对应缓存**（窗口不同不能互答，直接重新拉）。
+    // 缓存条目 = {days, summary, updatedAt, updatedISO}；summary 就是引擎
+    // fetchUsageSummary 的 usage 形状（prompt 原文在引擎里已被丢弃，见 engine/
+    // usage.mjs 文件头红线）。只有显式请求 GET /api/usage 才走到这里 —— /api/state
+    // 绝不读它以外的任何东西，更不会为投影打上游。
+    usage: {
+      engineFn: () => {
+        const fn = engine?.usage?.fetchUsageSummary
+        if (typeof fn !== "function") return null
+        return (acct, opts, param) => fn(acct, { days: param?.days ?? 7 }, opts)
+      },
+      optsFor: (acct) => engineOpts(acct),
+      cacheOf: (uid, param) => {
+        const want = Number(param?.days ?? 7)
+        const c = usageCache[uid]
+        if (!c || typeof c !== "object" || Array.isArray(c)) return null
+        return Number(c.days) === want ? c : null
+      },
+      cache: usageCache,
+      save: saveUsage,
+      busy: usageBusy,
+      isFresh: (c) => Number(c?.updatedAt) > 0 && now() - Number(c?.updatedAt) < CREDITS_TTL_MS,
+      payloadOf: (r) =>
+        r?.ok && r?.usage && typeof r.usage === "object"
+          ? {
+              days: r.windowDays,
+              summary: r.usage,
+              // updatedAt 提到顶层（isFresh 读它）；summary.updatedAt 是同一毫秒值
+              updatedAt: r.usage.updatedAt,
+            }
+          : null,
+      fallbackMsg: "用量明细拉取失败",
+      body: {
+        cachedHit: (uid, nickname, cached, param) => ({
+          ok: true, uid, nickname, days: Number(param?.days ?? 7), usage: cached.summary,
+        }),
+        ok: (uid, nickname, payload, param) => ({
+          ok: true, uid, nickname, days: Number(param?.days ?? 7), usage: payload.summary,
+        }),
+        failed: (r, uid, nickname, cached, message, param) => {
+          const body = { ok: false, uid, nickname, days: Number(param?.days ?? 7), error: message }
+          if (r?.needRelogin) body.needRelogin = true
+          if (cached) body.usage = cached.summary
+          return body
+        },
+      },
+    },
   }
 
   const fetchCreditsForUid = (uid, force = false) => fetchCachedForUid(CACHED_READER_SPECS.credits, uid, force)
   const fetchStreakForUid = (uid, force = false) => fetchCachedForUid(CACHED_READER_SPECS.streak, uid, force)
   const fetchCampaignForUid = (uid, force = false) => fetchCachedForUid(CACHED_READER_SPECS.campaign, uid, force)
+  // GET /api/usage（B6）：days ∈ 1–90（缺省 7）是缓存键的一部分 —— fetchUsageForUid
+  // 先做参数收敛，再走公共骨架（缓存/TTL/409/503 口径与 /api/credits 完全一致）。
+  const fetchUsageForUid = (uid, days, force = false) =>
+    fetchCachedForUid(CACHED_READER_SPECS.usage, uid, force, { days })
 
   // ---- 连登管家（CONTRACT §10.2）-------------------------------------------
   // GET /api/streak 走 fetchCachedForUid 公共骨架（见上方三端点注释）；
@@ -2100,6 +2256,36 @@ export async function startDaemon(opts = {}) {
   function cachedStreakOf(uid) {
     const c = streakCache[uid]
     return c && typeof c === "object" && !Array.isArray(c) ? c : null
+  }
+
+  // streakProjectionOf(s)：/api/state 的 accounts[].streak 只读投影（B5）。在缓存
+  // 原样之上补 4 个新字段的**缺省值**（新版引擎 fetchStreakState 已带这些字段，
+  // 旧缓存/假引擎没有 —— 字段缺失就缺省，绝不为此打上游）：
+  //   nextTier          连登下一档（如 "28d"，缺失 ""）
+  //   nextTierRemaining 距下一档天数（缺失/非数字 null）
+  //   remainingDays     连登兑换剩余天数（redemption_status.remaining_days，缺失 null）
+  //   todayActive       今日是否活跃 {active:boolean|null, statusText:string}（缺失 null）
+  // 数据源 = 引擎快照（engine/streak.fetchStreakState，CONTRACT §10.1）；本函数
+  // 只做投影，绝不改缓存、绝不发请求。
+  function streakProjectionOf(s) {
+    if (!s || typeof s !== "object" || Array.isArray(s)) return null
+    return {
+      ...s,
+      nextTier: typeof s.nextTier === "string" ? s.nextTier : "",
+      nextTierRemaining: Number.isFinite(Number(s.nextTierRemaining)) && s.nextTierRemaining !== null && s.nextTierRemaining !== ""
+        ? Number(s.nextTierRemaining)
+        : null,
+      remainingDays: Number.isFinite(Number(s.remainingDays)) && s.remainingDays !== null && s.remainingDays !== ""
+        ? Number(s.remainingDays)
+        : null,
+      todayActive:
+        s.todayActive && typeof s.todayActive === "object" && !Array.isArray(s.todayActive)
+          ? {
+              active: typeof s.todayActive.active === "boolean" ? s.todayActive.active : null,
+              statusText: String(s.todayActive.statusText ?? ""),
+            }
+          : null,
+    }
   }
 
   // ---- 「跑一轮」双胞胎的公共骨架（POST /api/streak/run §10.2、
@@ -2401,9 +2587,9 @@ export async function startDaemon(opts = {}) {
       // 积分缓存只读投影（CONTRACT §3）：绝不在这里打上游 —— 看板渲染 剩余/总额
       // 与明细弹窗的数据源；没拉过就是 null。
       credits: cachedCreditsOf(a.uid),
-      // 连登状态只读投影（CONTRACT §10.3）：state/streak.json 的缓存原样透出，
-      // 绝不为它打上游；没拉过/缓存损坏 → null。
-      streak: cachedStreakOf(a.uid),
+      // 连登状态只读投影（CONTRACT §10.3 + B5）：state/streak.json 的缓存经
+      // streakProjectionOf 补新字段缺省后透出，绝不为它打上游；没拉过/缓存损坏 → null。
+      streak: streakProjectionOf(cachedStreakOf(a.uid)),
       // 运营活动任务只读投影（CONTRACT §11.1）：state/campaign.json 的缓存原样
       // 透出，绝不为它打上游；没拉过/缓存损坏 → null。
       campaign: cachedCampaignOf(a.uid),
@@ -2794,6 +2980,38 @@ export async function startDaemon(opts = {}) {
       }
       // refresh=1/true/yes：无视 TTL 强制拉取（job 在跑时仍 409，见 fetchCreditsForUid）
       const r = await fetchCreditsForUid(uid, isTruthyParam(u.searchParams.get("refresh")))
+      json(res, r.status, r.body)
+      return
+    }
+
+    // GET /api/usage?uid=&days=7（B6，积分用量明细）：uid 缺省 = 第一个可参与账号；
+    // days 限 1–90（缺省 7），非法值 400。只读封装 + state/usage.json 缓存
+    //（10 分钟 TTL，days 是缓存键的一部分）；**只有显式请求才打上游**，
+    // /api/state 绝不顺带调用它。prompt 原文在引擎层就被丢弃（engine/usage.mjs
+    // 文件头红线），本路由的响应里只可能出现聚合字段。
+    if (p === "/api/usage" && req.method === "GET") {
+      let uid = String(u.searchParams.get("uid") ?? "").trim()
+      if (!uid) {
+        const first = eligibleNow()[0]
+        if (!first) {
+          json(res, 404, { error: "找不到可参与任务的国内版账号" })
+          return
+        }
+        uid = first.uid
+      }
+      const daysRawRaw = u.searchParams.get("days")
+      if (daysRawRaw === null) {
+        // 缺省 7：走 fetchUsageForUid 的 param.days ?? 7 兜底
+        const r = await fetchUsageForUid(uid, 7, isTruthyParam(u.searchParams.get("refresh")))
+        json(res, r.status, r.body)
+        return
+      }
+      const daysRaw = Number(daysRawRaw)
+      if (!Number.isInteger(daysRaw) || daysRaw < 1 || daysRaw > 90) {
+        json(res, 400, { error: "days 必须是 1–90 的整数" })
+        return
+      }
+      const r = await fetchUsageForUid(uid, daysRaw, isTruthyParam(u.searchParams.get("refresh")))
       json(res, r.status, r.body)
       return
     }

@@ -342,6 +342,10 @@ export class JobRunner {
           // 立即冻结（onFrozen → daemon 落盘 state/frozen.json），不再有冷却期
           this.freeze(uid || acct.uid, { code: 11140, message: detail || "restricted (403/11140)" });
           job.log.push(`! [${uid || acct.uid}/${leg}] 触发风控限制 (403/11140)，已冻结账号（不再自动恢复）`);
+        } else if (state === "benign403") {
+          // 良性 403（已知业务拒绝白名单，engine/upstream.BENIGN_403_MSGS）：
+          // 不是风控、不冻结，但也不静默 —— 记一行可诊断日志。
+          job.log.push(`· [${uid || acct.uid}/${leg}] benign403: ${detail}`);
         } else if (state === "fail" || state === "retry") {
           job.log.push(`· [${uid || acct.uid}/${leg}] ${state}: ${detail}`);
         }

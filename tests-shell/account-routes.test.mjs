@@ -108,6 +108,7 @@ describe("路由登记表（单一真相：routeNeedsKey 恒 false / API_ROUTE_A
       "GET /api/jobs/job-1",
       "GET /api/state",
       "GET /api/streak",
+      "GET /api/usage",
       "POST /api/account/toggle",
       "POST /api/account/unfreeze",
       "POST /api/accounts",

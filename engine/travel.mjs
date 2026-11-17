@@ -11,10 +11,31 @@ import {
   NIGHT_TASK_CODES,
   inNightWindow,
 } from "./constants.mjs";
+import { isNoActiveBuddyMsg, repairActiveBuddy } from "./buddy.mjs";
 import { acceptTasks, buildEvent, claimTask, fetchEnergy, fetchTasks, progressTask, reportEvents } from "./tasks.mjs";
 import { callJSON, ctxOf } from "./upstream.mjs";
 
 // ---- 状态查询 ------------------------------------------------------------------
+
+// etaMinutesOf(status, nowMs)：traveling 的预计返回分钟数（B3）。真机
+// arrive_at/server_now 是 epoch **秒**（idle 时 arrive_at=0）；⚠️ idle 时
+// location/letter 是字符串 "null"（连真 JSON null 都不是）—— 本函数只读
+// arrive_at/server_now 两个数值字段，其余字段一概不碰；字符串 "null"/0/负数/
+// 非有限值一律按缺失（→ null），误传毫秒（>1e12）也兜住。server_now 缺失时
+// 用注入时钟换算成秒兜底。分钟数 = round((arrive - now)/60)，可为 0/负数
+//（已到返回时间），调用方据此区分「即将归来」与「还在途中」。
+export function etaMinutesOf(st, nowMs) {
+  const toSec = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n > 1e12 ? Math.round(n / 1000) : n;
+  };
+  const arrive = toSec(st?.arrive_at);
+  if (arrive === null) return null;
+  const server = toSec(st?.server_now) ?? toSec(Number(nowMs) / 1000);
+  if (server === null) return null;
+  return Math.round((arrive - server) / 60);
+}
 
 // travelStatus(acct, opts) -> data|null（GET /activity/growth/buddy/travel/status）
 export async function travelStatus(acct, opts = {}) {
@@ -109,21 +130,55 @@ export async function runCatTravel(acct, opts = {}) {
     }
     if (lid == null) lid = 1;
 
-    // 先直接派，失败再补齐 first_buddy（其奖励即 Buddy 实例）重试一次。
+    // 先直接派，失败再修：B8 先查 Buddy 清单（选中态修复，有实例未选中 → switch
+    // 后重试一次），清单为空/查不到才补齐 first_buddy（其奖励即 Buddy 实例）重试
+    // 一次。判序（兄弟实现教训，signin.py:2096/2213）：上游把「还没领养猫猫」也回
+    // HTTP 403 —— 这是业务拒绝不是风控，必须**先于** restricted 判定处理，否则
+    // 没养猫的账号会被误冻（engine/upstream.mjs 已把白名单 403 归为 benign403
+    // 不带 restricted；这里再兜一层，msg 归一后精确全等，绝不模糊包含）。
     let dep = await travelDepart(acct, lid, opts);
-    if (dep.restricted) return { ok: false, msg: `派出旅行失败: ${dep.err}`, restricted: true };
-    if (dep.data == null && String(dep.err || "").toLowerCase().includes("no active buddy")) {
+    if (dep.data == null && isNoActiveBuddyMsg(dep.err)) {
+      // B8 修理性选中态修复（三态诊断见 engine/buddy.repairActiveBuddy）：
+      //   switched → 切换后重试一次；none → 走 ensureBuddy 补 first_buddy；
+      //   switch_failed → 如实报错（含上游 msg），绝不报成功；
+      //   already_selected / list_failed → 绝不动用户已选中的 Buddy / 状态不可判，
+      //     退回 ensureBuddy 老路（行为与旧版一致）。
+      const rep = await repairActiveBuddy(acct, opts);
+      if (rep.restricted) return { ok: false, msg: "派出旅行失败: 账号已被风控限制", restricted: true };
+      if (rep.state === "switched") {
+        await ctx.breathe();
+        dep = await travelDepart(acct, lid, opts);
+        if (dep.restricted) return { ok: false, msg: `派出旅行失败: ${dep.err}`, restricted: true };
+        if (dep.data != null) {
+          const loc = dep.data.location?.name || "";
+          return {
+            ok: true,
+            action: "depart",
+            msg: `${rep.message}：猫猫已出发前往「${loc}」，预计数小时后归来！`,
+          };
+        }
+        return { ok: false, msg: `${rep.message}，但仍派出失败: ${dep.err}` };
+      }
+      if (rep.state === "switch_failed") {
+        return { ok: false, msg: `${rep.message}：${rep.error}` };
+      }
       if (await ensureBuddy(acct, opts)) {
         await ctx.breathe();
         dep = await travelDepart(acct, lid, opts);
         if (dep.restricted) return { ok: false, msg: `派出旅行失败: ${dep.err}`, restricted: true };
       } else {
-        return {
-          ok: false,
-          msg: "还没有 Buddy：需先完成并领取「领取一只 Buddy」任务（新建任务并发起对话）",
-        };
+        // 三态诊断文案（B8）：清单为空 / 清单查不到 / 状态矛盾，绝不混为一谈
+        const why =
+          rep.state === "none"
+            ? "还没有 Buddy：需先完成并领取「领取一只 Buddy」任务（新建任务并发起对话）"
+            : rep.state === "list_failed"
+              ? `还没有 Buddy（Buddy 清单查询失败：${rep.error}）：需先完成并领取「领取一只 Buddy」任务（新建任务并发起对话）`
+              : `Buddy 清单已有 ${rep.instances.length} 个实例且已选中（${rep.current}），但上游拒绝派出（no active buddy）`;
+        return { ok: false, msg: why };
       }
     }
+    // 真风控 403（msg 不在白名单）：立即 restricted 透传，红线不变。
+    if (dep.restricted) return { ok: false, msg: `派出旅行失败: ${dep.err}`, restricted: true };
     if (dep.data != null) {
       const loc = dep.data.location?.name || "";
       return { ok: true, action: "depart", msg: `猫猫已出发前往「${loc}」，预计数小时后归来！` };
@@ -132,7 +187,12 @@ export async function runCatTravel(acct, opts = {}) {
   }
 
   if (state === "traveling") {
-    return { ok: true, action: "traveling", msg: "猫猫正在旅行途中，请稍后再来查看！" };
+    // B3：arrive_at/server_now（真机是 epoch **秒**）→ 「约 N 分钟后回来」。
+    // 字符串 "null"/0/负数/非有限值一律按缺失处理（绝不显示 1970 或负数分钟）。
+    const eta = etaMinutesOf(st, ctx.now());
+    if (eta === null) return { ok: true, action: "traveling", msg: "猫猫正在旅行途中，请稍后再来查看！" };
+    if (eta <= 0) return { ok: true, action: "traveling", msg: "猫猫已到预计返回时间，即将归来，稍后可领取奖励！" };
+    return { ok: true, action: "traveling", msg: `猫猫正在旅行途中，约 ${eta} 分钟后回来！` };
   }
 
   return { ok: true, action: state, msg: `当前状态: ${state}` };

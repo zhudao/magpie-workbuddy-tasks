@@ -42,10 +42,25 @@
 //   GET  /api/streak?uid=<uid>[&refresh=1]
 //                                         -> {uid, cached, streak:<连登状态>|null, error?}
 //        连登状态 = {ok, days, makeupCards, lotteryChances, heatmap:[{date,score}],
-//        tiers:[{tier:"7d"|"14d"|"28d", status}], updatedISO}（CONTRACT §10.1）；
+//        tiers:[{tier:"7d"|"14d"|"28d", status, days, credit, energy, cards, chances}],
+//        updatedISO}（CONTRACT §10.1）；
+//        tiers[].days/credit/energy/cards/chances 是数字或 null（null = 上游没说，整项隐藏）；
+//        老守护进程（≤0.3.8）没有这五项 → 档位照旧只显示状态，绝不报错、不拿 0 冒充。
 //        缓存 state/streak.json 新鲜期 10 分钟，refresh=1 强制拉上游（job 在跑 → 409 busy）。
 //        accounts[].streak 是同一形状的只读投影（state/streak.json），没查过 = null。
+//        0.3.x 起投影扩了 4 个只读字段（B5，缺失即省略，绝不显示 undefined/null/NaN）：
+//        nextTier（下一档，如 "28d"）、nextTierRemaining（距下一档天数）、
+//        remainingDays（连登兑换剩余天数）、todayActive（{active:boolean|null,statusText}）。
 //        后端尚未落地/字段缺失（undefined）时一律按 null 处理 —— 显示「未查询」，不抛错。
+//   GET  /api/usage?uid=<uid>&days=<1-90>&refresh=0|1
+//                                         -> {ok, uid, nickname, days:<窗口天数>,
+//                                             usage:{startTime,endTime,totalCredit,count,unparsed,
+//                                             days:[{date,credit,count}],models:[{model,credit,count}],
+//                                             truncated?,updatedAt,updatedISO}} | {ok:false,error,…}
+//        近 N 天积分用量（北京日分桶，日期升序；models 按 credit 降序）。uid 缺省 = 首个可参与
+//        账号；days 非法 → 400；days 是缓存键（TTL 10 分钟，updatedISO 是数据时刻，非实时）。
+//        只有显式请求才打上游（每次 1–2 次分页调用）—— 看板只在用户点「查询/刷新用量」或
+//        切窗口时请求，绝不在 3 秒重绘里轮询。prompt 原文后端已丢弃，前端不显示任何输入文本。
 //   POST /api/streak/run  {uids?}         -> {results:[{uid,outcome:"ok"|"skipped"|"failed",
 //                                                   earned, message, detail:{…}}]}
 //        缺省/空 uids = 全部「未冻结 + tasksEnabled」账号；账号与账号之间间隔 1500ms
@@ -2889,6 +2904,9 @@ function renderCreditsDialog() {
     refreshBtn.disabled = creditsDialog.loading;
     refreshBtn.textContent = creditsDialog.loading ? "刷新中…" : "刷新明细";
   }
+
+  // 用量明细区块独立于权益包明细：即便 credits 拉取失败也允许用户单独查询用量。
+  renderUsageDetail();
 }
 
 async function refreshCreditsInDialog() {
@@ -2931,6 +2949,7 @@ function openCreditsDialog(uid) {
   creditsDialog.loading = false;
   creditsDialog.error = "";
   creditsDialog.needRelogin = false;
+  resetUsageDetail(uid); // 用量明细：默认近 7 天、尚未查询（不自动打上游）
   syncCreditsControls();
   renderCreditsDialog();
   if (!dlg.open) {
@@ -2948,6 +2967,7 @@ function closeCreditsDialog() {
   if (dlg?.open) dlg.close();
   creditsDialog.uid = "";
   creditsDialog.loading = false;
+  resetUsageDetail(); // 用量明细一并清空（在途请求作废）
 }
 
 function wireCreditsDialog() {
@@ -2956,6 +2976,22 @@ function wireCreditsDialog() {
   $("#creditsCloseBtn").addEventListener("click", closeCreditsDialog);
   $("#creditsDoneBtn").addEventListener("click", closeCreditsDialog);
   $("#creditsRefreshBtn").addEventListener("click", () => refreshCreditsInDialog());
+  // 用量明细：手动触发（查询/刷新）+ 窗口切换（refresh=0，优先命中后端 10 分钟缓存）。
+  const usageRefreshBtn = $("#usageRefreshBtn");
+  if (usageRefreshBtn) {
+    usageRefreshBtn.addEventListener("click", () => loadUsageDetail(!!usageDetail.usage));
+  }
+  for (const b of $$("[data-usage-days]")) {
+    b.addEventListener("click", () => {
+      const d = Number(b.dataset.usageDays);
+      if (!USAGE_DAYS.includes(d) || d === usageDetail.days) return;
+      usageDetail.days = d; // 窗口变了 = 旧数据（含失败时的旧缓存）不再适用
+      usageDetail.usage = null;
+      usageDetail.error = "";
+      usageDetail.needRelogin = false;
+      loadUsageDetail(false);
+    });
+  }
   for (const b of $$("[data-credits-filter]")) {
     b.addEventListener("click", () => {
       const f = b.dataset.creditsFilter;
@@ -2985,11 +3021,254 @@ function wireCreditsDialog() {
     creditsDialog.req++;
     creditsDialog.uid = "";
     creditsDialog.loading = false;
+    resetUsageDetail();
   });
   // 点遮罩关闭（内容在 .credits-body 里，点中 dialog 本身即遮罩区域）
   dlg.addEventListener("click", (ev) => {
     if (ev.target === dlg) closeCreditsDialog();
   });
+}
+
+// ---- 用量明细（/api/usage，积分明细弹窗内的独立只读区块，B6） ----------------------------
+// 契约（daemon GET /api/usage?uid=&days=1-90&refresh=1）：
+//   成功 200 { ok:true, uid, nickname, days:<窗口天数>, usage:{ startTime, endTime,
+//     totalCredit, count, unparsed, days:[{date,credit,count}]（北京日分桶、日期升序）,
+//     models:[{model,credit,count}]（credit 降序）, truncated?, updatedAt, updatedISO } }
+//   失败 200 { ok:false, error, needRelogin?, usage?<旧缓存> }；404/409/503 与 /api/credits 同口径。
+// ⚠️ 外层 days 是数字（窗口天数），usage.days 是数组（按日分桶数组）—— 同名不同义。
+// 隐私红线：上游行里的 prompt 原文后端已丢弃，前端也不显示任何输入文本，只渲染聚合四项。
+// 成本纪律：绝不在 3 秒重绘里轮询 /api/usage —— 只有用户点「查询/刷新用量」或切换窗口
+//   才请求（每次 1–2 次上游分页调用），并复用 credits 的 loading / 错误提示风格。
+const USAGE_DAYS = [7, 30, 90];
+const USAGE_MODEL_TOP = 10; // 按模型最多显示前 10 条，其余合并成「其它 N 个」
+const USAGE_TTL_TEXT = "缓存 10 分钟"; // 后端 TTL：updatedISO 是数据时刻，不代表实时
+
+const usageDetail = {
+  uid: "",
+  days: 7, // 默认 7（也是后端缓存键的一部分）
+  loading: false,
+  error: "",
+  needRelogin: false,
+  usage: null, // 当前 uid + days 窗口最近一次拿到的 usage 对象（失败时保留旧缓存）
+  req: 0, // 请求序号：关闭弹窗 / 切账号 / 切窗口后让在途结果失效
+};
+
+// 积分：可能有小数（真机见过 0.28），最多保留 2 位小数、去掉多余的 0；千分位与 fmtNum 同风格。
+function fmtCredit2(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "0";
+  let s = n.toFixed(2);
+  if (s.includes(".")) s = s.replace(/0+$/, "").replace(/\.$/, "");
+  const x = Number(s);
+  return Number.isFinite(x) ? x.toLocaleString("zh-CN") : s;
+}
+
+// 请求数取整（上游是计数，出现小数也按整数展示）。
+function fmtReqCount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(Math.trunc(n)) : "0";
+}
+
+// "YYYY-MM-DD HH:MM:SS"（北京时间）→ "YYYY-MM-DD HH:MM"；解析不出 → ""（不显示半截）。
+function usageTimeText(v) {
+  const m = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})/.exec(String(v ?? "").trim());
+  return m ? `${m[1]} ${m[2]}` : "";
+}
+
+// 统一把 HTTP 错误 / 200 里的 ok:false 转成可渲染结果；绝不抛给调用方（同 requestCredits）。
+async function requestUsage(uid, days, force) {
+  try {
+    const d = await api("api/usage", { params: { uid, days, refresh: force ? 1 : 0 } });
+    if (d && d.ok && d.usage && typeof d.usage === "object") {
+      return { ok: true, usage: d.usage, nickname: d.nickname };
+    }
+    if (d && d.ok === false) {
+      return {
+        ok: false,
+        kind: "upstream",
+        error: humanizeApiErr(String(d.error || "用量查询失败"), d.hint),
+        needRelogin: !!d.needRelogin,
+        usage: d.usage && typeof d.usage === "object" ? d.usage : null, // 旧缓存照常带回
+      };
+    }
+    return { ok: false, kind: "bad", error: "返回数据不完整（缺少 usage）" };
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 409) return { ok: false, kind: "busy", error: "批量任务运行中，稍后再查" };
+      // 404 既可能「账号不存在」，也可能「老守护进程没这个路由（未知 API）」—— 交给统一改写函数区分。
+      if (e.status === 404 && !UNKNOWN_API_RE.test(e.message)) {
+        return { ok: false, kind: "notfound", error: "未知账号（可能已被移除）" };
+      }
+      return { ok: false, kind: "http", error: humanizeApiErr(e.message || `HTTP ${e.status}`, e.data?.hint) };
+    }
+    if (e && e.network) return { ok: false, kind: "network", error: "连不上守护进程" };
+    return { ok: false, kind: "error", error: humanizeApiErr(String((e && e.message) || e)) };
+  }
+}
+
+// 一张 3 列小表：headers = [{label, num?}]，rows = Array<Array<node|string>>。
+function usageTable(headers, rows) {
+  return el(
+    "table",
+    { class: "tbl usage-tbl" },
+    el("thead", {}, el("tr", {}, ...headers.map((h) => el("th", h.num ? { class: "num", text: h.label } : { text: h.label })))),
+    el("tbody", {}, ...rows),
+  );
+}
+
+// 按日分桶：升序，最多显示到窗口天数；末尾一行合计（totalCredit / count）。
+// 注意：合计来自顶层字段，含「时间无法解析」的记录 —— 与分桶行合计可能不等，由说明行解释。
+function usageDayBlock(usage, win) {
+  const list = (Array.isArray(usage?.days) ? usage.days : [])
+    .filter((d) => d && typeof d === "object")
+    .sort((a, b) => (String(a.date) < String(b.date) ? -1 : String(a.date) > String(b.date) ? 1 : 0));
+  const rows = list.map((d) =>
+    el("tr", {},
+      el("td", { text: String(d.date ?? "") }),
+      el("td", { class: "num", text: fmtCredit2(d.credit) }),
+      el("td", { class: "num", text: fmtReqCount(d.count) }),
+    ),
+  );
+  rows.push(
+    el("tr", { class: "usage-total" },
+      el("td", { text: "合计" }),
+      el("td", { class: "num", text: fmtCredit2(usage?.totalCredit) }),
+      el("td", { class: "num", text: fmtReqCount(usage?.count) }),
+    ),
+  );
+  return el("div", { class: "usage-block" },
+    el("h4", { class: "usage-block-title", text: `按日（近 ${win} 天，升序）` }),
+    usageTable([{ label: "日期" }, { label: "消耗积分", num: true }, { label: "请求数", num: true }], rows),
+  );
+}
+
+// 按模型分布：credit 降序取前 10，其余合并成「其它 N 个」（积分 / 请求数求和）。
+function usageModelBlock(usage) {
+  const all = (Array.isArray(usage?.models) ? usage.models : []).filter((m) => m && typeof m === "object");
+  const top = all.slice(0, USAGE_MODEL_TOP);
+  const rest = all.slice(USAGE_MODEL_TOP);
+  const rows = top.map((m) =>
+    el("tr", {},
+      el("td", {}, el("span", { class: "usage-model-name", text: String(m.model ?? "").trim() || "(unknown)" })),
+      el("td", { class: "num", text: fmtCredit2(m.credit) }),
+      el("td", { class: "num", text: fmtReqCount(m.count) }),
+    ),
+  );
+  if (rest.length) {
+    const credit = rest.reduce((s, m) => s + creditNum(m.credit), 0);
+    const count = rest.reduce((s, m) => s + creditNum(m.count), 0);
+    rows.push(
+      el("tr", { class: "usage-rest" },
+        el("td", { text: `其它 ${rest.length} 个` }),
+        el("td", { class: "num", text: fmtCredit2(credit) }),
+        el("td", { class: "num", text: fmtReqCount(count) }),
+      ),
+    );
+  }
+  return el("div", { class: "usage-block" },
+    el("h4", { class: "usage-block-title", text: all.length > USAGE_MODEL_TOP ? "按模型（credit 降序，前 10）" : "按模型（credit 降序）" }),
+    usageTable([{ label: "模型" }, { label: "消耗积分", num: true }, { label: "请求数", num: true }], rows),
+  );
+}
+
+function resetUsageDetail(uid = "") {
+  usageDetail.req++; // 让在途请求结果失效
+  usageDetail.uid = uid;
+  usageDetail.days = 7;
+  usageDetail.loading = false;
+  usageDetail.error = "";
+  usageDetail.needRelogin = false;
+  usageDetail.usage = null;
+}
+
+function renderUsageDetail() {
+  for (const b of $$("[data-usage-days]")) {
+    const on = Number(b.dataset.usageDays) === usageDetail.days;
+    b.classList.toggle("is-active", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+  const btn = $("#usageRefreshBtn");
+  if (btn) {
+    btn.disabled = usageDetail.loading;
+    btn.textContent = usageDetail.loading ? "查询中…" : usageDetail.usage ? "刷新用量" : "查询用量";
+  }
+
+  const status = $("#usageDetailStatus");
+  if (status) {
+    let text = "";
+    let cls = "credits-status usage-detail-status";
+    if (usageDetail.error) {
+      text = usageDetail.error;
+      if (usageDetail.needRelogin) text += "（需要重新登录 WorkBuddy）";
+      if (usageDetail.usage) text = `刷新失败，显示缓存数据：${text}`;
+      cls += " credits-status-error";
+    } else if (usageDetail.loading) {
+      text = usageDetail.usage ? "刷新中…" : "查询中…";
+      cls += " credits-status-loading";
+    }
+    status.className = cls;
+    status.textContent = text;
+    status.hidden = !text;
+  }
+
+  const u = usageDetail.usage;
+  const note = $("#usageDetailNote");
+  if (note) {
+    const bits = [];
+    if (u) {
+      const at = usageTimeText(u.updatedISO);
+      bits.push(at ? `数据时刻 ${at}（${USAGE_TTL_TEXT}）` : USAGE_TTL_TEXT);
+      if (creditNum(u.unparsed) > 0) bits.push(`有 ${fmtReqCount(u.unparsed)} 条记录时间无法解析，未计入按日统计`);
+      if (u.truncated) bits.push("数据未取全（分页上限）");
+    } else if (!usageDetail.loading && !usageDetail.error) {
+      // 空态（尚未查询）：说清成本与手动触发，绝不自动轮询
+      bits.push(`点「查询用量」按需拉取近 ${usageDetail.days} 天用量（每次会打 1–2 次上游调用，不自动轮询）`);
+    }
+    note.textContent = bits.join(" · ");
+    note.hidden = bits.length === 0;
+  }
+
+  const box = $("#usageDetailBody");
+  if (!box) return;
+  if (!u) {
+    box.replaceChildren();
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  if (creditNum(u.totalCredit) === 0) {
+    box.replaceChildren(el("p", { class: "usage-detail-empty", text: `近 ${usageDetail.days} 天没有消耗记录` }));
+    return;
+  }
+  box.replaceChildren(
+    el("div", { class: "usage-detail-grid" }, usageDayBlock(u, usageDetail.days), usageModelBlock(u)),
+  );
+}
+
+async function loadUsageDetail(force) {
+  const uid = usageDetail.uid;
+  if (!uid || usageDetail.loading) return;
+  const req = ++usageDetail.req;
+  const days = usageDetail.days;
+  usageDetail.loading = true;
+  usageDetail.error = "";
+  usageDetail.needRelogin = false;
+  renderUsageDetail();
+  const r = await requestUsage(uid, days, force);
+  // 弹窗已关闭 / 切账号 / 切窗口 / 又发起了新请求：丢弃本次结果。
+  if (usageDetail.req !== req || usageDetail.uid !== uid || usageDetail.days !== days) return;
+  usageDetail.loading = false;
+  if (r.ok) {
+    usageDetail.usage = r.usage;
+    usageDetail.error = "";
+    usageDetail.needRelogin = false;
+  } else {
+    usageDetail.error = r.error;
+    usageDetail.needRelogin = !!r.needRelogin;
+    if (r.usage) usageDetail.usage = r.usage; // 旧缓存照常显示（与 credits 同口径）
+    if (r.kind === "busy") toastCreditsBusy();
+  }
+  renderUsageDetail();
 }
 
 // ---- 连登管家 / 冻结账号（0.3.3，CONTRACT §10） -----------------------------------------
@@ -3031,10 +3310,50 @@ function streakOf(a) {
   return c && typeof c === "object" ? c : null;
 }
 
-function streakTierOf(st, tier) {
+function streakTierItem(st, tier) {
   const list = Array.isArray(st?.tiers) ? st.tiers : [];
   const hit = list.find((t) => String(t?.tier ?? "") === tier);
+  return hit && typeof hit === "object" ? hit : null;
+}
+
+function streakTierOf(st, tier) {
+  const hit = streakTierItem(st, tier);
   return hit ? String(hit.status ?? "").trim() : "";
+}
+
+// 档位奖励明细（B7）：tiers[] 每项可带 days/credit/energy/cards/chances，数字或 null。
+// null / 缺失 = 上游没说 → 整项隐藏，绝不拿 0 冒充未知（老守护进程 ≤0.3.8 就是全体缺失）。
+// 顺序固定：积分、能量、补签卡、抽奖次数；调用方用「、」并列。
+const STREAK_REWARD_UNITS = [
+  ["credit", "积分"],
+  ["energy", "能量"],
+  ["cards", "补签卡"],
+  ["chances", "抽奖次数"],
+];
+
+function streakRewardNum(v) {
+  if (v == null || (typeof v === "string" && !v.trim())) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// 一档的奖励文案（不含括号），如 "+120 积分、+5 补签卡"。
+// 只列 >0 的项：0 = 该档确实没有这项奖励；null = 上游没说 —— 两者都不显示。
+// 全都没有 → ""，调用方整段省略（绝不出现空括号）。
+function streakTierRewardText(st, tier) {
+  const item = streakTierItem(st, tier);
+  if (!item) return "";
+  const parts = [];
+  for (const [key, unit] of STREAK_REWARD_UNITS) {
+    const n = streakRewardNum(item[key]);
+    if (n == null || n <= 0) continue;
+    // 积分可能有小数（真机见过 0.28）：复用用量明细的 fmtCredit2（最多 2 位、去多余 0）；
+    // 能量 / 补签卡 / 抽奖次数是整数，取整后与 fmtNum 同风格（千分位）。
+    const text = key === "credit" ? fmtCredit2(n) : fmtNum(Math.trunc(n));
+    if (text === "0") continue; // 小数积分四舍五入后为 0 时也不显示「+0 积分」
+    parts.push(`+${text} ${unit}`);
+  }
+  return parts.join("、");
 }
 
 // accounts[i].frozen = {at, code, message}｜null；非空 = 已冻结（403 / 11140）。
@@ -3064,13 +3383,13 @@ function frozenBadge(f) {
 // 档位徽章：7d / 14d / 28d 三个状态；tiers 缺失时显示「未知」，不硬编造状态。
 // 三种已知状态各有一枚专属 class（.tier-available / .tier-claimed / .tier-locked），
 // 状态字符串不认识时原样显示，走 .tier-unknown（中性，非成功色）。
+// 徽章只显示「档位：状态」——B7 的奖励明细（+N 积分…）不再展示（用户反馈：括号太吵）；
+// 奖励数据仍保留在 tiers[] / /api/state 契约里（后端兑换自检日志要用），仅前端不渲染。
 function streakTierBadges(st) {
   return STREAK_TIERS.map((tier) => {
     const status = streakTierOf(st, tier);
-    const b = badge(
-      `${TIER_NAMES[tier]}：${TIER_STATUS_TEXT[status] ?? (status || "未知")}`,
-      TIER_STATUS_CLS[status] ?? TIER_STATUS_UNKNOWN_CLS,
-    );
+    const statusText = TIER_STATUS_TEXT[status] ?? (status || "未知");
+    const b = badge(`${TIER_NAMES[tier]}：${statusText}`, TIER_STATUS_CLS[status] ?? TIER_STATUS_UNKNOWN_CLS);
     b.title = status
       ? `连登 ${TIER_NAMES[tier]} 档：${status}（available 可兑换 / claimed 已兑换 / locked 未达成）`
       : `连登 ${TIER_NAMES[tier]} 档：上游未给出状态`;
@@ -3223,6 +3542,46 @@ function streakCellBlock(a) {
       ),
       el("span", { class: "streak-line streak-tiers" }, ...streakTierBadges(st)),
     );
+    // 连登投影新增字段（B5）：距下一档还差 N 天 / 今日是否活跃。四个字段（nextTier /
+    // nextTierRemaining / remainingDays / todayActive）在旧守护进程或未缓存时缺失，
+    // 缺失就整句省略 —— 绝不显示 undefined / null / NaN（与上方防御式写法同风格）。
+    const progressBits = [];
+    const nextTier = String(st.nextTier ?? "").trim();
+    const tierRemainRaw = st.nextTierRemaining;
+    const tierRemain = tierRemainRaw == null || tierRemainRaw === "" ? NaN : Number(tierRemainRaw);
+    if (nextTier && Number.isFinite(tierRemain)) {
+      // B7：下一档的奖励明细跟在天数后面 —— "距 28d 档还差 12 天（+120 积分）"；
+      // 该档奖励全是 null / 0（老守护进程 / 上游没给）时整段括号省略。
+      const nextReward = streakTierRewardText(st, nextTier);
+      progressBits.push(
+        el(
+          "span",
+          {
+            class: "streak-item",
+            title: `距下一档（${nextTier}）还差 ${tierRemain} 天（streak.nextTierRemaining）${nextReward ? `；该档奖励：${nextReward}` : ""}`,
+          },
+          "距 ",
+          el("b", { class: "streak-v", text: nextTier }),
+          " 档还差 ",
+          el("b", { class: "streak-v", text: String(tierRemain) }),
+          " 天",
+          nextReward ? `（${nextReward}）` : "",
+        ),
+      );
+    }
+    const today = st.todayActive;
+    if (today && typeof today === "object") {
+      let text = "";
+      if (today.active === true) text = "今日已活跃";
+      else if (today.active === false) text = "今日未活跃";
+      else if (String(today.statusText ?? "").trim()) text = String(today.statusText).trim();
+      if (text) progressBits.push(el("span", { class: "streak-item", title: "今日活跃状态（streak.todayActive）" }, text));
+    }
+    if (progressBits.length) {
+      kids.push(
+        el("span", { class: "streak-line streak-progress" }, ...progressBits.flatMap((b, i) => (i ? [" · ", b] : [b]))),
+      );
+    }
     // 全部子请求都失败时 streak 里带 ok:false + error（部分失败仍是 ok:true）——如实说出来
     if (st.ok === false && st.error) {
       kids.push(el("span", { class: "streak-note streak-err warn-text", text: `上游读取失败：${String(st.error)}` }));

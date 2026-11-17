@@ -4,6 +4,10 @@
 //   auto 任务先点亮领取（first_buddy 是前置）→ 批量接取 → 复查 → 二次补接
 //   → 逐任务点亮（上报 + 轮询进度）→ 领奖 → 猫猫旅行 → 结算。
 //
+// 只领奖兜底（0.3.9，CONTRACT §7）：未收录 / 需真实操作（unforgeable）的任务
+// 不接取、不上报，但上游显示已完成时只调一次 claimTask 把奖励领回来（不伪造
+// 进度；mp 任务除外 —— 小程序链路自己会领）。
+//
 // 防风控：所有上游调用之间 ≥1 s（ctx.breathe，假时钟下可断言）；上报后等
 // 1.5 s、轮询进度最多 6 次（在涨再等 2.5 s），没到位就把领奖顺延到下一轮，
 // 绝不硬闯。时钟全部走 opts.now / opts.sleep。
@@ -39,6 +43,7 @@ import { deriveId, uuidHex } from "./fingerprint.mjs";
 import { defaultNow } from "./identity.mjs";
 import { MP_TASK_CODES, runMiniProgramTasks } from "./miniprogram.mjs"; // 小程序链式任务（CONTRACT §7）
 import { resolveTaskKind } from "./taskkind.mjs"; // 任务 → kind 解析（CONTRACT §2/§7，唯一判断源）
+import { makeupCardsOf } from "./streak.mjs"; // 补签卡余额双形状解析（与连登管家同一判定源）
 import { runCatTravel } from "./travel.mjs"; // 循环引用（travel 需要 tasks 的流水线件）；ESM 函数声明提升下安全
 import {
   billBase as _billBase,
@@ -139,7 +144,9 @@ export async function fetchGrowthSummary(acct, opts = {}) {
   if (res.ok) {
     const data = res.data ?? {};
     out.streakDays = data.streak?.days ?? 0;
-    out.makeupCards = data.makeup_cards?.balance ?? 0;
+    // 补签卡两种形状都认（对象 balance / 裸数字，与 engine/streak.makeupCardsOf
+    // 同一判定源）：上游若回裸数字，只认 balance 的话这里恒显 0。
+    out.makeupCards = makeupCardsOf(data);
     const redemp = data.redemption_status ?? {};
     out.tiers = redemp.tiers ?? [];
     out.tierStatuses = {
@@ -896,33 +903,68 @@ export async function progressTask(acct, t, logs, opts = {}) {
   const rk = resolveTaskKind(t);
   const spec = rk.spec;
   const name = spec?.name || t.title || code;
+  const status = t.acceptStatus;
+  const cur = t.progress?.current ?? 0;
+  const tgt = t.progress?.target ?? 1;
 
   // 小程序链式任务（0.3.0 起会经快照进看板，但执行链路在 miniprogram 模块）：
   // 绝不走 web 的事件构造/上报/领奖 —— buildEvent 没有 "mp" 分支，硬闯只会发出
   // heartbeat 或错误头族。防御性跳过：正常 web 清单不会出现 MP-only 任务，万一
   // 出现（上游串台），这里兜底，runGrowthTasks 2b 的小程序链路会用正确的头族处理。
+  // 边界（只领奖兜底不覆盖 mp）：mp 任务的接取/点亮/领奖都在 miniprogram.mjs 的
+  // 小程序头族链路（runMiniProgramTasks 自己会对上游已完成的任务领奖），web 侧
+  // 绝不代领 —— 下面的 claimOnly 兜底只针对 source:"none" / unforgeable 两类。
   if (rk.kind === "mp") {
     logs.push(`⏭ 任务 [${name}] 小程序任务由小程序链路处理, 跳过 web 事件构造`);
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
 
+  // 只领奖兜底（88lin/workbuddy-auto-signin 的通用领奖兜底，MIT，只取行为）：
+  // 未收录 / 需真实操作（unforgeable）的任务没有合法的事件构造方式 —— 绝不接取、
+  // 绝不上报（不伪造进度这条红线不动）；但**用户自己手动完成**、上游清单已显示
+  // acceptStatus === "completed"（或进度已达标）时，只调一次既有 claimTask 把
+  // 奖励领回来（记账沿用 claimTask 的 credit/energy 回执）。将来上游上新任务码
+  // 也不漏领。claim=false 保持既有口径：只记「已达成，等待手动领取」，不发请求；
+  // 领奖失败按上游 reason 如实记一行日志，不判失败、不抛错；restricted 照旧
+  // 透传（风控不能被兜底吞掉）。
+  const claimOnly = async (why) => {
+    if (status === "claimed") return null; // 已领奖：无事可做，按原样走跳过日志
+    const done = status === "completed" || cur >= tgt;
+    if (!done) return null; // 未完成：按原样记「跳过」
+    if (!claim) {
+      logs.push(`⏸ 任务 [${name}] 已达成，等待手动领取`);
+      return { credit: 0, energy: 0, lit: 0, claimed: 0 };
+    }
+    const res = await claimTask(acct, code, opts);
+    if (res.ok) {
+      const cr = res.credit ?? 0;
+      logs.push(`✓ 任务 [${name}] ${why}，但上游已显示完成 → 只领奖: +${cr} 积分`);
+      await ctx.breathe();
+      return { credit: cr, energy: res.energy ?? 0, lit: 0, claimed: 1 };
+    }
+    logs.push(`⏭ 任务 [${name}] ${why}但上游已完成，只领奖失败: ${res.reason || "未知原因"}`);
+    await ctx.breathe();
+    return { credit: 0, energy: 0, lit: 0, claimed: 0, ...(res.restricted ? { restricted: true } : {}) };
+  };
+
   // 未收录任务（TASK_SPECS 没有、jump_url 也派生不出专家 id）：引擎没有任何
-  // 合法的事件构造方式 —— 不接取、不上报、不领奖，诚实标注（P0-1）。
+  // 合法的事件构造方式 —— 不接取、不上报；但上游显示已完成时只领奖（见上，
+  // P0-1 + 领奖兜底）。
   if (rk.source === "none") {
+    const fb = await claimOnly("未收录");
+    if (fb) return fb;
     logs.push(`⏭ 任务 [${name}] ${rk.reason || "未收录任务"}: 引擎没有该任务的事件构造方式, 跳过接取/上报/领奖`);
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
 
   if (rk.unforgeable) {
+    const fb = await claimOnly("需真实操作完成");
+    if (fb) return fb;
     if (rk.reason) {
       logs.push(`⏭ 任务 [${name}] 需真实操作完成: ${rk.reason}, 跳过`);
     }
     return { credit: 0, energy: 0, lit: 0, claimed: 0 };
   }
-
-  const status = t.acceptStatus;
-  const cur = t.progress?.current ?? 0;
-  const tgt = t.progress?.target ?? 1;
 
   if (status === "claimed") return { credit: 0, energy: 0, lit: 0, claimed: 0 };
 

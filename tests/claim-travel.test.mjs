@@ -286,6 +286,61 @@ test("猫猫旅行：补不了 Buddy → 诚实告知", async () => {
   assert.match(res.msg, /还没有 Buddy/);
 });
 
+// ---- 良性 403（A5，兄弟实现 88lin/workbuddy-auto-signin 实测口径）----------------
+// 上游把「还没领养猫猫」也回 HTTP 403（signin.py:2213：403 + msg 全等
+// "no active buddy"）—— 这是业务拒绝不是风控：travel 的判序必须先认它再判
+// restricted，否则没养猫的账号会被误冻（runner 对 restricted 立即冻结）。
+test("猫猫旅行：HTTP 403 + no active buddy（含大小写/空白变体）→ 走 ensureBuddy 兜底，绝不 restricted", async () => {
+  for (const msg of ["no active buddy", " No Active Buddy "]) {
+    const clock = fakeClock(DAY);
+    const backend = wbBackend({
+      clock,
+      tasks: [task("first_buddy", { task_type: "auto", reward: 300 })],
+      litRules: { chat_request_send: "first_buddy" },
+      travel: { state: "idle" },
+    });
+    // 第一次 depart 回兄弟实现实测的 403 + 业务拒绝文案（wbBackend 只有 400 形状，
+    // 这里包一层 fetch 把第一次 depart 换成 403）
+    let departs = 0;
+    const fetchImpl = async (url, init) => {
+      if (new URL(url).pathname === "/activity/growth/buddy/travel/depart") {
+        departs += 1;
+        if (departs === 1) {
+          return { status: 403, text: async () => JSON.stringify({ code: 50001, msg }) };
+        }
+      }
+      return backend.fetchImpl(url, init);
+    };
+    const res = await runCatTravel(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: fetchImpl });
+    assert.equal(res.ok, true, `${msg}: ${res.msg}`);
+    assert.equal(res.action, "depart");
+    assert.equal(res.restricted, undefined, `${msg}: 良性 403 不得把「没养猫」冻成风控`);
+    assert.equal(departs, 2, "补齐 first_buddy 后重试一次");
+    assert.deepEqual(backend.state.claims, ["first_buddy"], "ensureBuddy 兜底真实发生");
+  }
+});
+
+test("猫猫旅行：真风控 403（未知 msg）→ 仍立即 restricted，不进 ensureBuddy 兜底", async () => {
+  const clock = fakeClock(DAY);
+  const backend = wbBackend({
+    clock,
+    tasks: [task("first_buddy", { task_type: "auto", reward: 300 })],
+    litRules: { chat_request_send: "first_buddy" },
+    travel: { state: "idle" },
+  });
+  const fetchImpl = async (url, init) => {
+    if (new URL(url).pathname === "/activity/growth/buddy/travel/depart") {
+      return { status: 403, text: async () => JSON.stringify({ code: 50001, msg: "request illegal" }) };
+    }
+    return backend.fetchImpl(url, init);
+  };
+  const res = await runCatTravel(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: fetchImpl });
+  assert.equal(res.ok, false);
+  assert.equal(res.restricted, true, "非白名单 403 = 风控，红线不变");
+  assert.match(res.msg, /派出旅行失败/);
+  assert.deepEqual(backend.state.claims, [], "风控 403 不触发 ensureBuddy 补齐动作");
+});
+
 test("猫猫旅行：traveling / daily_limit / 未知状态 / 企业号", async () => {
   const clock = fakeClock(DAY);
   const t1 = wbBackend({ clock, tasks: [], travel: { state: "traveling" } });
@@ -305,6 +360,47 @@ test("猫猫旅行：traveling / daily_limit / 未知状态 / 企业号", async 
     now: clock.now, sleep: clock.sleep, fetch: async () => { throw new Error("no"); },
   });
   assert.equal(r4.action, "skip");
+});
+
+// ---- B3：旅行 ETA（arrive_at/server_now，epoch 秒）--------------------------------
+test("B3 旅行 ETA：arrive_at-server_now → 「约 N 分钟后回来」；0/\"null\"/过去时刻按缺失或即归", async () => {
+  const clock = fakeClock(DAY);
+  // 30 分钟后回来：arrive_at = server_now + 1800（epoch 秒，真机口径）
+  const t1 = wbBackend({
+    clock, tasks: [],
+    travel: { state: "traveling", arrive_at: 1763251200 + 1800, server_now: 1763251200 },
+  });
+  const r1 = await runCatTravel(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: t1.fetchImpl });
+  assert.equal(r1.action, "traveling");
+  assert.match(r1.msg, /约 30 分钟后回来/, `msg：${r1.msg}`);
+
+  // arrive_at = 0 / "null" 字符串 / 缺失 → 按缺失，绝不显示 1970/负数
+  for (const arrive_at of [0, "null", undefined]) {
+    const t = wbBackend({
+      clock, tasks: [],
+      travel: { state: "traveling", ...(arrive_at !== undefined ? { arrive_at } : {}), server_now: 1763251200 },
+    });
+    const r = await runCatTravel(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: t.fetchImpl });
+    assert.equal(r.action, "traveling");
+    assert.equal(r.msg, "猫猫正在旅行途中，请稍后再来查看！", `arrive_at=${arrive_at} 按缺失：${r.msg}`);
+  }
+
+  // 已过返回时间（差值为负）→ 「即将归来」文案，绝不出现负数分钟
+  const t2 = wbBackend({
+    clock, tasks: [],
+    travel: { state: "traveling", arrive_at: 1763251200 - 600, server_now: 1763251200 },
+  });
+  const r2 = await runCatTravel(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: t2.fetchImpl });
+  assert.match(r2.msg, /即将归来/, `msg：${r2.msg}`);
+
+  // server_now 缺失 → 用注入时钟兜底（DAY = 2026-09-15 10:00 本地；arrive_at = 该时刻 +900s）
+  const arriveMs = DAY + 900 * 1000;
+  const t3 = wbBackend({
+    clock, tasks: [],
+    travel: { state: "traveling", arrive_at: Math.round(arriveMs / 1000) },
+  });
+  const r3 = await runCatTravel(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: t3.fetchImpl });
+  assert.match(r3.msg, /约 15 分钟后回来/, `msg：${r3.msg}`);
 });
 
 test("猫猫旅行：两次上游调用间隔 ≥ 1000ms", async () => {

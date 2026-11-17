@@ -4,6 +4,7 @@
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { beijingDayKey } from "../engine/daily.mjs";
 
 export function fakeClock(startMs) {
   let t = startMs;
@@ -59,15 +60,27 @@ function cloneTask(t) {
 // - buddyQuota: {affordable, max_open_count}（Buddy 盲盒配额，缺省 affordable 0）；
 //   buddyOpenResponse: 开盒响应信封（缺省 code 0 + data.buddies）；buddyOpens
 //   记录每次开盒请求体。
+// - B8 选中态：buddies（实例清单，null = 端点 404）/ buddyInfo（当前选中）/ 
+//   buddySwitchResponse（switch 信封）/ buddySwitches（switch 请求体台账）。
+// - B1 签到：checkinV2Response = 备用路径 /v2/billing/meter/daily-checkin 的信封
+//  （null = 该路径 404）。
+// - B6 用量：usageRows = get-user-request-usage 的全量行（含 input/inputTrunc，
+//   测引擎丢弃）；usageQueries 记录每次翻页请求体。
 // - mpOnly: 这批 task_code 只出现在小程序标头的清单里（X-Client-Platform:
 //   miniprogram 的 GET /v2/activity/growth/tasks 只回它们；web 清单不回）——
 //   模拟真实环境「web 清单与 MP 清单是两份」的口径。
 // - streak（0.3.3 连登管家腿）：{days, makeupBalance, chances, heatmap:[{date,score}],
 //   redemption_status:{...}} —— 三个 GET（streak/heatmap/lottery summary）的响应；
-//   makeupResponse / redeemResponse / lotteryDrawResponse：对应 POST 的信封
-//   （缺省 code 0）；giftResponses: {"claim-gift"| "claim-compensation": 信封}
-//   （缺省 code 0 + credit）。streakMakeups/streakRedeems/streakDraws/giftClaims
-//   记录每次 POST 请求体。
+//   makeupCardsRaw：显式给出时 makeup_cards 字段原样透传（测裸数字/缺失形状，
+//   缺省回对象 {balance}）；makeupDates：已补签日期数组（data.streak.makeup_dates，
+//   A2 缺省 []）；launchDate：data.launch_date（A2 缺省已知上线边界 "2026-06-17"；
+//   launchDateRaw 显式给出时原样透传，测缺失/非法格式回落）；
+//   today：服务端今天（heatmap data.today.date，A2 的时间边界；缺省 = 假时钟的
+//   北京日 beijingDayKey(clock.now())，显式给 null 可测「today 缺失」）；
+//   makeupResponse / redeemResponse / lotteryDrawResponse：
+//   对应 POST 的信封（缺省 code 0）；giftResponses: {"claim-gift"|
+//   "claim-compensation": 信封}（缺省 code 0 + credit）。streakMakeups/
+//   streakRedeems/streakDraws/giftClaims 记录每次 POST 请求体。
 // redemptionBody(raw)：把测试里好写的档位写法转成**上游真实形状**（见上面 streak 分支
 // 的注释）：
 //   {"7d":"available","14d":"locked"} -> {tiers:[{tier:"7d"},{tier:"14d"}],
@@ -105,11 +118,28 @@ export function wbBackend(opts = {}) {
     restrictedUids: new Set(opts.restrictedUids ?? []),
     refreshTokens: [...(opts.refreshTokens ?? [])],
     webClaims: 0,
+    travelStatusFail: opts.travelStatusFail ?? false,
     buddyQuota: opts.buddyQuota ?? { affordable: 0, max_open_count: 1 },
     buddyOpenResponse: opts.buddyOpenResponse ?? { code: 0, data: { buddies: ["布丁猫"] } },
     buddyOpens: [],
+    // B8 Buddy 选中态：buddies = 实例清单（data.buddies[]，null = 上游没有这两个
+    // 端点 → 404，模拟「旧后端/未下发」）；buddyInfo = data.buddy（当前选中，
+    // null = 未选中任何实例）；buddySwitchResponse = switch 的信封（缺省 code 0）；
+    // buddySwitches 记录每次 switch 的请求体。
+    buddies: opts.buddies ?? null,
+    buddyInfo: opts.buddyInfo ?? null,
+    buddySwitchResponse: opts.buddySwitchResponse ?? { code: 0, data: {} },
+    buddySwitches: [],
+    // B6 积分用量明细：usageRows = 全量行（引擎按 pageNum/pageSize 翻页切片）；
+    // usageQueries 记录每次 POST 的 body（分页参数断言）。行字段照真机形状
+    //（含 input/inputTrunc —— 引擎必须把它们丢掉，测试断言归一化后没有）。
+    usageRows: opts.usageRows ?? [],
+    usageQueries: [],
     mpOnly: new Set(opts.mpOnly ?? []),
     checkinResponse: opts.checkinResponse ?? null,
+    // B1 备用签到路径（/v2/billing/meter/daily-checkin）的信封；null = 该路径 404
+    //（主路径正常时测试不会触达它）
+    checkinV2Response: opts.checkinV2Response ?? null,
     // 连登管家（0.3.3）：GET 三件套的固定快照 + POST 的响应/台账
     streak: opts.streak ?? null,
     makeupResponse: opts.makeupResponse ?? { code: 0, data: {} },
@@ -232,30 +262,76 @@ export function wbBackend(opts = {}) {
 
     // ---- 连登管家（0.3.3，engine/streak.mjs）------------------------------------
     // 三个 GET 一律按**上游真实外壳**回（不然引擎按真实字段解析的回归测不出来）：
-    //   streak  → data.streak.days / data.makeup_cards.balance / data.redemption_status
+    //   streak  → data.streak.days / data.streak.makeup_dates（A2） /
+    //             data.makeup_cards.balance / data.launch_date（A2） /
+    //             data.redemption_status
     //             （状态是**平铺的 tier_7d_status / tier_14d_status / tier_28d_status**，
-    //              另带 tiers 清单；2026-11-11 生产实测）
-    //   heatmap → data.cells:[{date,score}]（同上；0.3.3 第一版按 data.days 解析，
-    //             真实环境一直 0 格 —— 假后端照真实形状回才能钉住这类错）
+    //              另带 tiers 清单；2026-11-11 生产实测，makeup_dates/launch_date
+    //              为 2026-11-16 真机口径）
+    //   heatmap → data.cells:[{date,score,has_new_buddy}]（同上；0.3.3 第一版按
+    //             data.days 解析，真实环境一直 0 格 —— 假后端照真实形状回才能钉住
+    //             这类错）+ data.today{date,...}（服务端今天，A2 的时间边界；缺省
+    //             用假时钟的北京日，种子 today:null 可造「today 缺失」）
     //   lottery → data.chances
     if (u.pathname === "/activity/growth/streak") {
       const s = state.streak;
       return respond(200, {
         code: 0,
         data: {
-          streak: { days: s?.days ?? 0 },
-          makeup_cards: { balance: s?.makeupBalance ?? 0 },
-          redemption_status: redemptionBody(s?.redemption_status),
+          streak: {
+            days: s?.days ?? 0,
+            makeup_dates: s?.makeupDates ?? [],
+            // B5 投影字段：种子给了才出现（next_tier "28d" / next_tier_remaining 天，
+            // 2026-11-16 真机口径）
+            ...(s?.nextTier !== undefined ? { next_tier: s.nextTier } : {}),
+            ...(s?.nextTierRemaining !== undefined ? { next_tier_remaining: s.nextTierRemaining } : {}),
+          },
+          // makeup_cards 形状由种子控制：streak.makeupCardsRaw 显式给了就**原样**回
+          //（测裸数字 / 缺失等非实测形状），缺省按生产实测的对象形状 {balance}。
+          makeup_cards:
+            s?.makeupCardsRaw !== undefined ? s.makeupCardsRaw : { balance: s?.makeupBalance ?? 0 },
+          launch_date: s?.launchDateRaw !== undefined ? s.launchDateRaw : (s?.launchDate ?? "2026-06-17"),
+          // redemptionBody 可能返回数组形态（旧外壳兼容）—— 只对对象形态补
+          // remaining_days（B5 投影），数组原样透传（绝不能被展开成对象）
+          redemption_status: (() => {
+            const rsBody = redemptionBody(s?.redemption_status);
+            if (s?.remainingDays !== undefined && rsBody && !Array.isArray(rsBody)) {
+              return { ...rsBody, remaining_days: s.remainingDays };
+            }
+            return rsBody;
+          })(),
         },
       });
     }
 
     if (u.pathname === "/activity/growth/heatmap") {
-      return respond(200, { code: 0, data: { cells: state.streak?.heatmap ?? [] } });
+      return respond(200, {
+        code: 0,
+        data: {
+          cells: state.streak?.heatmap ?? [],
+          today: {
+            // A2 的时间边界：服务端今天。种子显式给了就用种子的（含 null = 缺失），
+            // 否则按假时钟的北京日推 —— 与 NOW 锚定的 UTC 时刻恒一致，测试可复现。
+            date: state.streak?.today !== undefined ? state.streak.today : beijingDayKey(clock.now()),
+            score: 0,
+            // B5 投影：is_active/status_text（真机形状 {date,score,is_active,status_text}；
+            // 种子 todayActive 缺省 false/"未打卡" 与旧版一致）
+            is_active: state.streak?.todayActive ?? false,
+            status_text: state.streak?.todayStatusText ?? "未打卡",
+          },
+        },
+      });
     }
 
     if (u.pathname === "/activity/growth/lottery/summary") {
+      // B2：lotterySummaryFail = summary 端点 500（测 /lottery/chances 回退源）
+      if (state.streak?.lotterySummaryFail) return respond(500, { code: -1, msg: "summary exploded" });
       return respond(200, { code: 0, data: { chances: state.streak?.chances ?? 0 } });
+    }
+
+    if (u.pathname === "/activity/growth/lottery/chances") {
+      // B2 回退源：data.balance（真机 2026-11-16 实测形状）
+      return respond(200, { code: 0, data: { balance: state.streak?.chancesFallback ?? 0 } });
     }
 
     if (u.pathname === "/activity/growth/makeup-cards/use") {
@@ -286,11 +362,48 @@ export function wbBackend(opts = {}) {
       return respond(200, state.checkinResponse ?? { code: 0, data: { credit: 5, streak: 3 } });
     }
 
+    if (u.pathname === "/v2/billing/meter/daily-checkin") {
+      // B1 备用路径（兄弟实现拼法）：缺省 404 —— 主路径活着的测试不触达这里
+      if (state.checkinV2Response) return respond(200, state.checkinV2Response);
+      return respond(404, { code: -1, msg: "not found" });
+    }
+
+    if (u.pathname === "/billing/meter/get-user-request-usage") {
+      // B6 用量明细：**真机 2026-11-16 实测外壳** —— data.total（number，唯一翻页
+      // 依据）+ data.data[]（行数组）；没有 pageNum/pageSize 回显、没有 hasMore
+      state.usageQueries.push(body);
+      const rows = state.usageRows ?? [];
+      const pageNum = Number(body?.pageNum ?? 1);
+      const size = Number(body?.pageSize ?? 100);
+      const slice = rows.slice((pageNum - 1) * size, pageNum * size);
+      return respond(200, { code: 0, data: { total: rows.length, data: slice } });
+    }
+
     if (u.pathname === "/v2/activity/growth/buddy/quota") {
       return respond(200, {
         code: 0,
         data: { affordable: state.buddyQuota.affordable, max_open_count: state.buddyQuota.max_open_count },
       });
+    }
+
+    // ---- B8 Buddy 选中态三端点 ---------------------------------------------
+    // 真机形状（2026-11-16 只读实测）：info → data.buddy{instance_id,...}（当前
+    // 选中的 Buddy）；list → data.buddies[]（每项 current_buddy(bool)/instance_id/
+    // template_id/source("gacha")/acquired_at/rarity）+ data.count。
+    // 种子 buddies === null 时两个 GET 都 404（模拟旧后端/端点未下发）。
+    if (u.pathname === "/activity/growth/buddy/info") {
+      if (state.buddies === null) return respond(404, { code: -1, msg: "not found" });
+      return respond(200, { code: 0, data: { buddy: state.buddyInfo } });
+    }
+
+    if (u.pathname === "/activity/growth/buddy/list") {
+      if (state.buddies === null) return respond(404, { code: -1, msg: "not found" });
+      return respond(200, { code: 0, data: { buddies: state.buddies, count: state.buddies.length } });
+    }
+
+    if (u.pathname === "/activity/growth/buddy/switch") {
+      state.buddySwitches.push(body);
+      return respond(200, state.buddySwitchResponse);
     }
 
     if (u.pathname === "/v2/activity/growth/buddy/open") {
@@ -299,6 +412,8 @@ export function wbBackend(opts = {}) {
     }
 
     if (u.pathname === "/activity/growth/buddy/travel/status") {
+      // travelStatusFail：状态查询 500（A4 盲盒状态门「查询失败 → 保守跳过」用）
+      if (state.travelStatusFail) return respond(500, { code: -1, msg: "upstream exploded" });
       return respond(200, { code: 0, data: state.travel });
     }
 

@@ -2,9 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  BENIGN_403_MSGS,
   billBase,
   callJSON,
   growthBase,
+  isBenign403Msg,
   makeCtx,
   refreshAccount,
   webBase,
@@ -62,6 +64,89 @@ test("信封 code 11140（哪怕 200）→ restricted", async () => {
     fetch: async () => RESP(200, { code: 11140, msg: "request illegal", data: null }),
   });
   assert.equal(res.restricted, true);
+});
+
+// ---- 良性 403：已知业务拒绝白名单（出处见 engine/upstream.mjs BENIGN_403_MSGS）----
+// 上游把「还没领养猫猫」（travel/depart）与「兑换档位天数不足」（/redeem）这类业务
+// 拒绝也回 HTTP 403（兄弟实现 88lin/workbuddy-auto-signin 实测，signin.py:2096/2213）。
+// 它们不是风控：不置 restricted（否则 runner 会把账号冻结，需手动解冻），但红线
+// 不许放松 —— 白名单之外的一切 403（未知 msg/空 msg）行为与旧版完全一致。
+test("良性 403：白名单内容与匹配规则（trim+lower 后精确全等，绝不模糊包含）", () => {
+  assert.deepEqual(BENIGN_403_MSGS, ["no active buddy", "连续登录天数不足"], "白名单条目钉死（出处见注释）");
+  assert.equal(isBenign403Msg("no active buddy"), true);
+  assert.equal(isBenign403Msg("  No Active Buddy  "), true, "trim+lower 后命中（大小写/空格变体）");
+  assert.equal(isBenign403Msg("连续登录天数不足"), true);
+  assert.equal(isBenign403Msg(""), false, "空 msg 恒不命中");
+  assert.equal(isBenign403Msg("   "), false, "纯空白同空 msg");
+  assert.equal(isBenign403Msg(undefined), false);
+  assert.equal(isBenign403Msg("no active buddy!!"), false, "尾部变体不命中");
+  assert.equal(isBenign403Msg("no active"), false, "截断不命中");
+  assert.equal(isBenign403Msg("权限不足"), false, "兄弟实现的子串匹配会误命中真风控文案 —— 绝不模糊包含");
+  assert.equal(isBenign403Msg("天数不足"), false, "只认完整原文，不认片段");
+  assert.equal(isBenign403Msg("连续登录天数不足，请继续加油"), false, "未实测的更长变体不命中（仍 restricted，行为同旧版）");
+});
+
+test("良性 403：每条白名单 msg → 不 restricted、benign403:true、信封保留、绝不重试", async () => {
+  for (const msg of BENIGN_403_MSGS) {
+    let n = 0;
+    const res = await callJSON(makeAcct(), "chat", "https://copilot.tencent.com/x", {}, {
+      fetch: async () => {
+        n += 1;
+        return RESP(403, { code: 50001, msg, data: { k: 1 } });
+      },
+    });
+    assert.equal(res.ok, false, `${msg}：仍是业务失败`);
+    assert.equal(res.restricted, undefined, `${msg}：不置 restricted（不得误冻账号）`);
+    assert.equal(res.benign403, true, `${msg}：带 benign403 标记`);
+    assert.equal(res.status, 403);
+    assert.equal(res.code, 50001);
+    assert.equal(res.msg, msg);
+    assert.deepEqual(res.data, { k: 1 });
+    assert.equal(n, 1, `${msg}：403 绝不重试`);
+  }
+});
+
+test("良性 403 之外红线不变：未知 msg / 空 msg / 非 JSON 主体 / 403+11140 仍 restricted 且不重试", async () => {
+  const cases = [
+    { body: { code: 50001, msg: "request illegal" }, why: "未知 msg" },
+    { body: { code: -1 }, why: "空 msg（信封里没有 msg 字段）" },
+    { body: { code: 50001, msg: "no active buddy!!" }, why: "白名单变体之外" },
+    { body: "no active buddy", why: "非 JSON 主体（没有信封可看）" },
+    { body: { code: 11140, msg: "no active buddy" }, why: "code 11140 不参与白名单 —— 判据一条不动" },
+  ];
+  for (const c of cases) {
+    let n = 0;
+    const res = await callJSON(makeAcct(), "chat", "https://copilot.tencent.com/x", {}, {
+      fetch: async () => {
+        n += 1;
+        return RESP(403, c.body);
+      },
+    });
+    assert.equal(res.ok, false, c.why);
+    assert.equal(res.restricted, true, `${c.why}：仍 restricted`);
+    assert.equal(res.benign403, undefined, `${c.why}：不带 benign 标记`);
+    assert.equal(n, 1, `${c.why}：绝不重试`);
+  }
+});
+
+test("429：与 5xx 同款线性退避重试（重试语义不变）", async () => {
+  const clock = fakeClock(1_700_000_000_000);
+  const sleeps = [];
+  let n = 0;
+  const res = await callJSON(makeAcct(), "chat", "https://copilot.tencent.com/x", {}, {
+    now: clock.now,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      await clock.sleep(ms);
+    },
+    fetch: async () => {
+      n += 1;
+      return RESP(429, { code: 429, msg: "too many requests" });
+    },
+  });
+  assert.equal(res.ok, false);
+  assert.equal(n, 3, "429 重试 3 次");
+  assert.deepEqual(sleeps, [1000, 2000], "线性退避节奏不变");
 });
 
 test("网络错误：线性退避重试 3 次（1s、2s），全部失败后报网络错误", async () => {

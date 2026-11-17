@@ -62,13 +62,32 @@ function makeStub() {
     calls.push({ uid, path: u.pathname, host: u.host, at: clock.now(), body: init.body ?? null });
     if (u.pathname === "/activity/growth/streak") {
       return ok({
-        streak: { days: 6 },
+        streak: { days: 6, makeup_dates: [] },
         makeup_cards: { balance: 1 },
-        redemption_status: { "7d": "available", "14d": "locked", "28d": "claimed" },
+        launch_date: "2026-06-17",
+        // 真机形状（2026-11-16）：状态平铺 + tiers[] 带每档奖励明细 + 平铺计数键
+        redemption_status: {
+          tier_7d_status: "available",
+          tier_14d_status: "locked",
+          tier_28d_status: "claimed",
+          tier_7d_count: 2,
+          tiers: [
+            { tier: "7d", days: 7, credit: 120, energy: 0, cards: 0, chances: 0 },
+            { tier: "14d", days: 14, credit: 300, energy: 5, cards: 1, chances: 1 },
+            { tier: "28d", days: 28, credit: 800, energy: 10, cards: 2, chances: 2 },
+          ],
+        },
       });
     }
+    // 真机形状（2026-11-16）：cells 全量一年 + today{date,...} 服务端今天
+    //（NOW = 2026-10-15 04:00Z = 北京 10-15 正午 → 服务端今天 2026-10-15）
     if (u.pathname === "/activity/growth/heatmap") {
-      return ok({ days: [{ date: YESTERDAY, score: 0 }] });
+      return ok({
+        cells: [{ date: YESTERDAY, score: 0, has_new_buddy: false }],
+        today: { date: "2026-10-15", score: 0, is_active: false, status_text: "未打卡" },
+        range: { start_date: "2025-11-17", end_date: "2026-11-15", days: 365 },
+        updated_at: "2026-10-15T12:00:00+08:00",
+      });
     }
     if (u.pathname === "/activity/growth/lottery/summary") return ok({ chances: 2 });
     if (u.pathname === "/activity/growth/makeup-cards/use") return ok({ days: 6 });
@@ -171,12 +190,12 @@ describe("路由登记与缓存口径", () => {
     assert.equal(j.streak.days, 6);
     assert.equal(j.streak.makeupCards, 1);
     assert.equal(j.streak.lotteryChances, 2);
-    assert.deepEqual(j.streak.heatmap, [{ date: YESTERDAY, score: 0 }]);
+    assert.deepEqual(j.streak.heatmap, [{ date: YESTERDAY, score: 0, raw: 0 }], "格形状 {date, score, raw}");
     assert.deepEqual(j.streak.tiers, [
-      { tier: "7d", status: "available" },
-      { tier: "14d", status: "locked" },
-      { tier: "28d", status: "claimed" },
-    ]);
+      { tier: "7d", status: "available", days: 7, credit: 120, energy: 0, cards: 0, chances: 0, count: 2 },
+      { tier: "14d", status: "locked", days: 14, credit: 300, energy: 5, cards: 1, chances: 1, count: null },
+      { tier: "28d", status: "claimed", days: 28, credit: 800, energy: 10, cards: 2, chances: 2, count: null },
+    ], "档位状态 + 奖励明细（2026-11-16 真机口径）：0 如实 0、上游没给的 count 是 null");
     assert.ok(Number.isFinite(Date.parse(j.streak.updatedISO)));
     assert.equal(stub.calls.length, 3, "恰好 3 次上游（streak/heatmap/lottery）");
     assert.ok(stub.calls.every((c) => c.host === "copilot.tencent.com" && c.uid === UID_OK));
@@ -256,11 +275,17 @@ describe("路由登记与缓存口径", () => {
     // /api/state 的 accounts[].streak 只读投影（不为它打上游）
     // /api/state 的 accounts[].streak 只读投影（不为它打上游）。先强制拉一次
     //（上一条用例预置过过期缓存，投影只认缓存内容）
-    await fetch(`${base()}/api/streak?uid=${UID_OK}&refresh=1`);
+    const fresh = await (await fetch(`${base()}/api/streak?uid=${UID_OK}&refresh=1`)).json();
     const n = stub.calls.length;
     const st = await (await fetch(`${base()}/api/state`)).json();
     const row = st.accounts.find((a) => a.uid === UID_OK);
     assert.ok(row.streak && row.streak.days === 6, "state 投影 streak 缓存");
+    // 奖励明细整段透传（streakProjectionOf 对缓存展开，不白名单挑字段）：
+    // /api/state 里能看到 tiers[] 的五键 + count
+    assert.deepEqual(row.streak.tiers, fresh.streak.tiers, "投影 tiers = /api/streak 的 tiers（含奖励明细）");
+    assert.equal(row.streak.tiers[0].credit, 120, "投影里能看到每档预期积分");
+    assert.equal(row.streak.tiers[0].energy, 0, "0 是合法值原样透传");
+    assert.equal(row.streak.tiers[1].count, null, "上游没给的键如实 null");
     assert.equal(stub.calls.length, n, "/api/state 没有打上游");
     assert.equal(row.frozen, null, "未冻结账号 frozen 为 null");
   });

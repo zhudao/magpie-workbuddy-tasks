@@ -102,6 +102,9 @@ test("看板 CSS：关键选择器都在（规则被吞时这里会红）", () =
     ".heat-grid", // 连登日历网格（0.3.3）
     ".frozen-note", // 冻结总览（0.3.3）
     ".streak-run",
+    ".streak-progress", // 连登投影新增字段行（距下一档 / 今日活跃，B5）
+    ".credits-usage-detail", // 用量明细区块（/api/usage，B6）
+    ".usage-detail-grid", // 按日 / 按模型两列
   ];
   for (const sel of needed) {
     assert.ok(css.includes(sel), `dashboard/style.css 缺少 ${sel} 规则（可能被语法错误吞了）`);

@@ -25,9 +25,12 @@ after(() => {
 })
 
 // fake engine：store 两个账号（u-ck01 健康 / u-ck02 留给冻结用例）；upstream.callJSON
-// 按脚本队列逐个吐信封
-function scriptedEngine(responses) {
+// 按脚本队列逐个吐信封。B1.2 起，签到成功（claimed/done）后 daemon 会重查一次连登
+// 状态（GET /activity/growth/streak）—— 它**不消费**签到回执的脚本队列（独立计数），
+// 回什么由 streakResponse 控制（缺省给一个稳定快照）。
+function scriptedEngine(responses, { streakResponse } = {}) {
   let i = 0
+  let streakQueries = 0
   const acct = (uid, nickname) => ({
     key: uid === "u-ck01" ? "workbuddy" : "workbuddy#ck02",
     provider: "workbuddy",
@@ -55,6 +58,17 @@ function scriptedEngine(responses) {
       webBase: () => "https://www.workbuddy.cn",
       callJSON: async (_acct, kind, url) => {
         const path = new URL(url).pathname
+        if (path === "/activity/growth/streak") {
+          // B1.2 领取后重查（chat 头族）——独立于签到脚本队列
+          assert.equal(kind, "chat")
+          streakQueries += 1
+          return (
+            streakResponse ?? {
+              ok: true, status: 200, code: 0, msg: "",
+              data: { streak: { days: 9, next_tier: "14d", next_tier_remaining: 4 }, total_credits: 1234 },
+            }
+          )
+        }
         assert.equal(path, "/billing/meter/daily-checkin", "签到只打 daily-checkin")
         assert.equal(kind, "billing")
         const next = responses[Math.min(i, responses.length - 1)]
@@ -65,10 +79,11 @@ function scriptedEngine(responses) {
     errors: [],
     ok: true,
     __calls: () => i,
+    __streakQueries: () => streakQueries,
   }
 }
 
-async function boot(responses, { frozen = [] } = {}) {
+async function boot(responses, { frozen = [], streakResponse } = {}) {
   const state = makeSandbox("wb-ck-pending-")
   if (frozen.length) {
     writeFileSync(
@@ -80,7 +95,7 @@ async function boot(responses, { frozen = [] } = {}) {
     key: KEY,
     port: 0,
     stateDir: state.dir,
-    engine: scriptedEngine(responses),
+    engine: scriptedEngine(responses, { streakResponse }),
     noTimers: true,
     skipExistingCheck: true,
   })

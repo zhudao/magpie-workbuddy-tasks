@@ -95,14 +95,19 @@ function makeStub() {
     if (u.pathname === "/activity/growth/streak") {
       if (state.down) return respond(500, { code: -1, msg: "upstream exploded" });
       return ok({
-        streak: { days: 6 },
+        streak: { days: 6, makeup_dates: [] },
         makeup_cards: { balance: 1 },
+        launch_date: "2026-06-17",
         redemption_status: { "7d": "available", "14d": "locked", "28d": "claimed" },
       });
     }
+    // 真机形状（2026-11-16）：cells + today{date}（服务端今天 = 北京 2026-10-15）
     if (u.pathname === "/activity/growth/heatmap") {
       if (state.down) return respond(500, { code: -1, msg: "upstream exploded" });
-      return ok({ days: [{ date: YESTERDAY, score: 0 }] });
+      return ok({
+        cells: [{ date: YESTERDAY, score: 0, has_new_buddy: false }],
+        today: { date: "2026-10-15", score: 0, is_active: false, status_text: "未打卡" },
+      });
     }
     if (u.pathname === "/activity/growth/lottery/summary") {
       if (state.down) return respond(500, { code: -1, msg: "upstream exploded" });

@@ -1659,6 +1659,49 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 }
 .credits-foot .dialog-actions { margin-top: 0; }
 
+/* 用量明细（GET /api/usage）：积分弹窗里的独立只读区块。与 .credits-usage（利用率条）
+   不同 —— 这里按窗口统计「近 N 天消耗 / 按模型分布」，只有手动触发才打上游。 */
+.credits-usage-detail {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.usage-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+}
+.usage-detail-title { margin: 0; font-size: 12.5px; font-weight: 650; color: var(--ink); }
+.usage-detail-tools { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.usage-days-tabs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.usage-detail-note {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink-3);
+}
+.usage-detail-note[hidden] { display: none; }
+.usage-detail-status { margin: 10px 0 0; }
+.usage-detail-body { margin-top: 10px; }
+.usage-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; }
+.usage-block { min-width: 0; }
+.usage-block-title {
+  margin: 0 0 4px;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: .05em;
+  color: var(--ink-3);
+}
+.usage-tbl { min-width: 0; }
+.usage-tbl td { padding-top: 5px; padding-bottom: 5px; }
+.usage-tbl .usage-model-name { color: var(--ink-2); word-break: break-all; }
+.usage-tbl .usage-total td, .usage-tbl .usage-rest td { color: var(--ink-3); }
+.usage-tbl .usage-total td:first-child, .usage-tbl .usage-rest td:first-child { font-weight: 600; }
+.usage-detail-empty { margin: 0; padding: 14px 0; text-align: center; color: var(--ink-3); font-size: 12.5px; }
+
 /* ---- 页脚 -------------------------------------------------------------------------- */
 
 .foot {
@@ -1746,6 +1789,10 @@ dialog::backdrop { background: rgba(8, 10, 14, .5); }
 .streak-note.warn-text { color: var(--warn); }
 .streak-run { color: var(--ink-2); }
 .streak-run.warn-text { color: var(--warn); }
+
+/* 连登投影新增字段行（距下一档 / 今日是否活跃，B5）：字段缺失时整句省略，
+   所以这行只在有内容时出现，不影响正常的两行布局。 */
+.streak-progress { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 账号单元格里的竖排容器：目前只放连登条（原「活动任务条」已从账号行移除，用户 2026-11-13）。 */
 .acct-id-stack {
@@ -2311,6 +2358,8 @@ details[open] > .heat-summary::before { transform: rotate(45deg); margin-top: 0;
   .credits-search { flex: 1 1 170px; width: auto; }
   .credits-sort { flex: 1 1 140px; }
   .credits-usage-meta { align-items: flex-start; }
+  .usage-detail-grid { grid-template-columns: minmax(0, 1fr); }
+  .usage-detail-tools { margin-left: 0; }
 }
 
 @media (max-width: 360px) {

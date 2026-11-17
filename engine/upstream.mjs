@@ -206,6 +206,41 @@ function shortPath(url) {
   }
 }
 
+// ---- 良性 403：已知业务拒绝白名单 ----------------------------------------------
+//
+// 上游把一部分**业务拒绝**也回 HTTP 403，它们不是风控 —— 必须在风控判定**之前**
+// 放行，否则「还没领养猫猫」「兑换档位天数不足」这类常态会把账号误冻（冻结需手动
+// 解冻）。兄弟实现 88lin/workbuddy-auto-signin（MIT）的实测教训（本地只读快照
+// C:\Users\Mcola.Tech\AppData\Local\Temp\wbas-ref\signin.py）：
+//   signin.py:2096「403『连登天数不足』是业务常态，必须**先于** _check_auth 判断」，
+//   其 _check_auth（signin.py:1817-1819）的注释同样是「已知业务 403 由调用方先处理，
+//   其余认证/权限拒绝结束本轮」。
+//
+// 匹配规则：msg 归一（String(msg).trim().toLowerCase()）后与白名单**精确全等**，
+// 绝不模糊包含。注意兄弟实现自己的 _is_tier_locked（signin.py:1527-1536）用的是
+// 子串包含（`"天数不足" in m or "不足" in m`）—— 那会连「权限不足」这类真风控
+// 文案也误命中；我们收紧为全等，宁可少放行，绝不放松红线。
+export const BENIGN_403_MSGS = [
+  // 还没领养猫猫（Buddy）：buddy/travel/depart 的业务拒绝。原文与出处：
+  // signin.py:2213 `if dcode == 403 and msg.strip().lower() == "no active buddy":`
+  //（兄弟实现同样 trim+lower 后全等）。
+  "no active buddy",
+  // 兑换档位未解锁（连登天数不足）：/redeem 的业务拒绝。兄弟实现的原文见
+  // signin.py:1528 docstring「未解锁档位：403 + 『连续登录天数不足』——这是常态，
+  // 不是故障」；README.md:447 同口径（「连登兑换『进阶』未解锁（连登天数不足）｜
+  // 正常……服务端返回 403，脚本按常态处理，不记为失败」）。注意兄弟实现 1536 行
+  // 的匹配是子串「天数不足/不足」，完整上游原文没有实测记录 —— 全等若没覆盖到
+  // 更长的变体，行为与旧版相同（仍 restricted），不会更糟；拿到真机完整 msg 后再补条目。
+  "连续登录天数不足",
+];
+
+// isBenign403Msg(msg)：msg 归一（trim + lower）后与白名单精确全等；空 msg 恒 false。
+export function isBenign403Msg(msg) {
+  const m = String(msg ?? "").trim().toLowerCase();
+  if (!m) return false;
+  return BENIGN_403_MSGS.some((w) => String(w).toLowerCase() === m);
+}
+
 function fallbackUrl(url) {
   // chat 主机失联 → 回退 https://www.workbuddy.cn：只换 host，路径与
   // X-Domain 都不动（CONTRACT §2）。
@@ -241,7 +276,10 @@ async function attempt(fetchImpl, url, method, headers, body, signal) {
 // - opts: {fetch, now, sleep, signal, log, leg, env, base, bases, gap, spacer, __ctx}
 // - 信封：{code, msg, data}，code===0 视为成功（2xx 且 code 0）
 // - 3 次线性退避重试，只重试「瞬时网络故障 / 5xx」（hub 的 _retryable 口径）
-// - HTTP 403 或信封 code 11140 → restricted:true，绝不重试（runner 记冷却）
+// - HTTP 403 或信封 code 11140 → restricted:true，绝不重试（runner 记冷却/冻结）；
+//   例外：403 且 msg 命中已知业务拒绝白名单（BENIGN_403_MSGS，如 "no active
+//   buddy"）→ 不置 restricted，按普通业务失败返回并带 benign403:true —— 见上方
+//   白名单一节的出处与红线。
 // - chat 主机网络级失败 → 最后用 https://www.workbuddy.cn 再试一次，X-Domain 不变
 // - opts.spacer（可选）：本次调用（含重试全程）先经全局节流器排队对齐 ——
 //   跨路径的 ≥gap 间隔与「绝不在途并行」由它保证（铁律 4）
@@ -301,8 +339,21 @@ async function callJSONInto(acct, kind, url, init = {}, opts = {}, ctx = ctxOf(o
     lastText = r.text || "";
 
     if (r.status === 403) {
-      // 账号级风控限制（hub note_restricted：立即停手，绝不换头再试）
       const { env, code } = parseEnvelope(lastText);
+      // 良性 403：已知业务拒绝（白名单见 BENIGN_403_MSGS）—— 不是风控：不置
+      // restricted、不冻结、不重试（403 本就绝不重试），按普通业务错误返回，
+      // benign403:true 供上层区分。兄弟实现教训：这类 403 必须先于风控判定放行
+      //（signin.py:2096/2213），否则没领养猫猫的账号会被整个冻结。
+      // 信封 code 11140 不参与白名单 —— 11140 判据一条不动（红线）。
+      if (code !== 11140 && isBenign403Msg(env?.msg)) {
+        step("benign403", `${method} ${shortPath(url)} HTTP 403 业务拒绝（白名单）: ${env.msg}`);
+        return {
+          ok: false, status: 403, code: code ?? 0, data: env?.data ?? null,
+          msg: env.msg || "HTTP 403", raw: lastText.slice(0, 400), benign403: true,
+        };
+      }
+      // 其余一切 403（含未知 msg、空 msg）：账号级风控限制（hub note_restricted：
+      // 立即停手，绝不换头再试）—— 行为与旧版完全一致，红线不许放松。
       step("restricted", `${method} ${shortPath(url)} HTTP 403${env?.msg ? ` ${env.msg}` : ""}`);
       return {
         ok: false, status: 403, code: code ?? 0, data: env?.data ?? null,

@@ -30,9 +30,11 @@ magpie-workbuddy-tasks/
     miniprogram.mjs      # 微信小程序链式任务（Sequential_Tasks_1–6 + school_season）：
                          # MP_HEADERS / mpBase / MP_REPORT_HEADERS 专属埋点链路
     travel.mjs           # 猫猫旅行闭环 + 夜猫子任务
-    buddy.mjs            # Buddy 盲盒腿（quota → 批量 open；不领积分不加 credit）
+    buddy.mjs            # Buddy 盲盒腿（travel/status 门 → quota → 批量 open；不领积分不加 credit）
     daily.mjs            # 每日活跃上报（点亮成长中心连登；uid→北京日幂等）
     credits.mjs          # 积分余额 + 套餐权益包明细（只读；fetchCredits）
+    usage.mjs            # 积分用量明细（B6 只读；fetchUsageSummary —— prompt 原文在
+                         # 归一化白名单制下丢弃，绝不透传/落盘/回显）
     runner.mjs           # 跨账号批量编排、job 状态与日志、并发闸门
     schedule.mjs         # 小时窗口排程
     constants.mjs        # TASK_SPECS / 事件池 / 上游常量（唯一事实来源）
@@ -82,6 +84,9 @@ webHeaders(acct) -> Record<string,string>          // 领奖回退用，Origin/R
 callJSON(acct, kind, url, init, opts) -> {ok, status, code, data, msg, raw}
   // kind: 'chat'|'billing'|'web'；统一 {code,msg,data} 信封；code===0 为成功
   // 3 次线性退避重试；403/11140 → {restricted:true}（由 runner 冻结账号，§10.5）
+  // 例外（§10.5 良性 403 白名单）：403 且 msg 归一后**精确全等**命中已知业务拒绝
+  // （"no active buddy" / "连续登录天数不足"）→ 不置 restricted，按普通业务失败
+  // 返回并带 benign403:true（绝不模糊包含；白名单外的 403 行为完全不变）
   // chat 主机失败（TLS reset）→ 回退到 https://www.workbuddy.cn，X-Domain 不变
   // 重试/回退也是「两次上游调用」：任意相邻两次 HTTP 尝试间隔 ≥ gap（铁律 4）
 makeSpacer({now, sleep, gap}) -> {run(fn), peekLast()}
@@ -164,13 +169,33 @@ runMiniProgramTasks(acct, opts) -> {ok, logs, earnedCredit, lit, claimed, restri
   //（mp-locks 台账回退）；claimed 优先判断，已领奖不被锁挡「已领奖，跳过」日志
   // opts.onClaimed?(code) —— 每次领奖成功后回调（daemon 记领奖日期；防御异常）
 
-// buddy.mjs —— Buddy 盲盒腿（独立腿，LEG_ORDER 在 travel 之前）
+// buddy.mjs —— Buddy 盲盒腿（独立腿，LEG_ORDER 在 travel 之前）+ B8 选中态
 runBuddyOpen(acct, opts) -> {ok, opened, name?, logs, restricted?}
+  // **0. 旅行状态门（A4）**：开盒会覆盖在途旅行记录（兄弟实现实测）—— 先 GET
+  // /activity/growth/buddy/travel/status，只有 state==="idle" 才往下走；
+  // traveling/arrived/查询失败/state 未知 → ok:true 跳过 + 一行原因日志，绝不发
+  // open（跳过永远比冒险开盒优先；idle 的 daily_limit_reached 是旅行的名额，
+  // 与开盒无关）。
   // GET /v2/activity/growth/buddy/quota 读 affordable/max_open_count；
   // affordable<=0 → ok:true +「成长能量不足以开启 Buddy 盲盒」（不发 open）；
   // count = min(affordable, max(1, max_open_count))，POST open body
   // {count, client_token: randomUUID()}；解析 data.buddy|name|buddies（数组 join）。
   // **不领积分、不加 credit**（结果无 credit 字段）；403/11140 → restricted 透传。
+  // **B8 选中态修复**：open 被 "no active buddy" 拒绝 → repairActiveBuddy（§10.9）
+  //   后重试一次；没失败绝不发 switch。
+buddyListOf(acct, opts) -> {ok, current: instance_id|null,
+                            instances:[{instance_id,name,rarity,current,source,acquiredAtMs}],
+                            logs, error?, restricted?}
+  // 只读探测（info + list，互不阻断、任一失败按缺失处理并记日志）；list 失败
+  // → ok:false（三态诊断的依据没了，绝不把「查不到」当「没有」）
+pickBuddyToSelect(instances) -> 实例|null
+  // 纯函数：优先 source==="gacha" → 最早 acquired_at → 取不到第一个
+repairActiveBuddy(acct, opts) -> {state:"none"|"switched"|"switch_failed"|
+                                  "already_selected"|"list_failed", ...}
+  // 修理性选中态修复，**只在 travel/buddy 两腿拿到 "no active buddy" 拒绝后调用**
+  //（三态诊断见 §10.9）；restricted 透传
+isNoActiveBuddyMsg(msg) -> bool
+  // trim+lower 后与 "no active buddy" 精确全等（绝不模糊包含，§10.5 同款教训）
 
 // daily.mjs
 beijingDayKey(nowMs) -> "YYYY-MM-DD"      // 北京日键（UTC+8；UTC 16:00 翻日）
@@ -220,6 +245,28 @@ beijingTextToMs(text) -> ms|null                 // naive 字符串按 +08:00 �
 tierFromSummary(data) -> {paid,package,packageCode,protectedPrice,trial}|null
                                                  // 无 IsPaidUser 字段 → null（「没答上来」绝不记成「免费」）
 
+// usage.mjs —— 积分用量明细（B6，只读；**隐私红线**：上游行的 input/inputTrunc
+// 字段是 prompt 原文 —— 归一化白名单制显式丢弃，绝不透传/落盘/回显）
+beijingTimeStr(ms) -> "YYYY-MM-DD HH:MM:SS"      // = credits.epochToBeijingText（北京时间，秒精度）
+usageWindow(days, nowMs) -> {startTime, endTime}
+  // 「最近 N 天（含北京今天）」窗口：北京今天 -(N-1) 天 00:00:00 ～ 北京的现在
+fetchRequestUsage(acct, {startTime, endTime, pageSize=100, maxPages=10}, opts)
+  -> {ok:true, rows, pages, total?, truncated?} | {ok:false, error, needRelogin?}
+  // POST {bill}/billing/meter/get-user-request-usage body {startTime,endTime,
+  // pageNum,pageSize}（北京时间、秒精度、camelCase）；外壳 = data.total + data.data[]
+  //（真机实测，见 §7）；翻页判据 = total > pageNum*pageSize（total 未知退回
+  // 「整页才继续」启发式，「不足一页」提前停）；达 maxPages 仍未到底 → truncated:
+  // true；行归一化白名单 = {requestId, credit, model, client, agentPurpose,
+  // requestTime}（六字段，input/inputTrunc 在此丢弃）；外壳全不命中时 error 带
+  // 「实际外壳键 + 已试路径」；中途失败不带回半截 rows
+summarizeUsage(rows, {tz="+08:00"}) -> {totalCredit, count, unparsed,
+                                        days:[{date,credit,count}], models:[{model,credit,count}]}
+  // 纯函数；按**北京日**分桶（requestTime 是北京时间字符串，日期段即北京日）；
+  // requestTime 解析失败的行只计入总数不参与分桶（unparsed 计数）；days 日期升序、
+  // models 按 credit 降序（输出稳定，前端直接渲染）
+fetchUsageSummary(acct, {days=7}, opts) -> daemon /api/usage 的引擎出口
+  // 窗口 + 拉取 + 汇总；usage.days 是分桶数组（窗口长度在返回值顶层 windowDays）
+
 // taskkind.mjs —— 任务 → kind 解析（fetchTasks 的 unforgeable/reason、流水线的
 // 接取/点亮决策、daemon.snapTask 的 6 个下发字段，全部出自这里的唯一判断源）
 resolveTaskKind(t) -> { source: "spec"|"mp"|"jump_url"|"none", kind, spec,
@@ -237,7 +284,8 @@ resolveTaskKind(t) -> { source: "spec"|"mp"|"jump_url"|"none", kind, spec,
   //        ③ 未命中但 jump_url 能解出 expertId=ex_… → expert 类可点亮，
   //          事件 id 钉在解析出的 id 上（expertType=agent，沿用 expert_actual_use）
   //        ④ 未命中且派生不出 → unforgeable:true + reason:"未收录任务"，
-  //          绝不进接取批次（防「接了一大堆却一项不亮、领奖报 task not completed」）
+  //          绝不进接取批次（防「接了一大堆却一项不亮、领奖报 task not completed」）；
+  //          上游显示已完成时只领奖（§7 只领奖兜底，不伪造进度）
 deriveExpertIdFromJumpUrl(jumpUrl) -> string  // URL 解码后取 expertId=ex_…；解不出 ""
 expertNameFromTitle(title) -> string           // 任务标题「」内的专家名（事件展示字段）
   // opts: {gap=1000, claim=true, log(fn), sleep(fn), signal}
@@ -556,6 +604,43 @@ GET  /api/credits?uid=<uid>&refresh=0|1
                                     //   · 上游失败 → 200 {ok:false,...,needRelogin?}，旧缓存保留
                                     //     （不清掉）并随响应一并带回（credits 字段，若有）；
                                     //   · 拉取成功后广播 SSE {kind:"credits", uid}（可选，前端不依赖）。
+GET  /api/usage?uid=<uid>&days=<1-90>&refresh=0|1
+                                    -> 200 {ok:true, uid, nickname, days:<窗口长度>,
+                                            usage:{startTime, endTime, totalCredit, count,
+                                                   unparsed, days:[{date,credit,count}],
+                                                   models:[{model,credit,count}], truncated?,
+                                                   updatedAt, updatedISO}}
+                                    | 200 {ok:false, uid, nickname, days, error,
+                                           needRelogin?, usage?<旧缓存>}
+                                    | 400 {error:"days 必须是 1–90 的整数"}
+                                    | 404 {error}   // uid 缺省 = 第一个可参与账号；找不到 / API key /
+                                                    //   已停用 → 与 /api/credits 同一段 404 文案；
+                                                    //   企业版同 /api/credits 的专属文案
+                                    | 409 {error:"busy"} | 503 {error}   // 同 /api/credits
+                                    // 积分用量明细（B6，前端唯一依据，engine/usage.mjs）：
+                                    //   · 请求：uid 缺省 = 第一个可参与账号；days 限 1–90（缺省 7），
+                                    //     表示「最近 N 天（含北京今天）」；refresh=1/true/yes 无视 TTL；
+                                    //   · usage.days 是**北京日分桶数组** [{date:"YYYY-MM-DD",
+                                    //     credit,count}]（日期升序；「命名约定」——窗口长度在响应顶层
+                                    //     的 days，两者刻意同名不同义，别混）；usage.models 按
+                                    //     credit 降序；usage.count/unparsed 是行数与 requestTime
+                                    //     解析失败行数（解析失败的行只计入总数不参与分桶）；
+                                    //   · usage.startTime/endTime = 查询窗口两端（北京时间
+                                    //     "YYYY-MM-DD HH:MM:SS"，北京今天 -(N-1) 天 00:00:00 ～ 现在）；
+                                    //   · truncated:true = 上游翻页达上限（10 页 × 100 行）仍未到底，
+                                    //     结果可能不完整（如实标记，绝不静默截断）；
+                                    //   · **隐私红线**：上游行的 input/inputTrunc 字段是 prompt 原文，
+                                    //     引擎归一化时已显式丢弃（engine/usage.mjs 白名单制）——本响应、
+                                    //     state/usage.json 落盘、日志里都只可能出现聚合字段，前端不得
+                                    //     也不需要请求原文；
+                                    //   · 缓存 state/usage.json（{uid:{days,summary,updatedAt,
+                                    //     updatedISO}}），TTL 10 分钟（CREDITS_TTL_MS，与 /api/credits
+                                    //     同口径）；**days 是缓存键的一部分**（days 不同 = 没有对应
+                                    //     缓存，直接重新拉）；缓存命中绝不打上游；job 在跑时
+                                    //     refresh=1 → 409（同 credits）；有缓存且未 refresh 时
+                                    //     直接回缓存（哪怕已过期）；
+                                    //   · **只有显式请求才打上游**：/api/state 绝不顺带调用它，
+                                    //     也没有 accounts[].usage 投影（看板需要时自己 GET 本路由）。
 GET  /api/history?limit=200     -> 每次尝试一行（对齐 hub 的 /activity/history）
                                     // 行的 trigger 口径：来自 job.spec.trigger（"schedule" |
                                     // "manual"），看板「触发」列据此显示 排程/手动 —— 触发方式
@@ -631,17 +716,35 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
 - 聊天侧：`GET {chat}/v2/activity/growth/tasks`、`POST .../tasks/accept`（`{task_codes:[...]}`，20 一批）、
   `POST {chat}/activity/growth/tasks/{code}/claim`（HTTP 400「task not completed」→ 试一次 web 回退）、
   `POST {chat}/v2/report`（**body 是事件数组**）、`GET {chat}/v2/activity/growth/energy`、
-  `GET {chat}/activity/growth/streak`、`GET {chat}/activity/growth/heatmap`、
-  `POST {chat}/activity/growth/makeup-cards/use`、`GET .../lottery/summary`、`POST .../lottery/draw`、`POST .../redeem`、
+  `GET {chat}/activity/growth/streak`（另有 `data.streak.makeup_dates` / `data.launch_date` /
+  `data.streak.next_tier|next_tier_remaining` / `data.makeup_cards.max` / 
+  `data.redemption_status.remaining_days`，2026-11-16 真机实测）、
+  `GET {chat}/activity/growth/heatmap`（`data.cells` 365 格全量一年 + `data.today{date,score,
+  is_active,status_text}` 服务端今天）、
+  `POST {chat}/activity/growth/makeup-cards/use`、`GET .../lottery/summary`（**B2 回退源
+  `/activity/growth/lottery/chances` 的 `data.balance`，真机两源一致**）、`POST .../lottery/draw`、`POST .../redeem`、
   猫猫：`GET .../buddy/travel/status|config`、`POST .../buddy/travel/depart`（body `{location_id}`）、`POST .../buddy/travel/claim`。
+- **Buddy 选中态（B8，engine/buddy.mjs）**：`GET {chat}/activity/growth/buddy/info` →
+  `data.buddy{instance_id,name,personality,rarity,...}`（**这就是当前选中的 Buddy**）、
+  `GET {chat}/activity/growth/buddy/list` → `data.buddies[]`、`data.count`（每项含
+  `current_buddy`(bool)、`instance_id`、`template_id`、`source("gacha")`、`acquired_at`、
+  `rarity`；2026-11-16 真机实测）；`POST {chat}/activity/growth/buddy/switch` body
+  `{instance_id}`（⚠️ **body 形状来自 WorkDaddy 参考、尚未真机验证** —— 上游若要求
+  别的键名会失败并如实报错，绝不静默换形重试）。选中态口径见 §10.9。
 - **Buddy 盲盒（engine/buddy.mjs，独立腿，消耗成长能量）**：
+  **先过旅行状态门（A4）**：`GET {chat}/activity/growth/buddy/travel/status` 读
+  `data.state` —— **开盒会覆盖在途旅行记录**（兄弟实现实测），只有 `idle` 才开；
+  `traveling`/`arrived`/查询失败/未知 state 一律 ok:true 跳过并写明原因，绝不发
+  open（跳过永远比冒险开盒优先；idle 的 `daily_limit_reached` 是旅行的每日名额，
+  与开盒无关）。然后
   `GET {chat}/v2/activity/growth/buddy/quota` → `data.affordable`（还能开几个）/
   `data.max_open_count`（单次上限）；`affordable<=0` → ok:true +「成长能量不足以开启
   Buddy 盲盒」，**绝不发 open**。`count = min(affordable, max(1, max_open_count))`，
   `POST {chat}/v2/activity/growth/buddy/open` body `{count, client_token:<randomUUID>}`；
   成功解析 `data.buddy || data.name || data.buddies`（数组 join）。**不领积分、不加
   credit**——本腿的产物只有 logs/opened。403/11140 → restricted 透传（runner 冻结账号，§10.5）。
-  腿顺序在 travel 之前（开出的 Buddy 可被旅行使用）；排程窗口可配但默认
+  腿顺序在 travel 之前（开出的 Buddy 可被旅行使用）；A4 状态门已保证开盒只发生在
+  idle，腿序无需调整；排程窗口可配但默认
   `hours.buddy=[]`（不给明确授权绝不自动花能量）。
 - **微信小程序链式任务（engine/miniprogram.mjs，Sequential_Tasks_1–6 + school_season）**：
   清单/接取/领奖走同一批 growth 端点但带 **MP_HEADERS**（`X-Client-Platform:
@@ -711,8 +814,25 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
     lockedCodes 台账任一命中即跳，claimed 优先判断不被锁挡「已领奖」日志；
   - 投影：snapTask(t, lock) → `locked/lockedUntil/lockHint` 三字段始终下发（§3），
     锁定项 canAccept=false。
-- 计费侧：`POST {bill}/billing/meter/claim-gift|claim-compensation`、`POST {bill}/v2/billing/meter/daily-checkin`、
-  `POST {chat}/v2/billing/meter/checkin-activity-status`。
+- 计费侧：`POST {bill}/billing/meter/claim-gift|claim-compensation`、
+  `POST {bill}/billing/meter/daily-checkin`（**B1 兜底链**：404/网络失败才换
+  `{bill}/v2/billing/meter/daily-checkin`，再不行两域互换一次，见 §10.4）、
+  `POST {chat}/v2/billing/meter/checkin-activity-status`（**待验证，暂不接入** ——
+  语义未实测可能是写操作，绝不盲发，§10.4）。
+- **积分用量明细（B6，只读）**：`POST {bill}/billing/meter/get-user-request-usage`
+  body `{startTime:"YYYY-MM-DD HH:MM:SS", endTime:同, pageNum, pageSize}`
+  （**北京时间、秒精度、camelCase**）。**响应外壳（2026-11-16 二次真机实测，与
+  get-user-resource 的腾讯云 PascalCase 壳不同族）**：`data.total`（number，命中总数，
+  **唯一的「还有没有下一页」依据** —— 翻页判据 `total > pageNum*pageSize`，没有
+  pageNum 回显/hasMore/totalPages）+ `data.data[]`（行数组）。行 = `requestId(string),
+  credit(number 浮点), model, client, requestTime(19 位**北京时间裸串** "YYYY-MM-DD
+  HH:MM:SS"), agentPurpose, appType, subscribeType` **以及 `input`/`inputTrunc`
+  = prompt 原文** —— 归一化白名单制只保留前六字段，**input/inputTrunc 一律丢弃**
+  （隐私红线，绝不透传/落盘/回显，engine/usage.mjs 文件头）；requestTime 分桶手工拆
+  日期段即北京日（绝不过 new Date() 的宿主时区，UTC 容器会串日；带偏移 ISO 也认）。
+  行提取以 `data.data` 为准、旧猜测外壳链（`Response.Data.Records` 等）兜底；外壳
+  全不命中时 error 带「实际外壳键 + 已试路径」（`外壳形状不符：data 键=[…]，
+  已试路径=[…]`）。路由与缓存口径见 §3 `/api/usage`。
 - **积分余额（只读，engine/credits.mjs，wb_accounts._fetch_credits_cn_detailed 口径）**：
   `POST {bill}/billing/meter/get-user-resource-summary`（body `"{}"`）、
   `POST {bill}/billing/meter/get-user-resource-free-packages`（`{PackageCodes,PageNumber:1,PageSize:200,Status:[0]}`）、
@@ -744,19 +864,46 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
      （上游按 `(eventCode,id)` 去重，池子里的通用 id 对它不推进进度 —— Valorant 同款坑），
      `expertType` 用 `agent`，事件其余字段沿用 `expert_actual_use` 形状；专家名从任务
      标题「」内提取（仅展示字段，进度只看 id）；
-  4. 未命中且派生不出 → `unforgeable:true` + `reason:"未收录任务"`：不接取、不上报、
-     不领奖，**绝不放进批量接取批次**（否则「接了一大堆却一项不亮、领奖报
-     task not completed」）；`desktopOnly`/`canAccept`/`canLight`/`pinnedExpertId`
+  4. 未命中且派生不出 → `unforgeable:true` + `reason:"未收录任务"`：不接取、不上报；
+     但上游显示已完成时**只领奖**（不伪造进度，见下方「只领奖兜底」），**绝不放进
+     批量接取批次**（否则「接了一大堆却一项不亮、领奖报 task not completed」）；
+     `desktopOnly`/`canAccept`/`canLight`/`pinnedExpertId`
      随 daemon 投影下发给前端（§3）。
+- **只领奖兜底（0.3.9，progressTask 的 claimOnly；源自 88lin/workbuddy-auto-signin
+  的通用领奖兜底，MIT，只取行为）**：未收录（rule 4）与 `unforgeable`
+  （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）两类任务的流程在领奖之前
+  就 early-return —— 用户自己手动完成、上游 `acceptStatus === "completed"`（或
+  `current >= target`）的任务此前永远不领奖，上游上新任务码同样漏领。兜底口径：
+  **任何**非 mp 任务只要上游显示已完成且 `claim` 开关为真，就调一次既有
+  `claimTask`（绝不发 `tasks/accept`、绝不发 `v2/report`，不伪造进度这条红线不动）；
+  记账沿用领奖回执的 `credit`/`energy`；失败按上游 reason 如实记一行日志、不判失败
+  不抛错；`restricted` 照旧透传（风控不被兜底吞掉）；`claim:false` 时保持既有口径
+  只记「已达成，等待手动领取」；没完成时仍按原样记「跳过」。
+  **mp 任务不纳入兜底**：小程序链式任务的接取/点亮/领奖都在 miniprogram 模块的
+  小程序头族链路（`runMiniProgramTasks` 自己会对上游已完成的任务领奖），web 侧绝不
+  代领。兜底的价值：上游上新任务码不漏领 / 用户手动完成的任务能自动到账。
+- **权威奖励值口径（`TASK_SPECS.reward` 的使用面，全仓核实 2026-11-17）**：
+  `spec.reward` 只在两处被读 —— `fetchTasks`（engine/tasks.mjs）与 `fetchMPTasks`
+  （engine/miniprogram.mjs）归一 `rewardCredit` 时当上游快照缺 `reward_credit` 的
+  **展示兜底**，随后仅进 daemon 快照投影与看板 `rewardCell` 文案；引擎的**记账**
+  （`runGrowthTasks`/`finishSpecialTask`/`grantedOf` 族）全部走领奖回执的
+  `credit`/`energy`，没有任何记账/统计读 `spec.reward`。因此：**权威奖励值以上游
+  快照 `reward_credit` 与领奖回执为准，`TASK_SPECS.reward` 仅兜底文案**（不因一次
+  观测就批量改常量）。
 - **连登/能量字段口径（P1，2026-10-31 两真实账号只读实测）**：
   `GET /v2/activity/growth/energy` → `data.balance`（data 里另有 total_consumed/
   total_earned，没有 energy/value 键）；
   `GET /activity/growth/streak` → `data.streak.days`（`makeup_cards.balance`、
-  `redemption_status` 同层；data 顶层没有 days/streakDays 键）。连登为 0 是真实值
+  `redemption_status` 同层；data 顶层没有 days/streakDays 键）。2026-11-16 真机补充：
+  同层还有 `streak.next_tier`（如 "28d"）/ `streak.next_tier_remaining`（数字，天）/
+  `streak.makeup_dates`（数组，**已补签日期**，A2 排除已补断点用）/ 顶层
+  `launch_date`（活动上线日）/ `makeup_cards.max`（余额上限 4）。连登为 0 是真实值
   （`streak.days` 与 `month_total_days` 是两个字段，前者才是连登天数）。
   daemon 快照读同一路径，不做多拼写回退链。
 - DESKTOP_ONLY 任务（目前只剩 `Buddy_App_QQ`）与 `unforgeable`
-  （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）不上报、接不上，只展示 `jump_url`。
+  （`wb_wechat_oa_subscribe_task`/`Expert_Philanthropy`）不上报、接不上，只展示
+  `jump_url`；但上游显示已完成时走只领奖兜底（见上）—— `Buddy_App_QQ` 本就在领奖
+  段（完成判断先于 desktopOnly 检查），行为不变。
   **`Buddy_App` 不在此列**（2026-11-06 实测）：5 条 `buddyapp_*` 事件 + 桌面指纹一次上报，
   进度 0→1 并领奖 +100，见 `buildEvent` 的 `kind:"buddy5"` 与 `reportBuddy5Events`。
   **`Library_read` 不在此列**（2026-11 修正）：它由 web 端的一次元素点击事件点亮 ——
@@ -873,9 +1020,15 @@ workbuddy_tasks_claim(uid, code)          -> 单个领奖
   批次）、快照 energy/streak 只认 data.balance / data.streak.days（毒键不误读）；
 - store：回写只改 access/refresh/expires，保留未知字段，产出合法 JSON 且权限 600；
 - runner：两个 `start()` → 第二个 409；`stop()` 能在步骤边界中止；
-- Buddy 盲盒（engine/buddy.mjs）：quota/open 两跳的批量口径（count=min）、能量
+- Buddy 盲盒（engine/buddy.mjs）：A4 旅行状态门（traveling/arrived/查询失败/未知
+  state 四类分支跳过且零 open 请求、日志说明原因；idle 放行）、quota/open 两跳的批量口径（count=min）、能量
   不足零开盒请求、restricted 透传、不领积分；runner 腿顺序 growth→mp→streak→buddy→travel→night（0.3.3 起含 streak）
   （乱序入参归一、未知腿剔除）、buddy 步骤 detail=最后一条日志且 credit=0；
+- 连登管家补签目标选择（A2，tests/streak.test.mjs）：候选 = 当月 / 服务端 today 之前 /
+  score 明确 0 / 不在 makeup_dates / 不早于上线边界（launch_date|2026-06-17）取最近
+  一天；makeup_dates 含最近断点 → 跳过补更早；上月/上线前不选；服务端 today 与本机
+  差一天以服务端为准（两个方向）；无 0 分格 / 余额 0 / 日历为空 / today 缺失均零请求
+  且日志原因互不混淆；多断点一轮只补 1 张；
 - 小程序链式任务（engine/miniprogram.mjs）：MP 头族与 mpBase 逐字断言、per-code
   事件族（1/3/6/school/2/4/5；Sequential_Tasks_7 无事件）、claimed/completed/
   not_accepted 三态、codes 交集过滤（交集为空零上游）、≥1s 节流、runGrowthTasks
@@ -1001,9 +1154,9 @@ hub `v2.1.0`「11140 命中后直接封禁账号」、hub `TASK_SPECS` 新增 4 
 
 | 用途 | 方法 | 路径 | body |
 | --- | --- | --- | --- |
-| 连登日历 | GET | `{chat}/activity/growth/heatmap` | — （**真实外壳 `data.cells:[{date,score}]`**，2026-11-11 实测） |
-| 连登状态 | GET | `{chat}/activity/growth/streak` | — （**`data.streak.days` / `data.makeup_cards.balance` / `data.redemption_status`**，实测） |
-| 补签昨日 | POST | `{chat}/activity/growth/makeup-cards/use` | `{target_date:"YYYY-MM-DD"}` |
+| 连登日历 | GET | `{chat}/activity/growth/heatmap` | — （**真实外壳 `data.cells:[{date,score}]` 365 格全量一年 + `data.today{date,…}` 服务端今天**，2026-11-11 / 2026-11-16 实测；~~近 28 天~~ 的旧注释作废） |
+| 连登状态 | GET | `{chat}/activity/growth/streak` | — （**`data.streak.days` / `data.makeup_cards.balance` / `data.streak.makeup_dates` / `data.launch_date` / `data.redemption_status`**，实测） |
+| 补签断点 | POST | `{chat}/activity/growth/makeup-cards/use` | `{target_date:"YYYY-MM-DD"}`（A2：选中的断点日，不再恒为昨日） |
 | 档位兑换 | POST | `{chat}/activity/growth/redeem` | `{tier:"7d"\|"14d"\|"28d", client_token:<uuid>}` |
 | 抽奖次数 | GET | `{chat}/activity/growth/lottery/summary` | — |
 | 抽奖 | POST | `{chat}/activity/growth/lottery/draw` | `{client_token:<uuid>}` |
@@ -1011,30 +1164,76 @@ hub `v2.1.0`「11140 命中后直接封禁账号」、hub `TASK_SPECS` 新增 4 
 | 活动补偿 | POST | `{bill}/billing/meter/claim-compensation` | `{}` |
 
 `client_token` 用 `node:crypto` 的 `randomUUID()`（与 `engine/buddy.mjs` 同款）。
-`target_date` = **北京昨日** = `beijingDayKey(now - 86400000)`（复用 `engine/daily.mjs`）。
+`target_date` = **A2 选中的断点日**（`makeupTargetOf`：当月 / 服务端今天之前 /
+score 明确 0 / 不在 `makeup_dates` / 不早于上线边界里**最近的一天**；服务端今天取
+`heatmap.data.today.date`，绝不用本机时区推日期当边界）。
 
 执行顺序（每次调用之间自然受 ≥1s 全局节流约束）：**补签 → 礼包/补偿 → 档位兑换 → 抽奖**。
 
 ```js
-// 只读：连登天数 / 补签卡 / 抽奖次数 / 连登日历（上游给一整年）/ 档位状态
+// 只读：连登天数 / 补签卡 / 抽奖次数 / 连登日历（上游给一整年）/ 档位状态 /
+//       服务端今天 / 已补签日期 / 活动上线日
 export async function fetchStreakState(acct, opts = {})
 // -> {ok:true, days:number, makeupCards:number, lotteryChances:number,
-//     heatmap:[{date:"YYYY-MM-DD", score:number}],   // 上游一次回一整年（365 格，实测）
-//     tiers:[{tier:"7d"|"14d"|"28d", status:string}],
+//     heatmap:[{date:"YYYY-MM-DD", score:number|null, raw}],   // score = 可判定性归一
+//              // 的数字或 null（脏/缺失/不可判定 → null）；raw = 上游 score 原值。
+//              // 上游一次回一整年（365 格，实测）
+//     today:"YYYY-MM-DD",         // 服务端今天 = heatmap data.today.date（缺失 ""）
+//     makeupDates:["YYYY-MM-DD"], // 已补签日期 = streak data.streak.makeup_dates（非数组 []）
+//     launchDate:"YYYY-MM-DD",    // 活动上线日 = streak data.launch_date 原样（缺失 ""）
+//     nextTier:string,            // B5 投影：data.streak.next_tier（如 "28d"，缺失 ""）
+//     nextTierRemaining:number|null, // B5 投影：data.streak.next_tier_remaining（天；缺失/非数字/null）
+//     remainingDays:number|null,  // B5 投影：redemption_status.remaining_days（缺失/非数字 → null）
+//     todayActive:{active:boolean|null, statusText:string}|null,
+//                                 // B5 投影：heatmap data.today.is_active/status_text
+//                                 //（is_active 非真布尔 → active:null；heatmap 查询失败 → 整个 null）
+//     lotterySource:"summary"|"chances"|"", // B2：抽奖次数来自哪个上游源（诊断用；两源都失败 ""）
+//     tiers:[{tier:"7d"|"14d"|"28d", status:string,
+//             days:number|null, credit:number|null, energy:number|null,
+//             cards:number|null, chances:number|null, count:number|null}],
+//                                 // status 口径不变（平铺 tier_<档>_status 优先）；
+//                                 // days/credit/energy/cards/chances 合并自
+//                                 // redemption_status.tiers[] 项（2026-11-16 真机
+//                                 // 口径），count 收平铺 tier_<档>_count；上游没给/
+//                                 // 形状异常/脏值 → null（0 是合法值，与「上游没说」
+//                                 // 可区分，看板据此隐藏），绝不报错、绝不猜
 //     updatedISO:string}
 //    任一子请求失败不影响其余字段（缺省 0 / []），全部失败 -> {ok:false, error}
+//    **B2 抽奖次数双源**：/lottery/summary 拿不到 → 回退 GET /activity/growth/lottery/
+//    chances 的 data.balance（真机 2026-11-16 实测两源一致）；两个来源都失败才按未知
+//    （0 + lotterySource:""）处理
 export async function runStreakSteward(acct, opts = {})
 // -> {ok:boolean, earned:number, restricted?:true, streak:<fetchStreakState 结果>,
 //     logs:string[],
 //     actions:{makeup:{used:boolean, date:string},
 //              gifts:[{key:"claim-gift"|"claim-compensation", name:string, credit:number}],
 //              redeemed:["7d"|"14d"|"28d"], drawn:number}}
+// 奖励回执解析 grantedOf(data)：兑换实发字段带 _granted 后缀（credit_granted /
+// energy_granted / cards_granted / chances_granted，兄弟实现实测），新字段优先、
+// 老字段（credit/energy/cards/chances）兜底，Number(...)||0。补签卡 makeupCardsOf：
+// data.makeup_cards 对象（.balance）或裸数字两形状都认，非有限/负数 → 0。
+// 补签目标选择 makeupTargetOf(state)：候选 = 当月 / 服务端今天之前 / score 明确 0 /
+// 不在 makeup_dates / 不早于 max(月初, launch_date|LAUNCH_DATE_FALLBACK) → 最近一天；
+// 返回 {date, reason}（date="" 表示本轮不补，reason 说明原因，见下）。
 ```
 
 幂等与静默跳过（hub 逐字口径，**全部不报错、只写一行说明**）：
-- 昨日 `heatmap` 格 `score === 0` 且 `makeup_cards.balance > 0` 才补签；否则不碰。
+- **补签目标选择（A2）**：候选 = 当月（服务端今天的年月）∧ 服务端今天之前 ∧
+  `score` 明确 `0` ∧ 不在 `streak.makeup_dates`（已补过的是历史不是待办）∧ 不早于
+  `max(月初, launch_date|2026-06-17)`，取**最近的一天**，每轮**最多补 1 张卡**
+  （兄弟实现 MAKEUP_MAX_PER_RUN=1 同口径 —— 补签会改变连登天数，一张一张来，
+  下轮重新拿最新日历/余额）。`makeupCards > 0` 才发请求。`score:null`（脏数据/
+  缺失/不可判定，`cellScoreOf` 归一）天然不进候选 —— 宁可少补，绝不误花补签卡；
+  绝不补日历里没有明确 0 分格的日子（没依据就不猜）。没补时日志写明是哪种原因：
+  「日历里没有 0 分格（无需补签）」「最近断点 X 已补过」「日历为空」「today.date
+  缺失」「早于可补边界」「余额为 0」—— **「无需补签」与「日历读不到」绝不混为一谈**。
 - 档位 `status` 为 `locked` / `claimed` 跳过；其余（如 `available`）才兑换。
 - `lottery/summary` 的 `chances` 为 0 不抽；每次抽奖之间仍走全局节流，不额外 sleep。
+- **抽奖回执 B2**：`data.need_address === true` 或 `data.require_address === true` →
+  日志/回执提示「中实物奖，需到成长中心填收件信息」（插件不代填、不为此多发请求）；
+  抽奖被拒且 msg 命中 `insufficient` + `chance`（如 "insufficient lottery chance
+  balance" 类 400）→ **视为常态不记失败**，日志写「抽奖次数余额不足…本轮停」
+  （「失败」字样绝不出现）—— 次数口径对不上/刚被别处消费是正常现象。
 - 礼包/补偿业务拒绝（「已领取过」等）静默，只有 `code === 0` 且 `credit > 0` 才计入 `actions.gifts`。
 - 企业版账号（`acct.enterpriseId` 非空）/ API key 账号：直接 `{ok:true, logs:["企业版账号无成长体系，跳过"]}`，一个上游请求都不发。
 - **绝不抛**；`restricted`（HTTP 403 / code 11140）透传，由调用方走 §10.5 冻结。
@@ -1066,7 +1265,11 @@ POST /api/account/unfreeze  {"uid":"…"} 或 {"uids":["…"]}
 
 ### 10.3 `/api/state` 新增字段（前端唯一依赖）
 
-- `accounts[i].streak`：`10.1 的 state 形状` | `null`（只读投影 `state/streak.json`）。
+- `accounts[i].streak`：`10.1 的 state 形状` | `null`（只读投影 `state/streak.json`，
+  经 `streakProjectionOf` 补 B5 新字段缺省 —— **B5（2026-11-16 起）**：投影里必有
+  `nextTier`（"" 缺省）/ `nextTierRemaining`（null 缺省）/ `remainingDays`（null 缺省）/
+  `todayActive`（`{active:boolean|null, statusText}` | null 缺省）。旧缓存/假引擎没有
+  这些字段时按缺省补齐；**绝不为投影打上游**（数据源仍是缓存快照）。
 - `accounts[i].frozen`：`{at:ISO, code:number|string, message:string}` | `null`。
 - 顶层 `frozen`：`[{uid, nickname, at, code, message}]`（冻结总览，替代原 `scheduler.holds`）。
 - `settings.hours.streak`：`number[]`，**默认 `[]`（留空 = 不排程）**，与 mp/buddy/travel/night 同规则；
@@ -1076,7 +1279,7 @@ POST /api/account/unfreeze  {"uid":"…"} 或 {"uids":["…"]}
   （runner 的 `LEG_ORDER` 同序）。**手动默认腿新增 `streak`**：`DEFAULT_SETTINGS.legs = ["growth","streak","travel"]`
   （连登管家是纯收益且幂等，默认做；已在 settings.json 里存过 legs 的实例不受影响）。
 
-### 10.4 `/api/checkin` 回执细分（hub #596）
+### 10.4 `/api/checkin` 回执细分（hub #596）+ B1 签到健壮性
 
 `outcome` 取值扩为 `"claimed" | "done" | "pending" | "failed"`（旧两值语义不变）：
 
@@ -1088,12 +1291,51 @@ POST /api/account/unfreeze  {"uid":"…"} 或 {"uids":["…"]}
 - 其他 code → `failed`。
 - 「失败」是唯一硬词，`不足`（如「距离 7 天奖励还不足」）**不得**判失败。
 
+**B1 签到兜底链（daemon.checkinCall）**：签到请求在主路径 **HTTP 404 / 网络层失败**
+（callJSON 的 `error` 字段，即 3 次重试全灭）时按顺序换候选，最多 4 个：
+
+1. `{bill}/billing/meter/daily-checkin`（主路径，旧版行为）
+2. `{bill}/v2/billing/meter/daily-checkin`（兄弟实现拼法）
+3. `https://www.workbuddy.cn/billing/meter/daily-checkin`（域兜底：**workbuddy.cn ↔
+   codebuddy.cn 两域互换一次**；billBase() 不是这两个域时不兜）
+4. `https://www.workbuddy.cn/v2/billing/meter/daily-checkin`
+
+- **只有 404 / 连接失败才换**：401 / 403 / 11140 / 业务码（含 10001 已签到、pending 词）
+  一律不换 —— restricted / needRelogin / pending 的既有口径原样保留。
+- 候选之间 ≥1s（`sleepFn(1000)` + engineOpts 全局节流器，铁律 4 对整条链成立）。
+- 命中非主候选 → 回执条目带 **`via`**（实际使用的路径），如实告知用户走了兜底。
+- 本插件**不解析账号 JWT 的 iss**（凭据不出守护进程、绝不解码 JWT）—— 域兜底就是
+  两个已知国内域互换，不做 iss 推断。
+- **`POST {chat}/v2/billing/meter/checkin-activity-status`：待验证，暂不接入** ——
+  该端点语义未实测（可能是写操作），绝不盲发；真机验证后再议。
+
+**B1.2 领取后重查连登状态**：`outcome ∈ claimed|done` 时，daemon 额外发一次只读
+`GET {chat}/activity/growth/streak`（先垫 1s 限速），把可得字段如实回填到回执与日志：
+
+- 回执条目新增 **`status`**：`{streakDays, nextStreakDay("28d" 形态), nextStreakRemaining,
+  totalCredits}` —— **只填上游真的给了的字段**（缺一个少一个；`data.streak.days` 同时
+  回填到 `streak` 字段，但**不覆盖签到回执里已有的值**）。
+- 重查失败 → 条目带 **`statusError`**（上游 msg），日志写「连登状态重查失败…拿不到就
+  如实不填」；**绝不拿回执旧值冒充新值、绝不重试第二次**。`pending` / `failed` 不重查。
+
 ### 10.5 403 / 11140：冻结账号（替换原 2 小时自动冷却）
 
 hub `v2.1.0` 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却，继续重试会让同设备账号连坐。
 
 - 任何腿收到 `restricted` → **立即冻结**该账号，持久化 `state/frozen.json`
   （`{uid:{at:ISO, code, message}}`，tmp+rename 原子写，与 `state/daily-activity.json` 同目录）。
+- **良性 403 白名单（本次修订起的唯一例外，来源 88lin/workbuddy-auto-signin 实测）**：
+  上游把一部分**业务拒绝**也回 HTTP 403 —— 「还没领养猫猫」（`buddy/travel/depart`）
+  与「兑换档位天数不足」（`/redeem`）。它们不是风控，且兄弟实现明确要求这类 403
+  **先于**风控/认证判定放行（signin.py:2096/2213），否则没养猫的账号会被整个冻结、
+  成长中心中止。`engine/upstream.mjs` 的 `BENIGN_403_MSGS = ["no active buddy",
+  "连续登录天数不足"]`：msg 归一（trim+lower）后**精确全等**命中 → 不置 `restricted`、
+  不重试、按普通业务失败返回并带 `benign403:true`（runner 记一行 `benign403` 日志，
+  不静默）。**绝不模糊包含**（兄弟实现 `_is_tier_locked` 的子串匹配连「权限不足」都
+  会误命中，不复制）；白名单之外的一切 403（未知 msg / 空 msg / 变体）行为完全不变，
+  仍 `restricted:true` 立即冻结；`code 11140` 不参与白名单，判据一条不动。
+  `travel.mjs` 的派出流程据此先认 `no active buddy` 再判 `restricted`（能走到
+  `ensureBuddy` 兜底 / 如实报「还没有 Buddy」，不被误冻）。
 - 冻结账号**不进** `eligibleNow()`、不进排程选号、不进 `/api/run` 缺省 uids、
   不进 `/api/checkin` 与 `/api/streak/run` 的缺省目标。
 - **不再自动恢复**：只有 `POST /api/account/unfreeze`（或看板「恢复」按钮）能解冻。
@@ -1129,22 +1371,50 @@ hub `v2.1.0` 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却
 
 - **`fetchStreakState` 的跳过口径**：国际版（`provider !== "workbuddy"`）/ API key / 企业版账号
   返回 `{ok:true, skipped:true, ...零值}`（`days/makeupCards/lotteryChances=0`、`heatmap=[]`、
-  `tiers` 三档 `status:""`），**一个上游请求都不发**；`runStreakSteward` 对同一批账号返回
-  `{ok:true}` + 一行「企业版账号无成长体系，跳过」，同样零上游。
+  `tiers` 三档 `status:""` + 奖励明细五键与 `count` 全 `null`），**一个上游请求都不发**；
+  `runStreakSteward` 对同一批账号返回 `{ok:true}` + 一行「企业版账号无成长体系，跳过」，
+  同样零上游。
 - **`updatedISO` 固定 ISO 8601**（`new Date(now).toISOString()`）：`GET /api/streak` 的 10 分钟
   新鲜期由它算出，别改成别的格式（改了就没有 TTL）。
-- **`redemption_status` 真实形状（2026-11-11 生产实测钉死）**：`{tiers:[…], tier_7d_status, tier_14d_status,
-  tier_28d_status}` —— 状态在**平铺的 `tier_<档>_status`** 键上，不在 `tiers` 数组项里；另兼容
-  `tiers:[{tier,status}]` 与 `{7d:"…"}`（后两种是早先的猜测形状，仅为容错保留）。第一版按猜测形状
+- **`redemption_status` 真实形状（2026-11-11 生产实测钉死；2026-11-16 真机补测 tiers[] 奖励明细）**：
+  `{tiers:[{tier:"7d", days:7, credit:N, energy:N, cards:N, chances:N}, …], tier_7d_status,
+  tier_14d_status, tier_28d_status, tier_7d_count?:N}` —— 状态在**平铺的 `tier_<档>_status`** 键上，
+  不在 `tiers` 数组项里；每档奖励明细在 **`tiers[]` 项**里（`days/credit/energy/cards/chances`）。
+  另兼容 `tiers:[{tier,status}]` 与 `{7d:"…"}`（后两种是早先的猜测形状，仅为容错保留）。第一版按猜测形状
   解析，结果是「days/makeupCards 正常、三档状态全空、日历 0 格」——档位兑换永远不会发生，只有拿真实
   响应回来看才露馅。`heatmap` 的真实外壳同理：**`data.cells`**（不是 `data.days`）。
   两条已由 `tests/streak.test.mjs` 的「真实报文形状」用例与 `tests/helpers.mjs` 的假后端钉住。
+- **`tiers[]` 奖励明细的合并与 null 口径（2026-11-16 起）**：`tiersFromRedemption` 按**档位名**
+  把 `tiers[]` 项合并进快照 `tiers[]`，输出 `{tier, status, days, credit, energy, cards, chances, count}`
+  —— `status` 口径不变（平铺键优先，别改判定），五键 + `count` 的取值规则：只有「明确的非负有限数字」
+  （number / 非空数字字符串）才是数字；**缺失 / 空串 / 布尔 / 对象 / 非数值串 / NaN / 负数 → `null`**
+  （「上游没说」与「说了脏值」同归 null，绝不拿 0 或负数冒充有效明细）；**`0` 是合法值**（上游明确给 0
+  就如实 0，与 `null` 严格可区分 —— 看板对 `null` 整项隐藏，绝不拿 0 冒充）。`count` 收平铺的
+  `tier_<档>_count`（真机计数键；`tiers[]` 项的 `count` 兜底），缺失 → `null`。上游 `tiers[]` 缺失 /
+  项形状异常（字符串、缺字段）→ 该档只出 `{tier,status}` + 六键全 `null`，**绝不报错、绝不猜**。
+  旧缓存 / ≤0.3.8 老守护进程的 `tiers[]` 只有 `{tier,status}` —— `streakProjectionOf` 对缓存整段
+  透传（不补键不改写），看板对缺失键按「未知」渲染。
+- **兑换自检日志（A1 记账 bug 的防线，2026-11-16 起）**：`redeem` 成功时，用该档预期 `credit`
+  （快照 `tiers[]` 明细；`null` = 上游没给明细，无从对照）与 `grantedOf()` 实发 `credit` 对照写日志：
+  一致 → 「N 档位兑换成功：实发 +X 积分（预期 +Y）」（能量/补签卡/抽奖次数明细跟在后面）；
+  不一致 → 追加「与预期差 ±D，见上游回执」（差值 = 实发 − 预期，带符号）；预期缺失 → 维持旧措辞
+  只写实发（「N 档位兑换成功（+X 积分 …）」）。**对照结果绝不判失败**（上游回执是唯一事实，
+  `earned` 永远按实发记）；这条日志是人工核对「预期 vs 实发」的自检手段，不是对账闸门。
 - **`tiers[].status` 未知值语义**：只认 `locked`（未达成）/ `claimed`（已兑换）为「不动」；
   `available` 之类的**已知非锁定值**才兑换；**空串 = 上游没给这一档 = 状态未知 → 不兑换**。
   看板对未知值原样展示，**不得**当成功或以它触发动作。
-- **奖励字段名**：礼包/补偿认 `data.credit ?? data.points ?? data.point`；兑换/抽奖认
-  `data.credit ?? data.points`（容错解析，尚未拿到真实到账报文 —— 2026-11-11 该账号
-  `tier_*_status` 全为未达成、`chances=0`，所以还没验证过兑换/抽奖的到账字段）。
+- **奖励字段名（grantedOf 统一解析）**：兑换回执的实发字段带 **`_granted` 后缀**
+  （`credit_granted` / `energy_granted` / `cards_granted` / `chances_granted`）——
+  88lin/workbuddy-auto-signin 实测口径（其 `_redeem_reward_desc`：「直接读 `credit`
+  恒为空，会把兑换所得漏计」）。`grantedOf(data)` 新字段优先、老字段
+  （`credit`/`energy`/`cards`/`chances`）兜底，两种拼写都认防上游回退，一律
+  `Number(...)||0`。礼包/补偿回执 legacy 拼 `credit ?? points ?? point`；兄弟实现
+  没有 claim-gift/compensation 端点，礼包回执是否也带 `*_granted` 未实测 —— 现在
+  `grantedOf(...).credit` 之后再兜 `points/point`，两种形状都认，防漏记。
+- **补签卡 `makeup_cards` 两形状（makeupCardsOf）**：对象 `{balance:n}`（2026-11-11
+  生产实测）与**裸数字** `makeup_cards: n`（兄弟实现 signin.py:2012-2014 实测：
+  「只认前者的话，接口是后者时整个补登会一声不响地永不执行」）都认；都缺 → 0；
+  非有限/负数 → 0。`fetchGrowthSummary`（tasks.mjs 的状态投影）同口径。
 - **`GET /api/streak` 的错误口径**（镜像 `/api/credits`）：缺 `uid` → 400；uid 找不到 /
   API key / `tasksEnabled:false` → 404（「找不到可参与任务的国内版账号：<uid>」）；
   企业版（`enterpriseId` 非空，issue #3）→ 404 且给与 `/api/credits` 同一段的专属文案
@@ -1165,8 +1435,85 @@ hub `v2.1.0` 口径：HTTP 403 / code 11140 不是可自动恢复的风控冷却
   （`dashboard/app.js` 的 `HEAT_WINDOW_DAYS`）：整年全铺是 53 行、807px 高的细长条，而且只有近期那几天有分，
   打开看像布局坏了（2026-11-11 实测确认网格与配色本身没问题，纯粹是窗口太大）。全年有记录天数只放在汇总
   文案里（「· 全年 N 天」）。
-- **`heatmap[].score` 量纲**：当天连登分（0 = 当天没连登；实测活跃日是个位到两位数，不是 0/1 布尔）。**只用于展示与「昨日是否为 0」的
+- **`heatmap[].score` 量纲**：当天连登分（0 = 当天没连登；实测活跃日是个位到两位数，不是 0/1 布尔）。**只用于展示与「断点格是否为 0」的
   补签判断**，看板的分档着色是纯视觉（0 / 1–2 / 3–5 / 6+），不得参与任何逻辑判断。
+  **可判定性（本次修订起）**：格形状扩为 `{date, score, raw}` —— `score` 是归一后的数字或
+  **`null`**（脏数据/缺失/不可判定，`cellScoreOf`：只有明确的有限数字才算数），
+  `raw` 保留上游原值供诊断；看板自带 `streakNum` 归一，`score:null` 展示为 0 分格
+  （展示层零改动）。**补签判据 = `score` 明确是数字且 `=== 0`**（A2 起作用于当月全部
+  历史格，不再只看昨日）；`null` 一律不补签
+  （旧实现把 NaN/null/""/"abc" 一律归 0，脏数据会把「其实活跃或状态未知」的日子当
+  成断签误花补签卡 —— 兄弟实现同口径：分数无效整段停止补登）。
+- **A2 补签目标选择（2026-11-16 真机口径钉死）**：
+  - **时间边界只有服务端**：候选窗口的「今天」一律取 `heatmap.data.today.date`
+    （真机必有）；本机时区推的北京日**绝不做边界**（生产容器是 UTC，与本机差 8 小时
+    会选错月/漏掉服务端昨天 —— `tests/streak.test.mjs` A2③ 两个方向钉死）。
+    `today.date` 缺失/格式非 `YYYY-MM-DD` → 本轮不补（没边界就不猜）。
+  - **上线边界**：`streak.launch_date` 有效就用它；缺失/格式无效 → 回落已知上线日
+    `LAUNCH_DATE_FALLBACK = "2026-06-17"`（兄弟实现 signin.py:1576 同款硬边界；
+    兄弟实现缺 launch_date 是整段停止，我们按任务口径放宽为回落 —— 断点仍限定当月，
+    放大范围仅限于上线月内，风险可控）。快照 `launchDate` 保存**原样字符串**（缺失
+    为空串），回落发生在 `makeupTargetOf` 内。
+  - **`streak.makeup_dates` 是历史不是待办**：真机实测它在 `data.streak` 层（数组，
+    已补签日期）；候选必须不在其中，否则会对同一天重复花卡。`makeupDatesOf` 兼容
+    顶层 `data.makeup_dates` 兜底（防换壳），条目非 `YYYY-MM-DD` 形状的一律不参与过滤。
+  - **每轮最多 1 张**（`MAKEUP_MAX_PER_RUN` 同款）：补签会改变连登天数与档位解锁，
+    一张一张来，下轮重新拉最新日历/余额再补 —— 也避免「一次循环补 N 天」放大风控面。
+  - **`makeup_cards.max`**（真机 = 4，余额上限）：仅记录，暂不使用。
+- **A4 开盲盒前置旅行状态门（2026-11-16 钉死）**：兄弟实现实测**开盒会覆盖在途
+  旅行记录**（traveling 时 open = 白丢一次旅行；arrived 未领奖时 open = 白丢奖励），
+  盲盒腿在 quota 之前先 `GET buddy/travel/status` 决策：
+  `traveling` → 跳过（「猫猫在外旅行，开盒会覆盖旅行记录，本轮跳过」）；`arrived` →
+  跳过（「旅行归来有奖励待领，先由旅行腿领取」）；`idle` → 放行；查询失败 / state
+  未知 → **保守跳过**（不花能量、连 quota 都不发，ok:true + 原因日志）。跳过永远比
+  冒险开盒优先（本腿铁律：不给明确授权绝不自动花能量）。`daily_limit_reached` 是
+  **旅行的**每日名额，与开盒无关，不据此跳过。**腿序不需要调整**（仍 buddy →
+  travel）：门已保证开盒只发生在 idle；buddy 在 travel 前意味着 arrived 的奖励
+  由本轮紧随的 travel 腿领取，下一轮盲盒腿再开。
+- **`buddy/travel/status` 真机形状（2026-11-16 只读实测）**：`state`
+  （`idle`/`traveling`/`arrived`）、`buddy_id`、`record_id`、`arrive_at`/`server_now`
+  （**epoch 秒**，idle 时 `arrive_at=0`）、`daily_limit_reached`、`duration_hours`、
+  `reward_credit`；⚠️ idle 时 `location`、`letter` 是**字符串 `"null"`**（连真 JSON
+  null 都不是）—— 引擎只读 `state`，其余字段不解析，将来谁要用这些字段先自己踩一遍坑。
+- **`heatmap` 响应其余真机字段（2026-11-16）**：`data.today = {date, score, is_active,
+  status_text}`（引擎只取 `today.date`）；`data.range = {start_date, end_date, days}`
+  与 `data.updated_at` 不透传；**`cells[]` 格内另有 `has_new_buddy`（当日是否换了新
+  Buddy）**—— 对连登/补签无用，`heatmapFrom` 不透传，**仅为将来 B8（Buddy 图鉴类）
+  预留记录**，现在不实现。
+
+### 10.9 B8：Buddy 选中态（修「有 Buddy 却派不出旅行/开不了盒」）
+
+背景：兄弟实现有 `buddy/switch{instance_id}`；账号**已有 Buddy 实例但未被选中**时，
+`travel/depart` 与 `buddy/open` 都被上游以 `"no active buddy"` 拒绝 —— 旧逻辑只会去补
+`first_buddy`，错报「还没有 Buddy」。修复口径（**保守、只在需要时动手**）：
+
+- **只读探测**（`engine/buddy.buddyListOf`，两腿共用）：`GET buddy/info`（当前选中，
+  `data.buddy.instance_id` 优先）+ `GET buddy/list`（清单）。两者互不阻断、任一失败按
+  缺失处理并如实记日志；**清单是三态诊断的唯一依据** —— list 查询失败时整体
+  `ok:false`（调用方退回 ensureBuddy 老路），绝不把「查不到」误报成「没有」。
+- **switch 只在「修理性」时机发生**（`repairActiveBuddy`）：travel 腿 `depart` 失败且
+  msg 归一后**精确全等** `"no active buddy"`、或盲盒腿 `open` 拿到同类拒绝之后 ——
+  先查清单：有实例但 `current_buddy` 全为 false（且 info 没给 current）→ 选一个
+  （`pickBuddyToSelect`：优先 `source==="gacha"` → 最早 `acquired_at` → 取不到第一个）
+  `POST {chat}/activity/growth/buddy/switch` body `{instance_id}`（⚠️ **body 形状来自
+  WorkDaddy 参考、尚未真机验证**）→ 重试**原请求一次**。**没失败绝不发 switch**
+  （绝不主动切换用户的 Buddy）；已有选中实例（`already_selected`）与清单查不到
+  （`list_failed`）都不切换。
+- **三态诊断文案**（绝不混为一谈）：
+
+| 状态 | 条件 | 文案/行为 |
+| --- | --- | --- |
+| `none` | 清单为空 | 「还没有 Buddy（需先完成并领取「领取一只 Buddy」任务）」；travel 腿继续走 ensureBuddy 补 `first_buddy` 老路 |
+| `switched` | 有实例但未选中 | 「已有 Buddy（N 个）但未选中，已尝试切换后重试」+ 重试原请求一次；重试仍失败如实报「仍失败」 |
+| `switch_failed` | switch 被上游拒 | 「已有 Buddy（N 个）但未选中，切换失败：<上游 msg>」—— **绝不报成功** |
+
+  travel 腿 `list_failed`（清单查询失败）→ 文案「还没有 Buddy（Buddy 清单查询失败：
+  …）：需先完成并领取…」；`already_selected` → 不切换，退回 ensureBuddy 老路。
+- **B3 旅行 ETA**（同一批落地）：traveling 时用 `travel/status` 的 `arrive_at`/`server_now`
+  （真机 **epoch 秒**）换算「约 N 分钟后回来」；已过 `arrive_at` → 「即将归来」；
+  0 / 负数 / 非有限值 / 字符串 `"null"` 一律按缺失（沿用旧文案，**绝不显示 1970 或
+  负数分钟**；server_now 缺失用注入时钟兜底）。idle 时 `location`/`letter` 是字符串
+  `"null"` —— 引擎不解析这两个字段。
 
 ## 11. 0.3.5 新增：运营活动任务（campaign）/ skill_share 自动化 / template_5 四事件
 
