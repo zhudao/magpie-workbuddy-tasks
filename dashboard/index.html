@@ -6,7 +6,7 @@
   <meta name="robots" content="noindex">
   <!-- 静态文件版本：必须与 package.json 的 version 一致（后端测试比对四处：
        package.json / index.mjs 的 VERSION / page 页脚 / 这个 meta）。app.js 读它做版本一致性检查。 -->
-  <meta name="wb-version" content="0.3.9">
+  <meta name="wb-version" content="0.4.0">
   <title>WorkBuddy 任务 · 看板</title>
   <link rel="icon" href="logo-mark.png" type="image/png">
   <link rel="stylesheet" href="style.css">
@@ -19,7 +19,7 @@
     <div class="appbar-inner">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">
-          <img src="logo-mark.png" alt="" width="28" height="28">
+          <img src="logo-mark.png" alt="" width="32" height="32">
         </span>
         <span class="brand-copy">
           <span class="brand-name">WorkBuddy 任务</span>
@@ -46,17 +46,38 @@
     </div>
   </header>
 
-  <!-- 今日概览。原「看板地址」整块已按需求移除：看板不再渲染地址块。 -->
-  <div class="statbar">
+  <!-- 今日概览 Bento KPI 卡片区（原「看板地址」整块已按需求移除） -->
+  <section class="statbar" aria-label="今日收益概览">
     <div class="statbar-inner">
       <dl class="stats" aria-label="今日收益">
-        <div class="stat"><dt>今日积分</dt><dd id="statCredits">—</dd></div>
-        <div class="stat"><dt>今日能量</dt><dd id="statEnergy">—</dd></div>
-        <div class="stat"><dt>运行轮次</dt><dd id="statRuns">—</dd></div>
+        <div class="stat stat-credits">
+          <dt>
+            <span class="stat-dot stat-dot-accent" aria-hidden="true"></span>
+            <span>今日积分</span>
+          </dt>
+          <dd id="statCredits">—</dd>
+          <span class="stat-cap">本日累计获取积分</span>
+        </div>
+        <div class="stat stat-energy">
+          <dt>
+            <span class="stat-dot stat-dot-ok" aria-hidden="true"></span>
+            <span>今日能量</span>
+          </dt>
+          <dd id="statEnergy">—</dd>
+          <span class="stat-cap">本日累计成长能量</span>
+        </div>
+        <div class="stat stat-runs">
+          <dt>
+            <span class="stat-dot stat-dot-neutral" aria-hidden="true"></span>
+            <span>运行轮次</span>
+          </dt>
+          <dd id="statRuns">—</dd>
+          <span class="stat-cap">本地自动化执行轮次</span>
+        </div>
       </dl>
       <p class="statbar-note">数据只来自本机守护进程 · 按本地时间统计</p>
     </div>
-  </div>
+  </section>
 
   <main id="main" class="page">
 
@@ -64,7 +85,7 @@
     <section class="panel panel-accounts" aria-labelledby="accountsTitle">
       <div class="panel-head">
         <div class="panel-title">
-          <h2 id="accountsTitle">账号</h2>
+          <h2 id="accountsTitle">账号与任务工作台</h2>
           <span class="count" id="acctCount">—</span>
         </div>
         <div class="panel-actions">
@@ -169,36 +190,28 @@
            有 count>0 才显示；绝不列出任何企业版账号的 uid / 昵称 / 域名。 -->
       <p class="acct-intl" id="enterpriseNote" hidden></p>
 
+      <!-- 悬浮毛玻璃批量操作坞 -->
       <div class="batchbar">
-        <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->
-        <fieldset class="segments" id="legsBox">
-          <legend class="sr-only">任务腿</legend>
-          <label class="segment" title="积分任务 = 成长任务 + 小程序链式任务 + 活动任务（一次跑完这三类；小程序任务次日解锁、活动任务独立记账）"><input type="checkbox" class="leg-check" value="points"><span>积分任务</span></label>
-          <label class="segment" title="连登管家：补签昨日 → 领新手礼包/活动补偿 → 兑换可用连登档位 → 抽奖（幂等、纯收益，已领的静默跳过）"><input type="checkbox" class="leg-check" value="streak"><span>连登管家</span></label>
-          <label class="segment" title="Buddy 盲盒：消耗成长能量开盲盒（不是领奖）；无能量时后端会跳过"><input type="checkbox" class="leg-check" value="buddy"><span>Buddy 盲盒</span></label>
-          <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
-          <label class="segment"><input type="checkbox" class="leg-check" value="night"><span>夜猫子</span></label>
-        </fieldset>
+        <div class="batch-main">
+          <div class="batch-controls">
+            <!-- 任务腿勾选是唯一选择源：初始勾选由 app.js 按 settings.legs 回写，HTML 里不写死 checked。 -->
+            <fieldset class="segments" id="legsBox">
+              <legend class="sr-only">任务腿</legend>
+              <label class="segment" title="积分任务 = 成长任务 + 小程序链式任务 + 活动任务（一次跑完这三类；小程序任务次日解锁、活动任务独立记账）"><input type="checkbox" class="leg-check" value="points"><span>积分任务</span></label>
+              <label class="segment" title="连登管家：补签昨日 → 领新手礼包/活动补偿 → 兑换可用连登档位 → 抽奖（幂等、纯收益，已领的静默跳过）"><input type="checkbox" class="leg-check" value="streak"><span>连登管家</span></label>
+              <label class="segment" title="Buddy 盲盒：消耗成长能量开盲盒（不是领奖）；无能量时后端会跳过"><input type="checkbox" class="leg-check" value="buddy"><span>Buddy 盲盒</span></label>
+              <label class="segment"><input type="checkbox" class="leg-check" value="travel"><span>猫猫旅行</span></label>
+              <label class="segment"><input type="checkbox" class="leg-check" value="night"><span>夜猫子</span></label>
+            </fieldset>
 
-        <label class="switch-inline" id="claimWrap"
-          title="自动领奖：流水线完成后立即领奖；手动领奖：只做不领，任务停在「待领奖」，之后可用「只领奖」补领">
-          <input type="checkbox" id="claimToggle" checked>
-          <span class="switch-track" aria-hidden="true"></span>
-          <span>自动领奖</span>
-        </label>
-
-        <div class="batch-actions">
-          <div class="batch-hints">
-            <span class="sel-count" id="selCount">已选 0 个账号</span>
-            <!-- 任务级勾选的全局汇总：有勾选时显示「已选 N 项任务 · 本轮所有目标账号只做这些」 -->
-            <span class="task-sel-summary" id="taskSelSummary" hidden></span>
-            <!-- 批量接取只提交后端判定 canAccept 的任务；不可自动接取的项数在这里说明，
-                 而不是静默少接（数字来自 snapshot.tasks[].canAccept，见 app.js acceptPlan）。 -->
-            <span class="accept-note" id="acceptNote" hidden></span>
-            <!-- 冻结账号总览（0.3.3，契约 §10.5）：有冻结账号时显示「N 个账号已冻结」+ 批量恢复。
-                 冻结账号不进排程 / 批量缺省目标，显式点到会如实失败 —— 所以必须显式说出来。 -->
-            <span class="frozen-note" id="frozenNote" hidden></span>
+            <label class="switch-inline" id="claimWrap"
+              title="自动领奖：流水线完成后立即领奖；手动领奖：只做不领，任务停在「待领奖」，之后可用「只领奖」补领">
+              <input type="checkbox" id="claimToggle" checked>
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>自动领奖</span>
+            </label>
           </div>
+
           <div class="batch-buttons">
             <button type="button" class="ghost-btn" id="btnAccept">批量接任务</button>
             <button type="button" class="ghost-btn" id="btnClaim">只领奖</button>
@@ -210,6 +223,18 @@
               title="连登管家（POST /api/streak/run）：补签昨日 → 领新手礼包/活动补偿 → 兑换可用档位 → 抽奖；作用于勾选账号（未勾选 = 全部可参与账号）。">连登管家</button>
             <button type="button" class="btn" id="btnRun">批量做任务</button>
           </div>
+        </div>
+
+        <div class="batch-hints">
+          <span class="sel-count" id="selCount">已选 0 个账号</span>
+          <!-- 任务级勾选的全局汇总：有勾选时显示「已选 N 项任务 · 本轮所有目标账号只做这些」 -->
+          <span class="task-sel-summary" id="taskSelSummary" hidden></span>
+          <!-- 批量接取只提交后端判定 canAccept 的任务；不可自动接取的项数在这里说明，
+               而不是静默少接（数字来自 snapshot.tasks[].canAccept，见 app.js acceptPlan）。 -->
+          <span class="accept-note" id="acceptNote" hidden></span>
+          <!-- 冻结账号总览（0.3.3，契约 §10.5）：有冻结账号时显示「N 个账号已冻结」+ 批量恢复。
+               冻结账号不进排程 / 批量缺省目标，显式点到会如实失败 —— 所以必须显式说出来。 -->
+          <span class="frozen-note" id="frozenNote" hidden></span>
         </div>
         <p class="batch-status" id="batchStatus" role="status" aria-live="polite"></p>
       </div>
@@ -242,7 +267,7 @@
             <span class="switch-track" aria-hidden="true"></span>
             <span class="switch-text">
               <strong>启用小时窗口排程</strong>
-              <small>到点自动跑一轮；同一窗口一天只触发一次，有任务在跑则让路。</small>
+              <small>到点自动跑一轮；同窗口每天仅一次，运行中让路</small>
             </span>
           </label>
 
@@ -267,8 +292,7 @@
               <input class="input input-mono" id="hoursTravel" inputmode="numeric" placeholder="留空" aria-label="猫猫旅行小时窗口">
               <span class="hint">北京时间小时；留空 = 不排程</span>
             </div>
-            <!-- 保存按钮放在 hours 网格里：第 3 行第 2 列 = 「夜猫子」右边、「猫猫旅行」下面，
-                 紧贴它要保存的那几个输入框（原先在说明文案下方，离得远）。 -->
+            <!-- 保存按钮放在 hours 网格里：钉死在右列并靠右对齐，紧贴它要保存的输入框 -->
             <div class="hour-row hour-actions">
               <button type="button" class="ghost-btn" id="saveHoursBtn">保存窗口</button>
             </div>
@@ -320,7 +344,7 @@
     <section class="panel" aria-labelledby="histTitle">
       <div class="panel-head">
         <div class="panel-title">
-          <h2 id="histTitle">历史</h2>
+          <h2 id="histTitle">历史记录</h2>
         </div>
         <div class="panel-actions">
           <label class="select-inline">拉取
@@ -347,8 +371,7 @@
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
   <!-- 积分明细对话框：数据只来自 GET /api/credits（账号行「明细」打开时先渲染
-       /api/state 里的 credits 缓存，再自动 refresh=1 刷新一次）。
-       结构和 #cmdDialog 一样用原生 <dialog> + dialog::backdrop，暗色主题共用变量。 -->
+       /api/state 里的 credits 缓存，再自动 refresh=1 刷新一次）。 -->
   <dialog id="creditsDialog" class="credits-dialog" aria-labelledby="creditsTitle">
     <div class="credits-body">
       <header class="credits-head">
@@ -366,10 +389,7 @@
 
         <div class="credits-usage" id="creditsUsage" hidden></div>
 
-        <!-- 用量明细（GET /api/usage）：独立于权益包明细的只读区块。成本纪律——
-             只有用户点「查询/刷新用量」或切换窗口才打上游（每次 1–2 次分页调用），
-             绝不在 3 秒重绘里轮询。上游行里的 prompt 原文后端已丢弃，这里只显示
-             日期 / 模型 / 积分 / 请求数四项聚合。 -->
+        <!-- 用量明细（GET /api/usage）：独立于权益包明细的只读区块。 -->
         <section class="credits-usage-detail" id="creditsUsageDetail" aria-labelledby="creditsUsageDetailTitle">
           <div class="usage-detail-head">
             <h3 class="usage-detail-title" id="creditsUsageDetailTitle">用量明细</h3>

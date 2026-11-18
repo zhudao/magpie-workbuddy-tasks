@@ -803,7 +803,7 @@ function pinShort(id) {
 // 「需在桌面端完成」徽章由 desktopOnly 字段单独负责（见 taskRow）。
 function jumpCell(t) {
   const url = String(t.jumpUrl ?? "");
-  if (!url) return el("span", { class: "muted", text: "—" });
+  if (!url) return el("span", { class: "muted row-jump-none", text: "—" });
   if (!/^https?:/i.test(url)) {
     return el("button", {
       type: "button",
@@ -1928,7 +1928,7 @@ function accountRow(a, opts = {}) {
             "aria-valuenow": String(t.claimed),
             "aria-label": `已领奖 ${t.claimed} / ${t.total}`,
             width: "100%",
-            height: "4",
+            height: "6",
             "shape-rendering": "crispEdges",
           },
           svgEl("rect", {
@@ -1937,8 +1937,8 @@ function accountRow(a, opts = {}) {
             y: "0",
             width: "100%",
             height: "100%",
-            rx: "2",
-            ry: "2",
+            rx: "3",
+            ry: "3",
           }),
           svgEl("rect", {
             class: "acct-bar-fill",
@@ -1946,8 +1946,8 @@ function accountRow(a, opts = {}) {
             y: "0",
             width: `${claimedPct}%`,
             height: "100%",
-            rx: "2",
-            ry: "2",
+            rx: "3",
+            ry: "3",
             style: { width: `${claimedPct}%` },
           }),
         )
@@ -2989,6 +2989,7 @@ function wireCreditsDialog() {
       usageDetail.usage = null;
       usageDetail.error = "";
       usageDetail.needRelogin = false;
+      renderUsageDetail(); // 立刻高亮新窗口：请求在途时 loadUsageDetail 会早退，不能只靠它渲染
       loadUsageDetail(false);
     });
   }
@@ -3255,8 +3256,17 @@ async function loadUsageDetail(force) {
   usageDetail.needRelogin = false;
   renderUsageDetail();
   const r = await requestUsage(uid, days, force);
-  // 弹窗已关闭 / 切账号 / 切窗口 / 又发起了新请求：丢弃本次结果。
-  if (usageDetail.req !== req || usageDetail.uid !== uid || usageDetail.days !== days) return;
+  // 又发起了新请求：本次结果作废，交给新请求负责 loading 与渲染。
+  if (usageDetail.req !== req) return;
+  // 弹窗已关闭 / 切账号 / 切窗口：丢弃本次结果。注意切窗口时 loadUsageDetail 因
+  // loading 守卫没有补发新请求 —— 这里必须清掉 loading 并按当前窗口补取一次，
+  // 否则面板会永远停在「查询中…」且刷新按钮一直禁用（0.4.0 实测发现）。
+  if (usageDetail.uid !== uid || usageDetail.days !== days) {
+    usageDetail.loading = false;
+    renderUsageDetail();
+    loadUsageDetail(false);
+    return;
+  }
   usageDetail.loading = false;
   if (r.ok) {
     usageDetail.usage = r.usage;
@@ -4290,7 +4300,7 @@ function updateSelectionUI() {
   // 批量连登管家的按钮说明随勾选范围变：与 /api/streak/run 的 uids 口径一致
   const btnStreak = $("#btnStreak");
   if (btnStreak) {
-    btnStreak.textContent = jobRunning ? "任务运行中…" : "连登管家";
+    btnStreak.textContent = "连登管家";
     btnStreak.title = noElig
       ? "没有可参与任务的账号"
       : state.selected.size
@@ -4619,6 +4629,18 @@ function renderJob() {
     wireLogScroll(logPane);
   }
 
+  const logShell = el(
+    "div",
+    { class: "log-shell" },
+    el(
+      "div",
+      { class: "log-chrome", "aria-hidden": "true" },
+      el("span", { class: "log-dots" }, el("i", { class: "dot-r" }), el("i", { class: "dot-y" }), el("i", { class: "dot-g" })),
+      el("span", { class: "log-title", text: "Console · 运行日志" }),
+    ),
+    logPane,
+  );
+
   // 重建期间抑制 scroll 监听采信（节点移动可能触发瞬时的 scroll 事件）
   state.log.suppress = true;
   try {
@@ -4628,7 +4650,7 @@ function renderJob() {
       el("div", { class: "subhead" }, el("span", { class: "label", text: "步骤" })),
       stepsTable,
       el("div", { class: "subhead" }, el("span", { class: "label", text: "日志" })),
-      logPane,
+      logShell,
     );
   } finally {
     state.log.suppress = false;
