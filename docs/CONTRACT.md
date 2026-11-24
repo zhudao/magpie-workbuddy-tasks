@@ -451,7 +451,14 @@ GET  /api/state                 -> {serveUrl, bindHost, port, reachableHint,
                                     //（见上方企业版同口径）
                                     scheduler:{enabled,nextRuns[[leg,hour]],lastCycle,
                                                holds:[{uid,nickname,releasedAt}]},
-                                    job:Job|null, stats:{creditsToday,energyToday,runs},
+                                    job:Job|null, stats:{creditsToday,energyToday,runs,
+                                                        checkinCreditsToday},
+                                    // stats.checkinCreditsToday（0.4.1，issue #6）：今日（北京日）
+                                    // 签到收益的只读汇总，用于对账。口径见 §10.4「签到收益归位」：
+                                    // 手签历史行（leg:"checkin"）与 magpie 本体账本
+                                    // `<magpie 配置目录>/plugin-checkin.json`（auth.checkin /
+                                    // settings.workbuddyCheckin 写入）**按账号取较大值**，同一天
+                                    // 两边都有记录时绝不重复相加；creditsToday 已含这一份。
                                     settings:{claim,legs,gapMs,hours:{mp,buddy,travel,night},host:{chat,bill,web}}}
                                     // hours 只有 mp|buddy|travel|night 四个键（排程不再触发
                                     // growth，§7/§8）；旧 settings.json 里的 hours.growth
@@ -642,6 +649,12 @@ GET  /api/usage?uid=<uid>&days=<1-90>&refresh=0|1
                                     //   · **只有显式请求才打上游**：/api/state 绝不顺带调用它，
                                     //     也没有 accounts[].usage 投影（看板需要时自己 GET 本路由）。
 GET  /api/history?limit=200     -> 每次尝试一行（对齐 hub 的 /activity/history）
+                                    // 行的 leg：job 的腿名（growth/mp/campaign/streak/buddy/
+                                    // travel/night）之外，0.4.1 起多一种 "checkin"（每日签到，
+                                    // 见 §10.4）—— 它**不是可排程/可批量跑的腿**，不进 LEGS，
+                                    // 只是历史记账行；看板 LEG_NAMES 给它中文名「每日签到」。
+                                    // checkin 行不带 jobId（签到不是一次「运行轮次」，不能让
+                                    // stats.runs 虚高），trigger 恒为 "manual"。
                                     // 行的 trigger 口径：来自 job.spec.trigger（"schedule" |
                                     // "manual"），看板「触发」列据此显示 排程/手动 —— 触发方式
                                     // 住在 spec 上（旧版误读 job 顶层 trigger，真实引擎没有该
@@ -1317,6 +1330,28 @@ POST /api/account/unfreeze  {"uid":"…"} 或 {"uids":["…"]}
   回填到 `streak` 字段，但**不覆盖签到回执里已有的值**）。
 - 重查失败 → 条目带 **`statusError`**（上游 msg），日志写「连登状态重查失败…拿不到就
   如实不填」；**绝不拿回执旧值冒充新值、绝不重试第二次**。`pending` / `failed` 不重查。
+
+**签到收益归位（0.4.1，issue #6 / PR #7）**：签到收益原本两条路都进不了「今日积分」——
+`doCheckin` 是 `manualOp` 直调的单账号操作（不产生 step、不走 `finalizeJob`，所以不写
+history），而 magpie 本体自动签到的收益写在 magpie 自己的账本里、本插件看不见。现在：
+
+1. **手签落历史**：`POST /api/checkin` 返回 200 时按回执补 history 行 ——
+   `leg:"checkin"`、`claimed|done → state:"ok"`、`pending → state:"skip"` 且 **credit 记 0**
+   （上游「处理中」的钱没落账，绝不入账）、其余 `state:"fail"`；**不带 `jobId`**
+   （签到不是一次运行轮次，不能让 `stats.runs` 虚高）；`trigger` 恒 `"manual"`。
+2. **并读 magpie 账本**：`<magpie 配置目录>/plugin-checkin.json`（由
+   `@magpie-community/opencode-workbuddy-auth` 的 `auth.checkin` / `settings.json` 的
+   `workbuddyCheckin` 写入），结构 `{ "<vendor>|<login>": {day,outcome,credit,...} }`。
+   只认 `day` = **北京今日**、`outcome ∈ {claimed,done}`、`credit > 0`、vendor 为
+   `workbuddy`（或 `workbuddy#…`）的条目；`<login>` 按 `plugin-auth.json` 的**条目键**
+   （实测 2026-11-24 生产账本与条目键逐字一致）、`#` 后的裸后缀、uid、nickname 四路匹配；
+   **认不出来的条目一律不计**（宁可少算，绝不把别人的分记到某个账号头上）。
+   **只读**：这是 magpie 的文件，本插件绝不写它；文件不存在 = 不启用该口径（手签行照常有效）。
+3. **去重**：同一账号同一天两边都可能有记录（手签 + 本体自动签是同一份收益的两种记录），
+   按账号取**较大值**再汇总，**绝不重复相加**；结果另给只读字段
+   `stats.checkinCreditsToday` 便于对账（`creditsToday` 已含这一份）。
+4. **读盘节流**：账本按 `mtime+size` 签名缓存 —— 看板 3 秒轮询 `/api/state` 时文件没变就
+   不重复解析、也不重复 `loadAccountsAll()`；magpie 刚写完（签名变）立刻重读，不靠 TTL 猜。
 
 ### 10.5 403 / 11140：冻结账号（替换原 2 小时自动冷却）
 

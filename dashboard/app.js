@@ -141,7 +141,9 @@ const raf = typeof requestAnimationFrame === "function" ? (cb) => requestAnimati
 
 // ---- 文案映射（领域词汇对齐 daemon/engine 与 CONTRACT） -----------------------
 
-export const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", campaign: "活动任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" };
+// checkin 不进可选腿（它不是任务，只是签到记账行），但历史表的「腿」列要认它 ——
+// 否则签到行会显示成生硬的 "checkin"（issue #6）。
+export const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", campaign: "活动任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子", checkin: "每日签到" };
 // 腿名单值常量：触发一轮 job（runStreakSelected / runCampaignOne）与 job 步骤过滤都按腿名字符串
 // 匹配。散落字面量写着容易手滑、也和 LEG_NAMES 的键 / POINTS_LEGS / DEFAULT_LEGS 脱节。
 // 取值必须与三者是同一套腿名（有测试钉住一致性）。

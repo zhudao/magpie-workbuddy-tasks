@@ -79,16 +79,18 @@ import { beijingDateKey, beijingHour, DEFAULT_GAP_MS, MIN_UPSTREAM_GAP_MS } from
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.0")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.1")
   } catch {
-    return "0.4.0"
+    return "0.4.1"
   }
 })()
 
 // 腿顺序（CONTRACT §11.1）：campaign（运营活动任务，独立于成长体系）排在 mp
 // 之后、streak 之前；runner 的 LEG_ORDER 同序。
 const LEGS = ["growth", "mp", "campaign", "streak", "buddy", "travel", "night"]
-const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", campaign: "活动任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子" }
+// 注意 checkin 只在这里（文案）登记，**不进 LEGS**：签到不是可排程/可批量跑的腿，
+// 它只是历史记录里的一种行（issue #6：签到收益要能被「今日积分」算到）。
+const LEG_NAMES = { growth: "成长任务", mp: "小程序链式任务", campaign: "活动任务", streak: "连登管家", buddy: "Buddy 盲盒", travel: "猫猫旅行", night: "夜猫子", checkin: "每日签到" }
 // 未知路由 404 的 hint（issue #3 的真实症状）：看板比守护进程新时，旧进程没有
 // 新路由（如 GET /api/streak），用户只看到「未知 API」一头雾水 —— hint 指路重启。
 // 只追加字段，error 原文不变（既有测试与前端按原文断言/匹配）。
@@ -736,6 +738,13 @@ export async function startDaemon(opts = {}) {
   // eligibleNow()/排程选号/缺省目标，只有 POST /api/account/unfreeze 能解冻，
   // 绝不自动恢复；重启后由本文件恢复冻结状态（runner 构造时经 frozenMap 读入）。
   const frozenFile = join(stateDir, "frozen.json")
+  // magpie 本体的签到账本（issue #6）：`/config/magpie/plugin-checkin.json`，
+  // 由 @magpie-community/opencode-workbuddy-auth 的 auth.checkin（settings 里的
+  // workbuddyCheckin 开关）写入。结构是 `{ "<vendor>|<key>": {day,outcome,credit} }`，
+  // 只读 —— 本插件绝不写它（那是 magpie 的文件），只在 computeStats 里补算「签到
+  // 收益」这一块本插件看不见的今日积分。容器里 cfgDir 就是 /config/magpie，所以
+  // 与 plugin-auth.json 同目录；不在配置目录时按「不启用」处理（读到就 nil）。
+  const magpieCheckinFile = join(cfgDir, "plugin-checkin.json")
 
   let settings = { ...DEFAULT_SETTINGS, ...readJson(settingsFile, {}) }
   // 安全默认（C1）：settings.json 缺失或损坏时 readJson 落 {}，scheduler 按
@@ -1399,6 +1408,104 @@ export async function startDaemon(opts = {}) {
     saveHistory()
   }
 
+  // 签到收益落历史（issue #6）：doCheckin 是手动单账号操作，不产生 step、也不走
+  // finalizeJob，所以它的收益从来进不了 history.json —— 看板「今日积分」在只有
+  // 签到的日子里必然是 0。这里按回执补一条历史行：
+  //   · leg 固定 "checkin"（不是可排程的腿，只是记账口径；LEG_NAMES 里有中文名）；
+  //   · state 沿用 job step 的三值口径（ok / skip / fail）：claimed|done = ok，
+  //     pending（上游「处理中」）= skip 且 credit 记 0（没落账的收益绝不入账），
+  //     其余 = fail；
+  //   · 不带 jobId —— 签到不是一次「运行轮次」，不能让 runs 计数虚高。
+  function recordCheckinHistory(rows) {
+    const list = Array.isArray(rows) ? rows : []
+    if (!list.length) return
+    const at = new Date(now()).toISOString()
+    for (const r of list) {
+      const oc = String(r?.outcome ?? "")
+      const ok = oc === "claimed" || oc === "done"
+      const pending = oc === "pending"
+      const uid = String(r?.uid ?? "")
+      history.push({
+        at,
+        uid,
+        nickname: String(accountByUid(uid)?.nickname ?? ""),
+        leg: "checkin",
+        state: ok ? "ok" : pending ? "skip" : "fail",
+        detail: scrub(`签到：${oc || "?"}${r?.message ? `（${r.message}）` : ""}`),
+        credit: ok ? Number(r?.credit) || 0 : 0,
+        energy: 0,
+        jobId: "",
+        trigger: "manual",
+      })
+    }
+    if (history.length > HISTORY_CAP) history = history.slice(-HISTORY_CAP)
+    saveHistory()
+  }
+
+  // magpie 本体的签到账本 → 今日（北京日）每个账号的签到积分。
+  // `/config/magpie/plugin-checkin.json`，形如
+  // `{ "workbuddy|workbuddy#abc": { day, outcome, credit } }`：
+  //   · 键的右半是 plugin-auth.json 的条目名（"workbuddy" / "workbuddy#xxxx"）；
+  //     实测（2026-11-24 生产账本）确认右半与 plugin-auth.json 的条目键逐字一致，
+  //     另兼容按 uid / 展示名（nickname）写的条目，三种都认；
+  //   · 只认 day = 北京今日、outcome = claimed/done、credit > 0 的条目；
+  //   · 只认 vendor 是 workbuddy 的（Trae/Qoder 的签到不属于本插件的积分口径）；
+  //   · 认不出来的条目一律不计 —— 宁可少算，绝不把别人的分数记到某个账号头上。
+  // 只读：这个文件是 magpie 的，本插件绝不写它。
+  //
+  // 读盘节流（看板 3 秒轮询 /api/state 会反复调 computeStats）：账本是 magpie
+  // 自己的写入点、本插件只读，按 mtime+size 做签名缓存 —— 文件没变就不重复解析，
+  // 也不重复 loadAccountsAll()。签名变化（magpie 刚签完）立刻重读，不靠 TTL 猜。
+  let checkinLedgerCache = { sig: "", raw: null }
+  function readCheckinLedger() {
+    let st = null
+    try {
+      st = statSync(magpieCheckinFile)
+    } catch {
+      checkinLedgerCache = { sig: "", raw: null }
+      return null // 文件不存在 = 不启用该口径（本插件手签历史行仍然有效）
+    }
+    const sig = `${st.mtimeMs}:${st.size}`
+    if (checkinLedgerCache.sig === sig) return checkinLedgerCache.raw
+    const raw = readJson(magpieCheckinFile, null)
+    checkinLedgerCache = { sig, raw }
+    return raw
+  }
+
+  function magpieCheckinCreditsByUid(today) {
+    const raw = readCheckinLedger()
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return new Map()
+    const byLogin = new Map()
+    for (const a of loadAccountsAll()) {
+      if (a.key) {
+        byLogin.set(String(a.key), a.uid)
+        // "workbuddy#abc" 的裸后缀也要能对上（有的写入方只留 # 后那截）
+        const hash = String(a.key).indexOf("#")
+        if (hash >= 0) byLogin.set(String(a.key).slice(hash + 1), a.uid)
+      }
+      if (a.uid) byLogin.set(String(a.uid), a.uid)
+      if (a.nickname) byLogin.set(String(a.nickname), a.uid)
+    }
+    const out = new Map()
+    for (const [k, v] of Object.entries(raw)) {
+      if (!v || typeof v !== "object" || Array.isArray(v)) continue
+      if (String(v.day ?? "") !== today) continue
+      const oc = String(v.outcome ?? "")
+      if (oc !== "claimed" && oc !== "done") continue
+      const credit = Number(v.credit) || 0
+      if (!(credit > 0)) continue
+      const bar = String(k).indexOf("|")
+      const vendor = bar >= 0 ? String(k).slice(0, bar) : String(k)
+      const login = bar >= 0 ? String(k).slice(bar + 1) : ""
+      if (!login) continue
+      if (vendor !== "workbuddy" && !vendor.startsWith("workbuddy#")) continue
+      const uid = byLogin.get(login) || byLogin.get(`workbuddy#${login}`) || ""
+      if (!uid) continue
+      out.set(uid, Math.max(out.get(uid) ?? 0, credit))
+    }
+    return out
+  }
+
   function computeStats() {
     // 「今日」口径（P3-1）：与全仓日期口径（排程窗口/同日去重/连登/夜猫子）一致，
     // 一律**北京日**（engine/constants 的 beijingDateKey，UTC 16:00 整翻北京日）。
@@ -1410,17 +1517,32 @@ export async function startDaemon(opts = {}) {
     let credit = 0
     let energy = 0
     const jobIds = new Set()
+    // 今日 history 里签到行的积分（按账号）：与 magpie 账本合并时要按账号取较大值，
+    // 不能直接相加（同一天手签 + 本体自动签是同一份收益的两种记录）。
+    const historyCheckin = new Map()
     for (const r of history) {
       if (beijingDayFromIso(r.at) !== today) continue
       if (r.state === "ok" || r.state === "skip") {
-        credit += Number(r.credit) || 0
+        const c = Number(r.credit) || 0
+        credit += c
         energy += Number(r.energy) || 0
+        if (r.leg === "checkin" && r.uid) historyCheckin.set(r.uid, (historyCheckin.get(r.uid) ?? 0) + c)
       }
       if (r.jobId) jobIds.add(r.jobId)
     }
+    // 签到收益归位（issue #6）：magpie 本体（auth.checkin / settings.workbuddyCheckin）
+    // 自动签到的收益只写它自己的账本，本插件的 history 看不到。按账号取两边较大值
+    // 计入今日积分 —— 上游一天只给一次，相加会把同一份收益算两遍。
+    const ledger = magpieCheckinCreditsByUid(today)
+    let checkinCredit = 0
+    for (const uid of new Set([...ledger.keys(), ...historyCheckin.keys()])) {
+      checkinCredit += Math.max(Number(historyCheckin.get(uid)) || 0, Number(ledger.get(uid)) || 0)
+    }
+    const historyCheckinTotal = [...historyCheckin.values()].reduce((a, b) => a + b, 0)
+    credit += checkinCredit - historyCheckinTotal
     const cur = runner?.current?.() ?? null
     if (cur) jobIds.add(cur.id)
-    return { creditsToday: credit, energyToday: energy, runs: jobIds.size }
+    return { creditsToday: credit, energyToday: energy, runs: jobIds.size, checkinCreditsToday: checkinCredit }
   }
 
   // ---- SSE ---------------------------------------------------------------
@@ -3101,6 +3223,9 @@ export async function startDaemon(opts = {}) {
         return
       }
       const r = await manualOp(() => doCheckin(body.uids))
+      // 签到收益落历史（issue #6）：只有真跑成的回执才记（manualOp 的 409/500
+      // 没有 rows，不清空、不伪造）。
+      if (r.status === 200 && Array.isArray(r.body)) recordCheckinHistory(r.body)
       json(res, r.status, r.body)
       return
     }
