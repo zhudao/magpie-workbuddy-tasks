@@ -919,6 +919,7 @@ export function selectableCodes(a) {
 function campaignPickCodes(a) {
   const out = [];
   for (const act of campaignActivities(campaignOf(a))) {
+    if (act?.ended) continue;
     const ac = String(act?.code ?? "").trim();
     if (!ac) continue;
     for (const t of Array.isArray(act?.tasks) ? act.tasks : []) {
@@ -1309,7 +1310,7 @@ function groupCountText(g) {
     for (const act of g.acts) {
       const ts = Array.isArray(act?.tasks) ? act.tasks : [];
       total += ts.length;
-      pending += campaignNum(act?.claimable);
+      if (!act?.ended) pending += campaignNum(act?.claimable);
     }
     return `· ${total} 项 · 待领 ${pending}`;
   }
@@ -1427,13 +1428,18 @@ function campaignStatusNote(a) {
 function campaignActHead(act) {
   const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
   const label = String(act?.label ?? act?.code ?? "活动").trim() || "活动";
+  const ended = !!act?.ended;
+  const endedReason = String(act?.endedReason ?? "").trim() || "活动未开始或已结束";
   const sep = () => el("span", { class: "tact-sep", text: "·" });
+  const endedBadge = ended ? badge("已结束", "badge-quiet") : null;
+  if (endedBadge) endedBadge.title = endedReason;
   return el(
     "div",
     { class: "tact-head" },
     el("span", { class: "tact-name", text: label }),
+    endedBadge,
     sep(),
-    el("span", { class: "tact-meta", text: `可领 ${campaignNum(act?.claimable)}` }),
+    el("span", { class: "tact-meta", text: `可领 ${ended ? 0 : campaignNum(act?.claimable)}` }),
     sep(),
     el("span", { class: "tact-meta", text: `已领 ${campaignClaimedCount(act)}/${tasks.length}` }),
   );
@@ -1448,7 +1454,9 @@ function campaignTaskRow(a, act, t, opts = {}) {
   const taskCode = String(t?.taskCode ?? "").trim();
   const code = activityCode && taskCode ? `${activityCode}:${taskCode}` : "";
   const claimed = campaignTaskClaimed(t);
-  const claimable = campaignTaskClaimable(t);
+  const ended = !!act?.ended;
+  const endedReason = String(act?.endedReason ?? "").trim() || "活动未开始或已结束";
+  const claimable = !ended && campaignTaskClaimable(t);
   const isApp = String(t?.kind ?? "") === "app";
   const label = String(t?.label ?? taskCode ?? "任务");
 
@@ -1463,6 +1471,8 @@ function campaignTaskRow(a, act, t, opts = {}) {
         onclick: (ev) => claimCampaignOne(uid, activityCode, taskCode, ev.target),
       }),
     );
+  } else if (ended && !claimed) {
+    actions.append(el("span", { class: "muted", text: "活动已结束", title: endedReason }));
   } else if (isApp && !claimed) {
     actions.append(el("span", { class: "muted", text: "需手机端完成" }));
   } else if (!claimed) {
@@ -1480,22 +1490,29 @@ function campaignTaskRow(a, act, t, opts = {}) {
   if (opts.showAct) marks.push(el("span", { class: "pin-id", text: String(act?.label ?? act?.code ?? "活动") }));
 
   const notes = [];
-  if (isApp) notes.push("需手机端 App 完成，脚本不伪造");
-  if (!claimed && !claimable && !isApp) notes.push("点分组标题的「跑一轮活动任务」执行");
+  if (ended && !claimed) notes.push(endedReason);
+  else {
+    if (isApp) notes.push("需手机端 App 完成，脚本不伪造");
+    if (!claimed && !claimable && !isApp) notes.push("点分组标题的「跑一轮活动任务」执行");
+  }
 
   const status = claimed
     ? badge(ACCEPT_NAMES.claimed, "badge-quiet")
-    : claimable
-      ? badge(ACCEPT_NAMES.completed, "badge-warn")
-      : badge("未完成", "badge-quiet");
+    : ended
+      ? badge("已结束", "badge-quiet")
+      : claimable
+        ? badge(ACCEPT_NAMES.completed, "badge-warn")
+        : badge("未完成", "badge-quiet");
   const target = campaignNum(t?.target);
   const cur = campaignNum(t?.progress);
   const reward = campaignNum(t?.credit);
   const pickTitle = claimed
     ? "已领奖，无需再跑"
-    : code
-      ? "勾选后批量操作只作用于选中任务；不勾选 = 全部"
-      : "缺少活动码 / 任务码，无法勾选";
+    : ended
+      ? `${endedReason}，无需再跑`
+      : code
+        ? "勾选后批量操作只作用于选中任务；不勾选 = 全部"
+        : "缺少活动码 / 任务码，无法勾选";
 
   return el(
     "div",
@@ -1509,8 +1526,8 @@ function campaignTaskRow(a, act, t, opts = {}) {
         el("input", {
           type: "checkbox",
           dataset: { taskPick: uid, code },
-          checked: !claimed && !!code && isPicked(uid, code),
-          disabled: !code || claimed,
+          checked: !claimed && !ended && !!code && isPicked(uid, code),
+          disabled: !code || claimed || ended,
           "aria-label": `选择活动任务 ${label}`,
           onchange: (ev) => setPicked(uid, code, ev.target.checked),
         }),
@@ -1556,7 +1573,7 @@ async function claimCampaignOne(uid, activityCode, taskCode, btn) {
       r?.ok ? `活动任务领取成功：+${fmtNum(r.credit)} 积分${viaNote}` : `活动任务领取未成功：${r?.reason || "见任务行提示"}`,
       r?.ok ? "info" : "warn",
     );
-    if (r?.ok) await queryCampaign(uid); // 成功后就地补查活动缓存，让分组计数/进度跟手更新
+    if (r?.ok || r?.ended) await queryCampaign(uid); // 成功后（或活动已结束时）就地补查活动缓存，让分组计数/进度跟手更新
   } catch (e) {
     btn.disabled = false;
     btn.textContent = "领取";
@@ -1750,7 +1767,7 @@ function taskTotals(a) {
   for (const act of campaignActivities(campaignOf(a))) {
     const ts = Array.isArray(act?.tasks) ? act.tasks : [];
     campTotal += ts.length;
-    campPending += ts.filter(campaignTaskClaimable).length;
+    if (!act?.ended) campPending += ts.filter(campaignTaskClaimable).length;
     campClaimed += ts.filter(campaignTaskClaimed).length;
   }
   return {
@@ -3967,6 +3984,7 @@ function campaignClaimedCount(act) {
 // 活动是否「已完成」（CONTRACT §11.5 口径）：可领 0 且全部任务 claimedAt 非空。
 // 没有任务的活动（tasks 为空）按「全部已领」成立，也归入已完成 —— 没什么可做的就该折叠下去。
 function campaignActDone(act) {
+  if (act?.ended) return true;
   if (campaignNum(act?.claimable) !== 0) return false;
   const tasks = Array.isArray(act?.tasks) ? act.tasks : [];
   return tasks.every(campaignTaskClaimed);

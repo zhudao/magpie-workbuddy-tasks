@@ -54,7 +54,7 @@ const UID_OK = "u-campaign-ok";
 const UID_FROZEN = "u-campaign-frozen";
 
 // ---- 假上游：活动 portal 两端点 + MP/桌面事件上报 + 专家市场 + 最小成长应答 -------
-function makeStub() {
+function makeStub(opts = {}) {
   const calls = [];
   const completed = new Set();
   const claimed = new Set();
@@ -101,7 +101,11 @@ function makeStub() {
       return respond(200, { code: 0, data: { tasks, progress } });
     }
     const viewMatch = /^\/portal\/activity\/tasks\/([^/]+)\/viewed$/.exec(u.pathname);
-    if (viewMatch) return respond(200, { code: 0 });
+    if (viewMatch) {
+      const campaign = u.searchParams.get("activity_code") ?? "";
+      if (opts.viewEnded?.[campaign]) return respond(410, { code: 12331, msg: "活动未开始或已结束" });
+      return respond(200, { code: 0 });
+    }
     const claimMatch = /^\/portal\/activity\/tasks\/([^/]+)\/claim$/.exec(u.pathname);
     if (claimMatch) {
       const task = decodeURIComponent(claimMatch[1]);
@@ -188,8 +192,8 @@ const frozenFile = join(stateDir, "frozen.json");
 const base = () => `http://127.0.0.1:${h.port}`;
 let h = null;
 
-async function boot({ runner } = {}) {
-  stub = makeStub();
+async function boot({ runner, stubOpts } = {}) {
+  stub = makeStub(stubOpts);
   return startDaemon({
     args: { cfg: cfgDir, state: stateDir, port: "0", key: DAEMON_KEY },
     now: clock.now,
@@ -528,5 +532,28 @@ describe("POST /api/campaign/claim（单条活动任务领奖，§11.6 第 3 条
       "未达成绝不 POST 领奖（成功用例里 ai_chat 的 claim POST 不计入）",
     );
     assert.ok(stub.calls.length > n0, "但清单读取发生了（拿进度与 reward_credit）");
+  });
+
+  test("viewed 命中 410 / code 12331 后，后续刷新缓存仍保留 ended:true 标注（issue #8）", async () => {
+    await h.stop();
+    h = await boot({ stubOpts: { viewEnded: { campaign_starbucks_2026: true } } });
+    const runRes = await fetch(`${base()}/api/campaign/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uids: [UID_OK] }),
+    });
+    assert.equal(runRes.status, 200);
+    const results = await runRes.json();
+    assert.equal(results[0].outcome, "ok");
+    assert.equal(results[0].earned, 200);
+
+    // 哪怕 GET /portal/activity/tasks 仍返回 200，refresh=1 刷新后星巴克仍带 ended:true
+    const q = await (await fetch(`${base()}/api/campaign?uid=${UID_OK}&refresh=1`)).json();
+    const star = q.campaign.activities.find((a) => a.code === "campaign_starbucks_2026");
+    const rep = q.campaign.activities.find((a) => a.code === "campaign_reporter_2026");
+    assert.equal(star.ended, true);
+    assert.equal(star.endedReason, "活动未开始或已结束");
+    assert.equal(star.claimable, 0);
+    assert.equal(rep.ended, undefined);
   });
 });

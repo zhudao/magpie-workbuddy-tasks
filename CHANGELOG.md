@@ -1,5 +1,27 @@
 # 更新日志
 
+## 0.4.2 — 2026-11-27
+
+**修复活动终态（`410 / 12331`）卡轮询 + 快照残留体验优化**（社区 issue #8）。
+
+### 修
+
+- **活动已结束/未开始不再继续上报与长时间轮询**（issue #8）：
+  - `engine/campaign.mjs` 在 `campaignView()`、`campaignClaim()`、`fetchCampaignRows()`、`campaignPoll()`、`claimCampaignTask()` 中统一识别活动终态（`res.status === 410 || res.code === 12331`），返回 `{ ended: true, reason }`。
+  - `runCampaignTasks()` 命中活动终态时输出 `☕️ <活动名>: <原因>，跳过` 并直接 `break` 跳出当前活动的任务循环，不再继续事件上报与慢轮询，后续其他活动正常执行。
+  - `daemon.mjs` 记住由写接口/轮询发现的已结束活动，并在后续刷新活动缓存（`refreshCachedAfterJob` / `GET /api/campaign`）时保留 `ended: true` 与 `claimable: 0`（写操作恢复成功时自动清除）。
+  - `dashboard/app.js` 在活动子标题与任务行展示「已结束」徽章与原因，禁用已结束活动任务勾选并从待领奖计数中排除。
+
+### 优化
+
+- **陈旧快照提示与收尾刷新预算**：
+  - `engine/tasks.mjs` 在勾选任务不在实时任务表时补充提示「上游可能已下线或本地快照过期，请点击「刷新快照」更新列表」。
+  - `daemon.mjs` 的 `finalizeJob` 收尾 `refreshSnapshots` 跳过整号跳过的账号，并将预算放宽至 `Math.max(12000, uids.length * 8000)`、上限 `20` 个账号，减少多账号下陈旧任务残留在看板列表的情况。
+
+### 自查
+
+- 单元与端到端回归测试通过（含 `release-consistency` 版本一致性校验与 NAS 真实环境联调验证）。
+
 ## 0.4.1 — 2026-11-23
 
 **签到收益归位 + 文档指路**（社区 issue #6）。只动签到记账与文案，成长/小程序/活动三条腿的行为与接口零变化。

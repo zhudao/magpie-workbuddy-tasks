@@ -292,6 +292,21 @@ export class JobRunner {
     };
   }
 
+  _campaignOpts(acct) {
+    const out = {};
+    if (typeof this.opts.onCampaignEnded === "function") {
+      out.onCampaignEnded = (code, reason) => {
+        try { this.opts.onCampaignEnded(acct.uid, code, reason); } catch {}
+      };
+    }
+    if (typeof this.opts.onCampaignActive === "function") {
+      out.onCampaignActive = (code) => {
+        try { this.opts.onCampaignActive(acct.uid, code); } catch {}
+      };
+    }
+    return out;
+  }
+
   _step(job, acct, leg, state, detail = "") {
     const step = {
       uid: acct.uid,
@@ -448,6 +463,7 @@ export class JobRunner {
             // growth 腿的 2b 与 mp 腿都要带 —— 锁定的任务整条跳过（不接取/不点亮），
             // 接取被上游锁拒时落盘锁原因，领奖成功时记领奖日期并锁下一环。
             ...((leg === "growth" || leg === "mp") ? this._mpLockOpts(acct) : {}),
+            ...(leg === "campaign" ? this._campaignOpts(acct) : {}),
           };
           if (leg === "growth") res = await runGrowthTasks(acct, legOpts);
           else if (leg === "mp") res = await runMiniProgramTasks(acct, legOpts);

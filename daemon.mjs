@@ -79,9 +79,9 @@ import { beijingDateKey, beijingHour, DEFAULT_GAP_MS, MIN_UPSTREAM_GAP_MS } from
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.1")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.2")
   } catch {
-    return "0.4.1"
+    return "0.4.2"
   }
 })()
 
@@ -830,6 +830,55 @@ export async function startDaemon(opts = {}) {
   const saveFrozen = () => writeJson(frozenFile, frozenState)
   const saveMPLocks = () => writeJson(mpLocksFile, mpLocks)
 
+  // 已结束/未开始的活动记忆表（uid -> Map<activityCode, reason>）：
+  // 活动任务列表接口（GET /portal/activity/tasks）有时在活动结束后仍返回 200 任务列表，
+  // 只有写接口（viewed / claim）才返回 HTTP 410 / code 12331。这里记住已命中 410/12331
+  // 的活动，合并进后续 fetchCampaignState 缓存投影里，避免看板继续误以为还能做；
+  // 一旦该活动写操作恢复成功（onCampaignActive），自动清除标记。
+  const endedCampaigns = new Map()
+  for (const [uid, st] of Object.entries(campaignCache)) {
+    const acts = Array.isArray(st?.activities) ? st.activities : []
+    for (const act of acts) {
+      if (act?.ended && act?.code) {
+        if (!endedCampaigns.has(uid)) endedCampaigns.set(uid, new Map())
+        endedCampaigns.get(uid).set(String(act.code), String(act.endedReason || "活动未开始或已结束"))
+      }
+    }
+  }
+  function applyCampaignEnded(uid, st) {
+    if (!st || typeof st !== "object" || !Array.isArray(st.activities)) return st
+    const map = endedCampaigns.get(String(uid ?? ""))
+    if (!map || !map.size) return st
+    return {
+      ...st,
+      activities: st.activities.map((act) => {
+        if (!act || typeof act !== "object" || act.ended) return act
+        const reason = map.get(String(act.code ?? ""))
+        if (!reason) return act
+        return { ...act, ended: true, endedReason: reason, claimable: 0 }
+      }),
+    }
+  }
+  function markCampaignEnded(uid, code, reason = "活动未开始或已结束") {
+    const key = String(uid ?? "")
+    const actCode = String(code ?? "")
+    if (!key || !actCode) return
+    const why = String(reason || "活动未开始或已结束")
+    if (!endedCampaigns.has(key)) endedCampaigns.set(key, new Map())
+    endedCampaigns.get(key).set(actCode, why)
+    if (campaignCache[key]) {
+      campaignCache[key] = applyCampaignEnded(key, campaignCache[key])
+      saveCampaign()
+    }
+  }
+  function clearCampaignEnded(uid, code) {
+    const key = String(uid ?? "")
+    const actCode = String(code ?? "")
+    const map = endedCampaigns.get(key)
+    if (!map || !map.delete(actCode)) return
+    if (!map.size) endedCampaigns.delete(key)
+  }
+
   // normalizeFrozenState(raw)：冻结台账逐条归一（CONTRACT §10.5 的
   // {uid:{at:ISO, code, message}}）。at 解析不出就记当前时刻（冻结语义不依赖
   // 精确时刻，宁可补一个也不丢条目）；code 保留原值（number|string 都合法）；
@@ -1022,6 +1071,8 @@ export async function startDaemon(opts = {}) {
     onMPLock: (uid, code, until, reason) => recordMPLock(uid, code, until, reason),
     onMPClaimed: (uid, code) => recordMPClaim(uid, code),
     mpLockedCodes: (uid) => Object.keys(lockedMapFor(uid)),
+    onCampaignEnded: (uid, code, reason) => markCampaignEnded(uid, code, reason),
+    onCampaignActive: (uid, code) => clearCampaignEnded(uid, code),
     // 铁律 4：全局节流器（上面创建的唯一实例）—— job 腿与 token 刷新的每一次
     // 上游调用都经它排队对齐，与快照刷新/手动操作共用同一份「上次放行时刻」。
     ...(upstreamSpacer ? { spacer: upstreamSpacer } : {}),
@@ -1230,6 +1281,8 @@ export async function startDaemon(opts = {}) {
         ? {
             onLock: (code, until, reason) => recordMPLock(acct.uid, code, until, reason),
             onClaimed: (code) => recordMPClaim(acct.uid, code),
+            onCampaignEnded: (code, reason) => markCampaignEnded(acct.uid, code, reason),
+            onCampaignActive: (code) => clearCampaignEnded(acct.uid, code),
           }
         : {}),
     }
@@ -1244,14 +1297,14 @@ export async function startDaemon(opts = {}) {
   // ---- 快照（/api/state 的 tasks/energy/streak；只在闲时刷新，限流） ------
   let snapBusy = false
 
-  async function refreshSnapshots(uids, budgetMs = 12000) {
+  async function refreshSnapshots(uids, budgetMs = 12000, maxCount = 5) {
     const fetchTasks = engine?.tasks?.fetchTasks
     if (typeof fetchTasks !== "function" || snapBusy) return
     if (runner?.current()) return // 有 job 在跑就让路，别跟它抢限速窗口
     snapBusy = true
     try {
       const deadline = now() + budgetMs
-      for (const uid of uids.slice(0, 5)) {
+      for (const uid of uids.slice(0, maxCount)) {
         if (now() > deadline || runner?.current()) break
         const acct = accountByUid(uid)
         if (!acct) continue
@@ -1363,7 +1416,7 @@ export async function startDaemon(opts = {}) {
           // 只写缓存投影（与 fetchCampaignForUid/fetchStreakForUid 成功路径同一
           // 落点）：/api/state 的 accounts[].campaign|streak 与 GET /api/campaign
           // |streak 的 TTL（state.updatedISO）从下一次读取起自动看到新值。
-          spec.cache[uid] = state
+          spec.cache[uid] = kind === "campaign" ? applyCampaignEnded(uid, state) : state
           spec.save()
         } else {
           log(`[${spec.tag}] ${uid} 刷新失败：${scrub(String(state?.error || state?.msg || spec.fallback))}`)
@@ -1625,8 +1678,8 @@ export async function startDaemon(opts = {}) {
     // 与 /api/run、/api/stop 一致：出门前过 safeJob（洗日志 + 不带内部字段）
     broadcast({ kind: "job", job: safeJob(job) })
     const steps = Array.isArray(job.steps) ? job.steps : []
-    const uids = [...new Set(steps.map((s) => s.uid).filter(Boolean))]
-    if (uids.length) refreshSnapshots(uids, 12000).catch(() => {})
+    const uids = [...new Set(steps.filter((s) => s.state !== "skip").map((s) => s.uid).filter(Boolean))]
+    if (uids.length) refreshSnapshots(uids, Math.max(12000, uids.length * 8000), 20).catch(() => {})
     // 活动缓存收尾刷新（CONTRACT §11.5）：只刷真跑过 campaign 腿的账号 ——
     // 腿没跑（无 campaign step）或整账号冻结跳过的（step.state === "skip"，
     // 上游一个活动请求都没发过）都不刷，没跑就查一次上游是浪费。收尾是
@@ -2206,7 +2259,7 @@ export async function startDaemon(opts = {}) {
     spec.busy.v = true
     try {
       const r = await fn(acct, spec.optsFor(acct, param), param)
-      const payload = spec.payloadOf(r, param)
+      const payload = spec.payloadOf(r, param, uid)
       if (payload) {
         spec.cache[uid] = payload
         spec.save()
@@ -2274,7 +2327,7 @@ export async function startDaemon(opts = {}) {
         const atMs = Date.parse(String(c?.updatedISO ?? ""))
         return Number.isFinite(atMs) && now() - atMs < CREDITS_TTL_MS
       },
-      payloadOf: (r) => (r?.ok ? r : null),
+      payloadOf: (r, _param, uid) => (r?.ok ? applyCampaignEnded(uid, r) : null),
       fallbackMsg: "连登状态查询失败",
       body: {
         cachedHit: (uid, _nickname, cached) => ({ uid, cached: true, streak: cached }),
@@ -2297,7 +2350,7 @@ export async function startDaemon(opts = {}) {
         const atMs = Date.parse(String(c?.updatedISO ?? ""))
         return Number.isFinite(atMs) && now() - atMs < CREDITS_TTL_MS
       },
-      payloadOf: (r) => (r?.ok ? r : null),
+      payloadOf: (r, _param, uid) => (r?.ok ? applyCampaignEnded(uid, r) : null),
       fallbackMsg: "活动任务读取失败",
       body: {
         cachedHit: (uid, _nickname, cached) => ({ uid, cached: true, campaign: cached }),
@@ -2631,6 +2684,7 @@ export async function startDaemon(opts = {}) {
       energy: r?.energy ?? 0,
       via: "",
       reason: scrub(r?.reason ?? ""),
+      ...(r?.ended ? { ended: true } : {}),
     }
   }
 

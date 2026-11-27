@@ -109,6 +109,14 @@ function campaignStub(opts = {}, clock = fakeClock(NOW)) {
     // 活动清单读取
     if (u.pathname === "/portal/activity/tasks" && method === "GET") {
       const campaign = u.searchParams.get("activity_code") ?? "";
+      if (opts.readEnded?.[campaign]) {
+        const e = opts.readEnded[campaign];
+        return respond(e.status ?? 410, e.body ?? { code: 12331, msg: "活动未开始或已结束" });
+      }
+      if (opts.pollEnded?.[campaign] && calls.filter((c) => c.path === "/portal/activity/tasks" && c.query.includes(campaign)).length > 1) {
+        const e = opts.pollEnded[campaign];
+        return respond(e.status ?? 410, e.body ?? { code: 12331, msg: "活动未开始或已结束" });
+      }
       if (opts.readFailure?.[campaign]) {
         const f = opts.readFailure[campaign];
         return respond(f.status ?? 500, f.body ?? { msg: "upstream boom" });
@@ -151,13 +159,23 @@ function campaignStub(opts = {}, clock = fakeClock(NOW)) {
     // viewed / claim（portal 契约）
     const viewMatch = /^\/portal\/activity\/tasks\/([^/]+)\/viewed$/.exec(u.pathname);
     if (viewMatch) {
-      viewed.push({ task: decodeURIComponent(viewMatch[1]), campaign: u.searchParams.get("activity_code") });
+      const campaign = u.searchParams.get("activity_code") ?? "";
+      if (opts.viewEnded?.[campaign]) {
+        const e = opts.viewEnded[campaign];
+        return respond(e.status ?? 410, e.body ?? { code: 12331, msg: "活动未开始或已结束" });
+      }
+      viewed.push({ task: decodeURIComponent(viewMatch[1]), campaign });
       return respond(200, { code: 0 });
     }
     const claimMatch = /^\/portal\/activity\/tasks\/([^/]+)\/claim$/.exec(u.pathname);
     if (claimMatch) {
       const task = decodeURIComponent(claimMatch[1]);
-      claims.push({ task, campaign: u.searchParams.get("activity_code") });
+      const campaign = u.searchParams.get("activity_code") ?? "";
+      if (opts.claimEnded?.[campaign]) {
+        const e = opts.claimEnded[campaign];
+        return respond(e.status ?? 410, e.body ?? { code: 12331, msg: "活动未开始或已结束" });
+      }
+      claims.push({ task, campaign });
       if (!opts.claimWithoutReceipt) {
         if (opts.receiptOnRead?.[task]) {
           receiptReads.set(task, 0); // 回执延迟：从下一次回读开始计数
@@ -809,4 +827,95 @@ test("campaign：LEG_ORDER 顺序钉死 —— campaign 插在 mp 与 streak 之
     ["growth", "mp", "campaign", "streak", "buddy", "travel", "night"],
     "CONTRACT §11.1 的 LEG_ORDER",
   );
+});
+
+// ---- issue #8：HTTP 410 / code 12331（活动未开始或已结束）提前中止 ---------------
+
+test("campaign：viewed 返回 HTTP 410 / code 12331 —— 立即跳过该活动，不上报不轮询，其余活动照跑", async () => {
+  const stub = campaignStub({
+    viewEnded: { campaign_starbucks_2026: { status: 410, body: { code: 12331, msg: "活动未开始或已结束" } } },
+  });
+  const res = await run(stub);
+  assert.equal(res.ok, true, "活动已结束属于正常跳过，不记失败");
+  assert.equal(res.earned, 200, "星巴克跳过，记者节 3 项照常入账 200");
+  assert.ok(
+    res.logs.some((l) => l.includes("☕️ 星巴克协作: 活动未开始或已结束，跳过")),
+    res.logs.join("\n"),
+  );
+  // 星巴克：只在 ai_chat 调了一次 viewed 就短路，零上报、零轮询、expert/app 不再触碰
+  const starViews = stub.calls.filter((c) => c.path.includes("/viewed") && c.query.includes("campaign_starbucks_2026"));
+  assert.equal(starViews.length, 1, "只打过一次 viewed 就跳出当前活动");
+  const starReads = stub.calls.filter((c) => c.path === "/portal/activity/tasks" && c.query.includes("campaign_starbucks_2026"));
+  assert.equal(starReads.length, 1, "绝不进入判据轮询（只读过初始 1 次）");
+  const mpEvents = stub.reports.filter((r) => r.kind === "mp").flatMap((r) => r.events);
+  assert.ok(!mpEvents.some((e) => e.pageName === "starbucks_activity"), "星巴克绝不上报任何判据事件");
+  assert.ok(!res.logs.some((l) => l.includes("与 AI 对话3次: 等待上游落库")), "星巴克绝不进入等待上游落库轮询");
+  assert.ok(!res.logs.some((l) => l.includes("召唤专家并对话: 等待上游落库")), "星巴克后续任务也绝不进入轮询");
+  // state 标记星巴克为已结束
+  const starState = res.state.activities.find((a) => a.code === "campaign_starbucks_2026");
+  assert.equal(starState.ended, true);
+  assert.equal(starState.endedReason, "活动未开始或已结束");
+  assert.equal(starState.claimable, 0);
+  assert.equal(starState.error, "");
+  const repState = res.state.activities.find((a) => a.code === "campaign_reporter_2026");
+  assert.equal(repState.ended, undefined);
+});
+
+test("campaign：claim 返回 410 / code 12331 —— runCampaignTasks 跳过且 claimCampaignTask 返回 ended:true", async () => {
+  // HTTP 200 + code 12331 也要能识别
+  const a = campaignStub({
+    claimEnded: { campaign_starbucks_2026: { status: 200, body: { code: 12331, msg: "活动未开始或已结束" } } },
+  });
+  a.completed.add("ai_chat");
+  const ra = await run(a, { codes: ["campaign_starbucks_2026"] });
+  assert.equal(ra.ok, true);
+  assert.equal(ra.earned, 0);
+  assert.ok(ra.logs.some((l) => l.includes("☕️ 星巴克协作: 活动未开始或已结束，跳过")));
+  assert.equal(a.reports.length, 0, "在 ai_chat 领奖时命中结束即跳出，后续 expert 不再上报");
+  assert.equal(ra.state.activities[0].ended, true);
+
+  // 单任务领奖出口 claimCampaignTask
+  const b = campaignStub({
+    claimEnded: { campaign_starbucks_2026: { status: 410, body: { code: 12331, msg: "活动未开始或已结束" } } },
+  });
+  b.completed.add("ai_chat");
+  const rb = await claimOne(b, { activity: "campaign_starbucks_2026", task: "ai_chat" });
+  assert.equal(rb.ok, false);
+  assert.equal(rb.ended, true);
+  assert.equal(rb.credit, 0);
+  assert.match(rb.reason, /活动未开始或已结束/);
+});
+
+test("campaign：轮询期间命中 410 / code 12331 —— 立即中止轮询与当前活动", async () => {
+  const stub = campaignStub({
+    needViewFalse: true,
+    landOnCheck: { ai_chat: 999 },
+    pollEnded: { campaign_starbucks_2026: { status: 410, body: { code: 12331, msg: "活动未开始或已结束" } } },
+  });
+  const res = await run(stub, { codes: ["campaign_starbucks_2026"] });
+  assert.equal(res.ok, true);
+  assert.ok(res.logs.some((l) => l.includes("☕️ 星巴克协作: 活动未开始或已结束，跳过")));
+  const starReads = stub.calls.filter((c) => c.path === "/portal/activity/tasks" && c.query.includes("campaign_starbucks_2026"));
+  assert.equal(starReads.length, 2, "初始 1 次 + 轮询第 1 次命中 410 即停（绝不再等 3×6 + 6 次）");
+  assert.equal(stub.reports.filter((r) => r.kind === "mp").length, 1, "只发过一次 ai_chat，expert 不再触发");
+});
+
+test("campaign：清单读取本身返回 410 / code 12331 —— fetchCampaignState 与 runCampaignTasks 均正常处理", async () => {
+  const stub = campaignStub({
+    readEnded: { campaign_starbucks_2026: { status: 410, body: { code: 12331, msg: "活动未开始或已结束" } } },
+  });
+  const st = await fetchCampaignState(makeAcct(), {
+    now: stub.clock.now, sleep: stub.clock.sleep, fetch: stub.fetchImpl, gap: GAP,
+  });
+  assert.equal(st.ok, true);
+  const star = st.activities.find((a) => a.code === "campaign_starbucks_2026");
+  assert.equal(star.ended, true);
+  assert.equal(star.error, "");
+  assert.equal(star.tasks.length, 0);
+
+  const res = await run(stub);
+  assert.equal(res.ok, true);
+  assert.equal(res.earned, 200);
+  assert.ok(res.logs.some((l) => l.includes("☕️ 星巴克协作: 活动未开始或已结束，跳过")));
+  assert.ok(!res.logs.some((l) => l.includes("活动任务读取失败")), "已结束不能写成读取失败");
 });

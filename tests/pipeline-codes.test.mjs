@@ -68,6 +68,7 @@ test("codes：只接取/点亮/领奖选中的任务，未选中的完全不动�
   // 日志口径：仅处理选中的 N 项任务（去重后 3 项，含任务表里没有的 missing_code）
   assert.ok(text.includes("仅处理选中的 3 项任务"), text);
   assert.ok(text.includes("不在任务表中"), text);
+  assert.ok(text.includes("刷新快照"), text);
   assert.ok(text.includes("missing_code"), text);
 
   // 批量接取批次里只有选中的 create_canvas（chat_5 已接取、missing_code 不存在、

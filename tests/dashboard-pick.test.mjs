@@ -132,3 +132,28 @@ test("缺快照 / 缺活动状态时不抛错，返回空数组", () => {
   assert.deepEqual(selectableCodes({ uid: "u1", snapshot: null, campaign: null }), []);
   assert.deepEqual(selectableCodes(undefined), []);
 });
+
+test("活动已结束（ended:true）的任务不进可选码，未结束活动照常可选", () => {
+  const a = {
+    uid: "u1",
+    snapshot: { tasks: [] },
+    campaign: {
+      activities: [
+        {
+          code: "campaign_starbucks_2026",
+          ended: true,
+          endedReason: "活动未开始或已结束",
+          tasks: [
+            { taskCode: "ai_chat", claimedAt: "" },
+            { taskCode: "expert", claimedAt: "" },
+          ],
+        },
+        {
+          code: "campaign_reporter_2026",
+          tasks: [{ taskCode: "expert_chat", claimedAt: "" }],
+        },
+      ],
+    },
+  };
+  assert.deepEqual(codesOf(a), ["campaign_reporter_2026:expert_chat"]);
+});

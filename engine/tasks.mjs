@@ -1184,7 +1184,8 @@ export async function runGrowthTasks(acct, opts = {}) {
     if (missing.length) {
       emit(
         `! 选中的 ${missing.length} 项任务不在任务表中，本轮跳过: ${missing.slice(0, 5).join(", ")}` +
-        (missing.length > 5 ? " ..." : ""),
+        (missing.length > 5 ? " ..." : "") +
+        "（上游可能已下线或本地快照过期，请点击「刷新快照」更新列表）",
       );
     }
   }

@@ -119,6 +119,19 @@ export const CAMPAIGN_CLAIM_GAP_MS = 4000;  // CAMPAIGN_CLAIM_GAP = 4：领奖�
 export const CAMPAIGN_CLAIM_POLL_TRIES = 5; // CAMPAIGN_CLAIM_POLL = 5
 export const CAMPAIGN_DESKTOP_WAIT_MS = 60000; // CAMPAIGN_DESKTOP_WAIT = 60（秒）
 export const CAMPAIGN_DESKTOP_POLL_MS = 6000;  // CAMPAIGN_DESKTOP_POLL = 6（秒）
+export const CAMPAIGN_ENDED_CODE = 12331;      // 活动未开始或已结束（HTTP 410 / code 12331）
+
+function isCampaignEndedRes(res) {
+  return res?.status === 410 || res?.code === CAMPAIGN_ENDED_CODE;
+}
+
+function campaignEndedReason(res) {
+  const m = String(res?.msg ?? "").trim();
+  if (!m || m === `code=${CAMPAIGN_ENDED_CODE}` || m === "HTTP 410") {
+    return "活动未开始或已结束";
+  }
+  return m;
+}
 
 // ---- 事件构造（hub `_campaign_*_events` 逐字移植；事件体本身不带 userId ——
 // 它们经 postCampaignEvents 上报，userId/timestamp 等公共字段由 mpBase 包络携带）--
@@ -275,6 +288,18 @@ async function fetchCampaignRows(acct, campaign, opts = {}, log = null) {
   if (res.restricted) {
     return { ok: false, restricted: true, rows: {}, error: res.msg || "restricted" };
   }
+  if (isCampaignEndedRes(res)) {
+    const reason = campaignEndedReason(res);
+    return {
+      ok: false,
+      ended: true,
+      rows: {},
+      error: "",
+      reason,
+      status: res.status ?? 0,
+      code: res.code ?? 0,
+    };
+  }
   if (!res.ok) {
     const snippet = String(res.raw || res.msg || "").slice(0, 80);
     const error = `活动任务读取失败[${campaign}]: HTTP ${res.status ?? 0} ${snippet}`.trim();
@@ -309,7 +334,15 @@ async function fetchCampaignRows(acct, campaign, opts = {}, log = null) {
 // 只聚合上游实际下发的 task（spec 里没下发的行不进 tasks —— runCampaignTasks 会
 // 为它们记「未下发/已下线」与 unavailable）。error 非空 = 读取失败（与 tasks 为
 // 空 = 没下发，两种状态严格区分）。
-function activityFromRead(spec, read) {
+function activityFromRead(spec, read, endedReason = "") {
+  if (read?.ended) {
+    return {
+      code: spec.code, label: spec.label, page: spec.page,
+      tasks: [], claimable: 0, claimed: 0, error: "",
+      ended: true,
+      endedReason: String(endedReason || read.reason || "活动未开始或已结束"),
+    };
+  }
   if (!read || !read.ok) {
     return {
       code: spec.code, label: spec.label, page: spec.page,
@@ -339,7 +372,17 @@ function activityFromRead(spec, read) {
       needView: !!row.needView,
     });
   }
-  return { code: spec.code, label: spec.label, page: spec.page, tasks, claimable, claimed, error: "" };
+  const ended = !!endedReason;
+  return {
+    code: spec.code,
+    label: spec.label,
+    page: spec.page,
+    tasks,
+    claimable: ended ? 0 : claimable,
+    claimed,
+    error: "",
+    ...(ended ? { ended: true, endedReason: String(endedReason) } : {}),
+  };
 }
 
 // specFilter(opts.codes)：活动 code 勾选（CONTRACT §11.1 fetchCampaignState 的
@@ -434,10 +477,10 @@ export async function fetchCampaignState(acct, opts = {}) {
     if (read.restricted) {
       return { ok: false, restricted: true, error: read.error || "账号已被风控限制", activities, updatedISO };
     }
-    if (!read.ok) {
-      if (!errText) errText = read.error;
-    } else {
+    if (read.ended || read.ok) {
       okCount += 1;
+    } else if (!errText) {
+      errText = read.error;
     }
     activities.push(activityFromRead(spec, read));
   }
@@ -480,14 +523,23 @@ async function campaignView(acct, campaign, task, opts = {}) {
     `?activity_code=${encodeURIComponent(String(campaign))}`;
   const res = await callJSON(acct, "chat", campaignBase(opts) + path, { method: "POST", body: "{}" }, opts);
   if (res.restricted) return { ok: false, restricted: true };
-  return { ok: !!res.ok };
+  if (isCampaignEndedRes(res)) {
+    return {
+      ok: false,
+      ended: true,
+      status: res.status ?? 0,
+      code: res.code ?? 0,
+      reason: campaignEndedReason(res),
+    };
+  }
+  return { ok: !!res.ok, status: res.status ?? 0, code: res.code ?? 0 };
 }
 
 // 领奖（hub `_campaign_claim`）：只 POST 成功**不算**成功 —— 提交后最多回读
 // CAMPAIGN_CLAIM_POLL_TRIES 次（间隔 CAMPAIGN_CLAIM_GAP_MS），必须看到
 // claimed_at 才记成功；没回读到就「下轮重试」。
-// -> {ok, reason, restricted?}：reason 是给人话的失败说明（含 HTTP 状态/正文
-// 片段；ok:true 时为空串）。批量腿只消费 ok/restricted，reason 供单任务出口
+// -> {ok, reason, restricted?, ended?}：reason 是给人话的失败说明（含 HTTP 状态/正文
+// 片段；ok:true 时为空串）。批量腿只消费 ok/restricted/ended，reason 供单任务出口
 // claimCampaignTask 透传给路由。
 async function campaignClaim(acct, campaign, task, credit, opts = {}, log = null) {
   const ctx = ctxOf(opts);
@@ -497,6 +549,15 @@ async function campaignClaim(acct, campaign, task, credit, opts = {}, log = null
     `?activity_code=${encodeURIComponent(String(campaign))}`;
   const res = await callJSON(acct, "chat", campaignBase(opts) + path, { method: "POST", body: "{}" }, opts);
   if (res.restricted) return { ok: false, restricted: true, reason: res.msg || "账号已被风控限制" };
+  if (isCampaignEndedRes(res)) {
+    return {
+      ok: false,
+      ended: true,
+      status: res.status ?? 0,
+      code: res.code ?? 0,
+      reason: campaignEndedReason(res),
+    };
+  }
   if (!res.ok) {
     const snippet = String(res.raw || res.msg || "").slice(0, 80);
     if (log) log(`⚠️ 领奖[${campaign}/${task}]: HTTP ${res.status ?? 0} ${snippet}`.trimEnd());
@@ -513,6 +574,15 @@ async function campaignClaim(acct, campaign, task, credit, opts = {}, log = null
     if (log) log(`   🎁 领奖[${campaign}/${task}]: 已提交，等待回执（第 ${i + 1}/${total} 次）`);
     const read = await fetchCampaignRows(acct, campaign, opts, log);
     if (read.restricted) return { ok: false, restricted: true, reason: read.error || "账号已被风控限制" };
+    if (read.ended) {
+      return {
+        ok: false,
+        ended: true,
+        status: read.status ?? 0,
+        code: read.code ?? 0,
+        reason: read.reason || "活动未开始或已结束",
+      };
+    }
     const row = (read.ok ? read.rows[task] : null) || {};
     if (row.claimedAt) {
       if (log) log(`🎁 领奖[${campaign}/${task}]: +${credit} 积分`);
@@ -549,11 +619,19 @@ export async function claimCampaignTask(acct, target, opts = {}) {
   try {
     const read = await fetchCampaignRows(acct, activity, opts);
     if (read.restricted) return fail(read.error || "账号已被风控限制", { restricted: true });
+    if (read.ended) {
+      const reason = read.reason || "活动未开始或已结束";
+      try { opts.onCampaignEnded?.(activity, reason); } catch {}
+      return fail(reason, { ended: true });
+    }
     if (!read.ok) return fail(read.error || "活动任务读取失败");
     const row = read.rows[task];
     if (!row) return fail(`活动 ${activity} 未下发任务 ${task}（未下发/已下线，或活动不存在）`);
     const credit = row.credit || 0;
-    if (row.claimedAt) return { ok: true, credit, energy: 0, reason: "" };
+    if (row.claimedAt) {
+      try { opts.onCampaignActive?.(activity); } catch {}
+      return { ok: true, credit, energy: 0, reason: "" };
+    }
     const targetCount = row.target || 1;
     if (!row.completedAt && (row.progress || 0) < targetCount) {
       // 与批量腿同一道门（completed_at 或 progress>=target 才领）：不给未达成的
@@ -562,7 +640,13 @@ export async function claimCampaignTask(acct, target, opts = {}) {
     }
     const got = await campaignClaim(acct, activity, task, credit, opts);
     if (got.restricted) return fail(got.reason || "账号已被风控限制", { restricted: true });
+    if (got.ended) {
+      const reason = got.reason || "活动未开始或已结束";
+      try { opts.onCampaignEnded?.(activity, reason); } catch {}
+      return fail(reason, { ended: true });
+    }
     if (!got.ok) return fail(got.reason || "领奖未完成（未回读到 claimed_at）");
+    try { opts.onCampaignActive?.(activity); } catch {}
     return { ok: true, credit, energy: 0, reason: "" };
   } catch (e) {
     return fail(`活动任务领奖失败：${String(e?.message ?? e).slice(0, 200)}`);
@@ -582,6 +666,7 @@ async function campaignPoll(acct, campaign, task, target, tries, gapMs, opts = {
     await ctx.breathe(gapMs ?? CAMPAIGN_GAP_MS);
     const read = await fetchCampaignRows(acct, campaign, opts, log);
     if (read.restricted) return { value: current, restricted: true };
+    if (read.ended) return { value: current, ended: true, reason: read.reason || "活动未开始或已结束" };
     const row = (read.ok ? read.rows[task] : null) || {};
     current = row.progress || 0;
     // 生命迹象：先打点再判达标（落库那一轮也有一行 —— 行数 = 检查次数）
@@ -682,9 +767,20 @@ export async function runCampaignTasks(acct, opts = {}) {
   }
   const wanted = sel.specs;
   const lastRead = new Map(); // 活动最后一次读取（成功或失败），结束时据此拼 state
+  const endedMap = new Map(); // 活动终态（410 / 12331）：code -> reason
+  const markEnded = (spec, reason) => {
+    const why = String(reason || "活动未开始或已结束");
+    endedMap.set(spec.code, why);
+    try { opts.onCampaignEnded?.(spec.code, why); } catch {}
+    emit(`☕️ ${spec.label}: ${why}，跳过`);
+  };
+  const markActive = (code) => {
+    endedMap.delete(code);
+    try { opts.onCampaignActive?.(code); } catch {}
+  };
   const updatedISO = () => new Date(ctx.now()).toISOString();
   const stateFrom = () => {
-    const activities = wanted.map((spec) => activityFromRead(spec, lastRead.get(spec.code)));
+    const activities = wanted.map((spec) => activityFromRead(spec, lastRead.get(spec.code), endedMap.get(spec.code)));
     return {
       ok: activities.some((a) => a && a.error === ""),
       activities,
@@ -703,6 +799,10 @@ export async function runCampaignTasks(acct, opts = {}) {
     if (read.restricted) {
       restricted = true;
       break;
+    }
+    if (read.ended) {
+      markEnded(spec, read.reason);
+      continue;
     }
     if (!read.ok) {
       // 读取失败 ≠ 没下发：错误行（HTTP 状态 + 正文片段）已在 fetchCampaignRows
@@ -731,6 +831,7 @@ export async function runCampaignTasks(acct, opts = {}) {
       const target = row.target || taskSpec.times || 1;
       let credit = row.credit || taskSpec.credit || 0;
       if (row.claimedAt) {
+        markActive(spec.code);
         emit(`   ✅ ${label}: 已领奖（${target}/${target}）`);
         continue;
       }
@@ -741,7 +842,12 @@ export async function runCampaignTasks(acct, opts = {}) {
             restricted = true;
             break;
           }
+          if (got.ended) {
+            markEnded(spec, got.reason);
+            break;
+          }
           if (got.ok) {
+            markActive(spec.code);
             earned += credit;
             actions.claimed.push(code);
           } else {
@@ -758,7 +864,14 @@ export async function runCampaignTasks(acct, opts = {}) {
           restricted = true;
           break;
         }
-        if (v.ok && !actions.viewed.includes(code)) actions.viewed.push(code);
+        if (v.ended) {
+          markEnded(spec, v.reason);
+          break;
+        }
+        if (v.ok) {
+          markActive(spec.code);
+          if (!actions.viewed.includes(code)) actions.viewed.push(code);
+        }
       }
       let current = row.progress || 0;
       const kind = taskSpec.kind;
@@ -789,9 +902,14 @@ export async function runCampaignTasks(acct, opts = {}) {
           restricted = true;
           break;
         }
+        if (poll.ended) {
+          markEnded(spec, poll.reason);
+          break;
+        }
         current = poll.value;
       } else {
         // chat / expert / skill：按缺口逐次发射，每次发射后轮询判据
+        let endedReason = "";
         for (let i = 0; i < Math.max(1, target - current); i++) {
           if (current >= target) break;
           const r = await campaignFire(acct, spec, taskSpec, opts, emit);
@@ -806,9 +924,17 @@ export async function runCampaignTasks(acct, opts = {}) {
             restricted = true;
             break;
           }
+          if (poll.ended) {
+            endedReason = poll.reason || "活动未开始或已结束";
+            break;
+          }
           current = poll.value;
         }
         if (restricted) break;
+        if (endedReason) {
+          markEnded(spec, endedReason);
+          break;
+        }
         if (current < target) {
           // 判据落库慢：慢轮询再等一轮（10s × 6），仍没到位就顺延下次运行
           const poll = await campaignPoll(
@@ -820,6 +946,10 @@ export async function runCampaignTasks(acct, opts = {}) {
             restricted = true;
             break;
           }
+          if (poll.ended) {
+            markEnded(spec, poll.reason);
+            break;
+          }
           current = poll.value;
         }
       }
@@ -827,6 +957,10 @@ export async function runCampaignTasks(acct, opts = {}) {
       const fresh = await fetchCampaignRows(acct, spec.code, opts, emit);
       if (fresh.restricted) {
         restricted = true;
+        break;
+      }
+      if (fresh.ended) {
+        markEnded(spec, fresh.reason);
         break;
       }
       lastRead.set(spec.code, fresh);
@@ -843,7 +977,12 @@ export async function runCampaignTasks(acct, opts = {}) {
           restricted = true;
           break;
         }
+        if (got.ended) {
+          markEnded(spec, got.reason);
+          break;
+        }
         if (got.ok) {
+          markActive(spec.code);
           earned += credit;
           actions.claimed.push(code);
         } else {
