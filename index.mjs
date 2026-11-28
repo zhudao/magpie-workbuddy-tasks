@@ -7,8 +7,9 @@
 //   1. tool 钩子：五个工具（契约 §6），全部只走守护进程的 HTTP API，
 //      单次执行 ≤55 s，长活一律 fire-and-poll。
 //   2. 生命周期（契约 §4）：被宿主加载时读 state/control.json 的 desired，
-//      非 off 则 ensureDaemon()（健康则复用，不健康才 spawn detached 守护进程），
-//      并注册退出钩子——若守护进程是本会话拉起的，退场时通知它退出。
+//      非 off 则 ensureDaemon()（健康则复用，不健康才 spawn detached 守护进程）。
+//      守护进程按 state 目录全局单例且自持退出守卫（plugins.json / control.json /
+//      magpie TCP 探测），宿主重启时绝不主动关闭共享守护进程（issue #9）。
 //
 // 本插件**不声明 provider**（没有 auth / config 钩子，契约 §5）：早先版本声明过
 // 一个无模型的 provider「workbuddy-tasks」，只为给 magpie 一个加载理由；但它让
@@ -40,7 +41,7 @@ import {
   writeControl,
 } from "./lifecycle.mjs"
 
-const VERSION = "0.4.2"
+const VERSION = "0.4.4"
 const TOOL_PREFIX = "workbuddy_tasks" // 契约 §6 的工具名前缀（magpie 还会加上插件短名前缀）
 
 // 本文件自己的目录（daemon.mjs 与它同目录）
@@ -59,28 +60,46 @@ const short = (e) => String(e?.message ?? e).slice(0, 180)
 
 // ---- 守护进程 HTTP 客户端（工具共用） --------------------------------------
 
-function makeDaemonClient(getInfo) {
-  async function call(method, path, body, timeoutMs = 10000, extraSignal = null) {
-    const info = await getInfo()
-    if (!info?.port || !info?.key) {
-      const e = new Error("任务守护进程未运行，无法执行（打开/重开本插件会自动拉起）")
-      e.code = "WB_NO_DAEMON"
-      throw e
-    }
+function makeDaemonClient(getInfo, recoverInfo = null) {
+  async function requestWith(info, method, path, body, timeoutMs, extraSignal) {
     const signals = [AbortSignal.timeout(timeoutMs)]
     if (extraSignal) signals.push(extraSignal)
     const signal = typeof AbortSignal.any === "function" ? AbortSignal.any(signals) : signals[0]
-    const res = await fetch(`http://127.0.0.1:${info.port}${path}`, {
+    return fetch(`http://127.0.0.1:${info.port}${path}`, {
       method,
       // Bearer 头兼容保留：免密钥口径下 daemon 不校验任何密钥（routeNeedsKey 恒
       // false），带上它只为与老版本 daemon（仍设密钥门禁）平滑共存。
       headers: {
-        authorization: `Bearer ${info.key}`,
+        ...(info.key ? { authorization: `Bearer ${info.key}` } : {}),
         ...(body !== undefined ? { "content-type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal,
     })
+  }
+
+  async function call(method, path, body, timeoutMs = 10000, extraSignal = null) {
+    let info = await getInfo()
+    if (!info?.port || !info?.key) {
+      const e = new Error("任务守护进程未运行，无法执行（打开/重开本插件会自动拉起）")
+      e.code = "WB_NO_DAEMON"
+      throw e
+    }
+    let res
+    try {
+      res = await requestWith(info, method, path, body, timeoutMs, extraSignal)
+    } catch (err) {
+      if (typeof recoverInfo === "function" && !extraSignal?.aborted) {
+        const fresh = await recoverInfo().catch(() => null)
+        if (fresh?.port && fresh?.key) {
+          res = await requestWith(fresh, method, path, body, timeoutMs, extraSignal)
+        } else {
+          throw err
+        }
+      } else {
+        throw err
+      }
+    }
     let data = null
     try {
       data = await res.json()
@@ -276,41 +295,93 @@ export const WorkBuddyTasksPlugin = async (input, options) => {
   // issue #5：实际端口 ≠ 期望端口（被占用顺延 / 复用了别端口上的旧进程）时补
   // 一行差异说明 —— 入口卡默认按「访问 magpie 的主机 + 端口」推导，顺延后打
   // 不开时把实际端口填进插件选项 port（或用 dashboardUrl 给完整地址）即可对齐。
-  const boot = ensureDaemon({ cfgDir, pluginDir: dir, log, addr: listenAddress, port: portOpt })
-    .then((r) => {
-      if (r?.error) log("守护进程：" + r.error)
-      else if (r?.info) {
-        const bindHost = r.info.host || "127.0.0.1"
-        log(`守护进程就绪：${bindHost}:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
-        const hint = bindHint(bindHost)
-        if (hint) log(`监听 ${bindHost}:${r.info.port}：${hint}`)
-        if (r.info.port !== wantPort) {
-          const why = r.spawned ? "期望端口被占用已顺延" : "复用了已有守护进程"
-          log(
-            `实际端口 ${r.info.port} ≠ 期望端口 ${wantPort}（${why}）：` +
-              `想固定端口就在插件选项 port 里填 ${r.info.port}（或用 dashboardUrl 填完整地址）；` +
-              `想回到 ${wantPort} 就先停掉占用 ${wantPort} 的进程/旧守护进程再重启插件`,
-          )
-        }
-      }
-      return r
+  let ensuring = null
+  let lastInfo = null
+  const ensureOnce = (budgetMs, quiet = false) => {
+    if (ensuring) return ensuring
+    ensuring = ensureDaemon({
+      cfgDir,
+      pluginDir: dir,
+      log: quiet ? () => {} : log,
+      ...(budgetMs ? { budgetMs } : {}),
+      addr: listenAddress,
+      port: portOpt,
+      version: VERSION,
     })
-    .catch((e) => ({ info: null, spawned: false, error: short(e) }))
+      .then((r) => {
+        if (r?.info) lastInfo = r.info
+        else if (r?.off) lastInfo = null
+        if (r?.error) log("守护进程：" + r.error)
+        else if (r?.info && (!quiet || r.spawned)) {
+          const bindHost = r.info.host || "127.0.0.1"
+          log(`守护进程就绪：${bindHost}:${r.info.port}${r.spawned ? "（本次拉起）" : "（复用已有）"}`)
+          const hint = bindHint(bindHost)
+          if (hint) log(`监听 ${bindHost}:${r.info.port}：${hint}`)
+          if (r.info.port !== wantPort) {
+            const why = r.spawned ? "期望端口被占用已顺延" : "复用了已有守护进程"
+            log(
+              `实际端口 ${r.info.port} ≠ 期望端口 ${wantPort}（${why}）：` +
+                `想固定端口就在插件选项 port 里填 ${r.info.port}（或用 dashboardUrl 填完整地址）；` +
+                `想回到 ${wantPort} 就先停掉占用 ${wantPort} 的进程/旧守护进程再重启插件`,
+            )
+          }
+        }
+        return r
+      })
+      .catch((e) => ({ info: null, spawned: false, error: short(e) }))
+      .finally(() => {
+        ensuring = null
+      })
+    return ensuring
+  }
 
-  // 宿主退出：只有本会话拉起的守护进程才由我们送行；其余交给它自己的 magpie 探测
-  registerExitHooks(async () => {
-    const r = await boot.catch(() => null)
-    if (r?.spawned && r?.info) await shutdownDaemon(r.info)
+  const boot = ensureOnce()
+
+  // 宿主重启/更新保护（issue #9）：
+  //   1. 守护进程按 state 目录全局单例，且自带 plugins.json / control.json /
+  //      magpie TCP 探测四重自退守卫 —— 宿主进程退出时（尤其是 Magpie 更新其它
+  //      插件重启宿主、新老宿主交叠瞬间）绝不主动 shutdown 共享守护进程；
+  //   2. 若本次宿主启动走的是「复用已有」（!spawned），3s 后复查一次，防止旧宿主
+  //      被系统进程树清理带走守护进程后长期空窗；同时每 30s 轻量保活巡检（.unref()
+  //      不阻塞短命 CLI 进程退出）。
+  let reuseCheckTimer = null
+  let watchdogTimer = null
+  let hostStopping = false
+  boot.then((r) => {
+    if (hostStopping) return
+    if (r?.info && !r.spawned) {
+      reuseCheckTimer = setTimeout(() => {
+        if (!hostStopping) ensureOnce(4000, true).catch(() => {})
+      }, 3000)
+      reuseCheckTimer.unref?.()
+    }
+    watchdogTimer = setInterval(() => {
+      if (!hostStopping) ensureOnce(4000, true).catch(() => {})
+    }, 30_000)
+    watchdogTimer.unref?.()
   })
 
-  const client = makeDaemonClient(async () => {
-    const r = await boot
-    if (r?.info) return r.info
-    // 第一次没起来，给一次快速重试的机会（port 口径与首次 boot 完全一致）
-    const retry = await ensureDaemon({ cfgDir, pluginDir: dir, log, budgetMs: 3000, addr: listenAddress, port: portOpt }).catch(() => null)
-    if (retry?.info) return retry.info
-    return null
+  registerExitHooks(() => {
+    hostStopping = true
+    if (reuseCheckTimer) clearTimeout(reuseCheckTimer)
+    if (watchdogTimer) clearInterval(watchdogTimer)
   })
+
+  const resolveClientInfo = async () => {
+    await boot
+    if (lastInfo && stateDir) {
+      const disk = readDaemonInfo(stateDir)
+      if (disk && pidAlive(disk.pid)) {
+        lastInfo = disk
+        return disk
+      }
+    } else if (lastInfo && pidAlive(lastInfo.pid)) {
+      return lastInfo
+    }
+    const retry = await ensureOnce(3000)
+    return retry?.info ?? null
+  }
+  const client = makeDaemonClient(resolveClientInfo, () => ensureOnce(3000).then((r) => r?.info ?? null))
 
   // ---- tool 钩子（契约 §6） ----
   // SDK 由宿主提供；importPluginSdk 自带硬超时（见模块顶部说明），拿不到就只少工具，

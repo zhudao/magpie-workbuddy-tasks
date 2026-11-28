@@ -266,7 +266,18 @@ export function interpreter() {
 //   off      —— control.json.desired === 'off'，宿主不该拉起
 //   spawned  —— 本次是否由我们 spawn（exit 钩子据此决定要不要叫它退场）
 //   info     —— 就绪守护进程的 {pid,port,key,...}；没就绪时为 null
-export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs = SPAWN_BUDGET_MS, addr = "", port = "" } = {}) {
+export function isPluginDisabledInConfig(cfgDir) {
+  try {
+    const raw = JSON.parse(readTextSync(join(cfgDir, "plugins.json")) ?? "null")
+    if (!raw || !Array.isArray(raw.plugins)) return false
+    const mine = raw.plugins.filter((x) => String(x?.spec ?? "").includes(PLUGIN_NAME))
+    return mine.some((x) => x?.off === true)
+  } catch {
+    return false
+  }
+}
+
+export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs = SPAWN_BUDGET_MS, addr = "", port = "", version = "" } = {}) {
   if (!cfgDir) {
     return { info: null, spawned: false, error: "无法定位 magpie 配置目录（可设 MAGPIE_CONFIG_DIR 环境变量）" }
   }
@@ -276,6 +287,10 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
   const control = readControl(stateDir)
   if (control.desired === "off") {
     log("control.json desired=off，守护进程保持关闭")
+    return { info: null, spawned: false, off: true }
+  }
+  if (isPluginDisabledInConfig(cfgDir)) {
+    log("plugins.json 本插件已关闭（off:true），守护进程保持关闭")
     return { info: null, spawned: false, off: true }
   }
 
@@ -288,12 +303,20 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
   if (prev && pidAlive(prev.pid)) {
     const hello = await probeDaemon(prev.port, prev.key).catch(() => null)
     if (hello) {
-      if (prev.port !== wantPort) {
-        log(
-          `已有守护进程在 ${prev.port}（期望 ${wantPort}）：本次复用 ${prev.port}，看板地址用 ${prev.port}；重启后会回到 ${wantPort}`,
-        )
+      if (version && hello.version && hello.version !== version) {
+        log(`检测到守护进程版本变更（${hello.version} → ${version}），平滑升级中…`)
+        const targetPid = hello.pid ?? prev.pid
+        await shutdownDaemon({ ...prev, pid: targetPid }).catch(() => false)
+        const waitDown = Date.now() + 3000
+        while (Date.now() < waitDown && pidAlive(targetPid)) await sleep(150)
+      } else {
+        if (prev.port !== wantPort) {
+          log(
+            `已有守护进程在 ${prev.port}（期望 ${wantPort}）：本次复用 ${prev.port}，看板地址用 ${prev.port}；重启后会回到 ${wantPort}`,
+          )
+        }
+        return { info: prev, spawned: false }
       }
-      return { info: prev, spawned: false }
     }
   }
 
@@ -331,14 +354,26 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
   while (Date.now() < deadline) {
     await sleep(400)
     const info = readDaemonInfo(stateDir)
-    if (info) {
+    // 必须等新子进程完成写盘认领（info.pid === child.pid），避免子进程刚 bind
+    // 端口但未写 daemon.json 时，探活命中子进程却返回陈旧 daemon.json 里的旧 pid。
+    if (info && Number(info.pid) === Number(child.pid)) {
       const hello = await probeDaemon(info.port, info.key || key).catch(() => null)
-      if (hello) return { info, spawned: true }
+      if (hello && (hello.pid == null || Number(hello.pid) === Number(child.pid))) {
+        return { info, spawned: true }
+      }
     }
-    if (!pidAlive(child.pid)) break // 起来又倒了：多半是端口/状态目录问题，不无限等
+    if (!pidAlive(child.pid)) break // 起来又倒了：可能是竞态输家或端口/状态目录问题
+  }
+  // 兜底：若子进程在启动竞态中让位给另一新守护进程并已退出，复用那个活着的赢家
+  const finalInfo = readDaemonInfo(stateDir)
+  if (finalInfo && Number(finalInfo.pid) !== Number(child.pid) && pidAlive(finalInfo.pid)) {
+    const hello = await probeDaemon(finalInfo.port, finalInfo.key || key).catch(() => null)
+    if (hello && (hello.pid == null || Number(hello.pid) === Number(finalInfo.pid))) {
+      return { info: finalInfo, spawned: false }
+    }
   }
   return {
-    info: readDaemonInfo(stateDir),
+    info: finalInfo,
     spawned: true,
     error: "守护进程未能在时限内就绪（详情见 magpie 日志里 plugin: 开头的行）",
   }
@@ -349,11 +384,19 @@ export async function ensureDaemon({ cfgDir, pluginDir, log = () => {}, budgetMs
 export async function shutdownDaemon(info, timeoutMs = 2500) {
   // Bearer 头兼容保留：免密钥 daemon 不校验，老版本 daemon 需要；info.key 恒有
   // （daemon.json 的 key 字段向后兼容保留）。
-  if (!info?.port || !info?.key) return false
+  if (!info?.port) return false
+  // 身份校验（issue #9）：带 pid 时先确认端口上仍是同一个进程，绝不误杀后来接管的
+  // 新守护进程；同时把 ?pid=... 传给服务端双重把关。
+  if (info.pid != null) {
+    const hello = await probeDaemon(info.port, info.key, Math.min(1000, timeoutMs)).catch(() => null)
+    if (!hello) return false
+    if (hello.pid != null && Number(hello.pid) !== Number(info.pid)) return false
+  }
   try {
-    const res = await fetch(`http://127.0.0.1:${info.port}/api/shutdown`, {
+    const qs = info.pid != null ? `?pid=${encodeURIComponent(String(info.pid))}` : ""
+    const res = await fetch(`http://127.0.0.1:${info.port}/api/shutdown${qs}`, {
       method: "POST",
-      headers: { authorization: `Bearer ${info.key}` },
+      headers: info.key ? { authorization: `Bearer ${info.key}` } : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     })
     return res.ok

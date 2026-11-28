@@ -1,5 +1,40 @@
 # 更新日志
 
+## 0.4.4 — 2026-11-28
+
+**修复猫猫旅行 `no unclaimed travel` 误冻结账号 + 看板顶栏 GitHub 入口**（社区 issue #10 / PR #11 by `@WW-shan`）。
+
+### 修
+
+- **猫猫旅行领奖遇到 `no unclaimed travel` 不再冻结账号**（issue #10 / PR #11 by `@WW-shan`）：
+  - `engine/upstream.mjs` 将精确文案 `"no unclaimed travel"` 加入良性 403 白名单 `BENIGN_403_MSGS`（保持 `trim().toLowerCase()` 精确全等匹配；若信封带 `code: 11140` 仍按风控处理）。
+  - `engine/travel.mjs` 的 `travel/claim` 分支在确认未触发 `restricted` 后识别该良性 403，返回正常跳过结果（`ok: true, action: "idle"`：「没有可领取的旅行奖励，本轮跳过」），不再触发永久冻结。
+
+### 新增
+
+- **看板顶栏新增 GitHub 项目主页快捷按钮**：
+  - `dashboard/index.html` 与 `dashboard/style.css` 在右上角主题切换按钮左侧新增 GitHub 图标入口，点击在新标签页打开仓库主页。
+
+### 自查
+
+- 全量测试 699 项用例（82 suites）全部通过，含 `release-consistency` 与 `BENIGN_403_MSGS` 精确全等 / `code: 11140` 反例回归。
+
+## 0.4.3 — 2026-11-27
+
+**修复插件宿主重启或其它插件自动更新后守护进程被误关的问题**（社区 issue #9）。
+
+### 修
+
+- **宿主重启不再误杀共享守护进程**（issue #9）：
+  - `index.mjs` 移除退出钩子中对守护进程的 `shutdownDaemon` 调用，避免 Magpie 因其它插件更新重启宿主时，旧宿主退出把新宿主复用的共享守护进程一并关闭。守护进程的正常停机继续由 `daemon.mjs` 自身监听 `plugins.json`（`off: true` / 被移除）、`control.json`（`desired: "off"`）及 Magpie 网关退出完成。
+  - `lifecycle.mjs` 的 `shutdownDaemon` 与 `daemon.mjs` 的 `POST /api/shutdown` 增加 `?pid=` 校验（PID 不匹配返回 HTTP `409`），防止跨代误关同端口新守护进程。
+  - `lifecycle.mjs` 的 `ensureDaemon` 启动轮询要求新写出的 `daemon.json` PID 与刚拉起子进程一致（或确认竞态胜者），新增 `isPluginDisabledInConfig` 遵守 `plugins.json off:true`，并支持传入 `version` 在版本变化时平滑替换升级。
+  - `index.mjs` 新增宿主侧 `ensureOnce` 单飞收敛、复用已有进程后 3 秒复检与 30 秒周期看门狗，并在工具调用失败或配置变更后自动恢复守护进程。
+
+### 自查
+
+- 单元、外壳与端到端回归测试全部通过（697 项用例，含 `host-restart-lifecycle` 与 `release-consistency` 校验），并在 NAS 容器环境完成实机升级与生命周期联调验证。
+
 ## 0.4.2 — 2026-11-27
 
 **修复活动终态（`410 / 12331`）卡轮询 + 快照残留体验优化**（社区 issue #8）。

@@ -79,9 +79,9 @@ import { beijingDateKey, beijingHour, DEFAULT_GAP_MS, MIN_UPSTREAM_GAP_MS } from
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const VERSION = (() => {
   try {
-    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.2")
+    return String(JSON.parse(readFileSync(join(PLUGIN_DIR, "package.json"), "utf8")).version || "0.4.4")
   } catch {
-    return "0.4.2"
+    return "0.4.4"
   }
 })()
 
@@ -3536,6 +3536,11 @@ export async function startDaemon(opts = {}) {
     }
 
     if (p === "/api/shutdown" && req.method === "POST") {
+      const wantPid = u.searchParams.get("pid")
+      if (wantPid !== null && wantPid !== "" && Number(wantPid) !== process.pid) {
+        json(res, 409, { ok: false, error: "pid mismatch", pid: process.pid })
+        return
+      }
       json(res, 200, { ok: true })
       shutdown("收到 /api/shutdown")
       return

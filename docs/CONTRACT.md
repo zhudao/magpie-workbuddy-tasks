@@ -85,7 +85,7 @@ callJSON(acct, kind, url, init, opts) -> {ok, status, code, data, msg, raw}
   // kind: 'chat'|'billing'|'web'；统一 {code,msg,data} 信封；code===0 为成功
   // 3 次线性退避重试；403/11140 → {restricted:true}（由 runner 冻结账号，§10.5）
   // 例外（§10.5 良性 403 白名单）：403 且 msg 归一后**精确全等**命中已知业务拒绝
-  // （"no active buddy" / "连续登录天数不足"）→ 不置 restricted，按普通业务失败
+  // （"no active buddy" / "连续登录天数不足" / "no unclaimed travel"）→ 不置 restricted，按普通业务失败
   // 返回并带 benign403:true（绝不模糊包含；白名单外的 403 行为完全不变）
   // chat 主机失败（TLS reset）→ 回退到 https://www.workbuddy.cn，X-Domain 不变
   // 重试/回退也是「两次上游调用」：任意相邻两次 HTTP 尝试间隔 ≥ gap（铁律 4）
@@ -685,7 +685,7 @@ SSE 事件是看板实时进度的唯一来源；断线时看板回退到 `GET /
 - `index.mjs` 被宿主加载时（= 插件已启用且 magpie 用到了它）：
   1. 读 `state/control.json` 的 `desired`（`'on'|'off'`）；
   2. `desired!=='off'` → `ensureDaemon()`（0.3.8 起，issue #5）：期望端口 = 显式传入的 `port`（插件选项 `options.port` 经 `normalizePort` 归一，非法/未传 = 默认 4390）——**绝不取自 daemon.json**（它的 `port` 是上次实际绑定的观察值/复用探测线索，不是偏好，顺延结果不回灌）。先探测 `daemon.json` 记的守护进程是否健康（`pidAlive` + `probeDaemon`）：健康则复用并返回（实际端口 ≠ 期望端口时打一行日志说清，绝不重启它）；不健康才 spawn `Bun.spawn([bunPath,'daemon.mjs'], {detach:true, stdio:'ignore'})`，env 传 `WB_CONFIG_DIR`、`WB_DAEMON_KEY`、`WB_DAEMON_PORT`（= 期望端口，顺延由 daemon 侧自行处理）；
-  3. 注册 `process.on('exit'|'SIGINT'|'SIGTERM')` → 若我们是 owner 则 `POST /api/shutdown` 通知 daemon 退出。
+  3. 宿主重启保护（issue #9）：守护进程按 state 目录全局单例，宿主退出时不主动关闭共享守护进程（由守护进程四重自退守卫接管；`shutdownDaemon` 校验目标 `pid` 防止误杀）。宿主内设 3s 复用复查与 30s 轻量保活巡检（`.unref()`），检测到守护进程意外消失且非 `off` 状态时自动拉起；本插件自身版本升级时由 `ensureDaemon` 平滑替换旧版本守护进程。
 - `daemon.mjs` 自持生命周期，不依赖宿主存活假设：
   1. 每 10 s 读 magpie `plugins.json`：本插件条目 `off:true` → 优雅退出；
   2. 每 15 s TCP 探测 magpie（`MAGPIE_ADDR`/`127.0.0.1:3425`，失败再试 3430）：连续 4 次失败（magpie 停了）→ 退出；

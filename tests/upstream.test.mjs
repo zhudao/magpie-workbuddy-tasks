@@ -59,6 +59,22 @@ test("HTTP 403（body code 11140）→ restricted，绝不重试", async () => {
   assert.equal(n, 1);
 });
 
+test("travel/claim 的 403 code 403 no unclaimed travel → benign403，绝不 restricted", async () => {
+  let n = 0;
+  const res = await callJSON(makeAcct(), "chat", "https://copilot.tencent.com/x", {}, {
+    fetch: async () => {
+      n += 1;
+      return RESP(403, { code: 403, msg: "no unclaimed travel" });
+    },
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.benign403, true);
+  assert.equal(res.restricted, undefined, "没有可领取奖励是正常业务态，不得冻结账号");
+  assert.equal(res.code, 403);
+  assert.equal(res.msg, "no unclaimed travel");
+  assert.equal(n, 1, "403 绝不重试");
+});
+
 test("信封 code 11140（哪怕 200）→ restricted", async () => {
   const res = await callJSON(makeAcct(), "chat", "https://copilot.tencent.com/x", {}, {
     fetch: async () => RESP(200, { code: 11140, msg: "request illegal", data: null }),
@@ -72,15 +88,22 @@ test("信封 code 11140（哪怕 200）→ restricted", async () => {
 // 它们不是风控：不置 restricted（否则 runner 会把账号冻结，需手动解冻），但红线
 // 不许放松 —— 白名单之外的一切 403（未知 msg/空 msg）行为与旧版完全一致。
 test("良性 403：白名单内容与匹配规则（trim+lower 后精确全等，绝不模糊包含）", () => {
-  assert.deepEqual(BENIGN_403_MSGS, ["no active buddy", "连续登录天数不足"], "白名单条目钉死（出处见注释）");
+  assert.deepEqual(
+    BENIGN_403_MSGS,
+    ["no active buddy", "连续登录天数不足", "no unclaimed travel"],
+    "白名单条目钉死（出处见注释）",
+  );
   assert.equal(isBenign403Msg("no active buddy"), true);
   assert.equal(isBenign403Msg("  No Active Buddy  "), true, "trim+lower 后命中（大小写/空格变体）");
   assert.equal(isBenign403Msg("连续登录天数不足"), true);
+  assert.equal(isBenign403Msg("no unclaimed travel"), true);
+  assert.equal(isBenign403Msg("  No Unclaimed Travel  "), true, "trim+lower 后命中");
   assert.equal(isBenign403Msg(""), false, "空 msg 恒不命中");
   assert.equal(isBenign403Msg("   "), false, "纯空白同空 msg");
   assert.equal(isBenign403Msg(undefined), false);
   assert.equal(isBenign403Msg("no active buddy!!"), false, "尾部变体不命中");
   assert.equal(isBenign403Msg("no active"), false, "截断不命中");
+  assert.equal(isBenign403Msg("no unclaimed travel!!"), false, "尾部变体不命中");
   assert.equal(isBenign403Msg("权限不足"), false, "兄弟实现的子串匹配会误命中真风控文案 —— 绝不模糊包含");
   assert.equal(isBenign403Msg("天数不足"), false, "只认完整原文，不认片段");
   assert.equal(isBenign403Msg("连续登录天数不足，请继续加油"), false, "未实测的更长变体不命中（仍 restricted，行为同旧版）");
@@ -113,6 +136,7 @@ test("良性 403 之外红线不变：未知 msg / 空 msg / 非 JSON 主体 / 4
     { body: { code: 50001, msg: "no active buddy!!" }, why: "白名单变体之外" },
     { body: "no active buddy", why: "非 JSON 主体（没有信封可看）" },
     { body: { code: 11140, msg: "no active buddy" }, why: "code 11140 不参与白名单 —— 判据一条不动" },
+    { body: { code: 11140, msg: "no unclaimed travel" }, why: "code 11140 不参与白名单 —— 旅行文案也不放宽" },
   ];
   for (const c of cases) {
     let n = 0;

@@ -232,6 +232,10 @@ export const BENIGN_403_MSGS = [
   // 的匹配是子串「天数不足/不足」，完整上游原文没有实测记录 —— 全等若没覆盖到
   // 更长的变体，行为与旧版相同（仍 restricted），不会更糟；拿到真机完整 msg 后再补条目。
   "连续登录天数不足",
+  // 旅行领奖没有可领奖励：travel/claim 的正常业务拒绝。上游实际返回
+  // HTTP 403 + `{code:403,msg:"no unclaimed travel"}`（多个独立实现实测并把它
+  // 当作 no-op / already claimed）；这不是账号风控，不能冻结账号。
+  "no unclaimed travel",
 ];
 
 // isBenign403Msg(msg)：msg 归一（trim + lower）后与白名单精确全等；空 msg 恒 false。

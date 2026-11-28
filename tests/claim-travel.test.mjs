@@ -235,6 +235,27 @@ test("猫猫旅行：arrived → 领奖 +20", async () => {
   assert.match(res.msg, /领奖成功/);
 });
 
+test("猫猫旅行：arrived + claim 403 code 403 no unclaimed travel → 成功 no-op，不冻结", async () => {
+  const clock = fakeClock(DAY);
+  const backend = wbBackend({ clock, tasks: [], travel: { state: "arrived" } });
+  const fetchImpl = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/activity/growth/buddy/travel/claim") {
+      return {
+        status: 403,
+        text: async () => JSON.stringify({ code: 403, msg: "no unclaimed travel" }),
+      };
+    }
+    return backend.fetchImpl(url, init);
+  };
+
+  const res = await runCatTravel(makeAcct(), { now: clock.now, sleep: clock.sleep, fetch: fetchImpl });
+  assert.equal(res.ok, true, res.msg);
+  assert.equal(res.action, "idle");
+  assert.equal(res.restricted, undefined, "business no-op 不得透传 restricted");
+  assert.match(res.msg, /没有可领取|今日已完成/);
+});
+
 test("猫猫旅行：idle → 带 location_id 派出", async () => {
   const clock = fakeClock(DAY);
   const backend = wbBackend({ clock, tasks: [], travel: { state: "idle" } });

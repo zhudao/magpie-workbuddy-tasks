@@ -585,9 +585,11 @@ a:hover { text-decoration: underline; }
   color: var(--ink-2);
   font-size: 14px;
   line-height: 1;
+  text-decoration: none;
   box-shadow: 0 1px 1px rgba(15, 23, 42, .03);
 }
 .icon-btn:hover { background: var(--surface-2); border-color: var(--line-strong); color: var(--ink); }
+.icon-btn svg { display: block; }
 .theme-glyph { font-size: 15px; }
 
 .btn:disabled, .ghost-btn:disabled, .icon-btn:disabled, .mini-btn:disabled {

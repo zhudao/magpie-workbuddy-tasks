@@ -15,6 +15,10 @@ import { isNoActiveBuddyMsg, repairActiveBuddy } from "./buddy.mjs";
 import { acceptTasks, buildEvent, claimTask, fetchEnergy, fetchTasks, progressTask, reportEvents } from "./tasks.mjs";
 import { callJSON, ctxOf } from "./upstream.mjs";
 
+function isNoUnclaimedTravelMsg(msg) {
+  return String(msg ?? "").trim().toLowerCase() === "no unclaimed travel";
+}
+
 // ---- 状态查询 ------------------------------------------------------------------
 
 // etaMinutesOf(status, nowMs)：traveling 的预计返回分钟数（B3）。真机
@@ -106,6 +110,9 @@ export async function runCatTravel(acct, opts = {}) {
       opts,
     );
     if (res.restricted) return { ok: false, msg: "领奖失败: 账号已被风控限制", restricted: true };
+    if (res.benign403 && isNoUnclaimedTravelMsg(res.msg)) {
+      return { ok: true, action: "idle", msg: "没有可领取的旅行奖励，本轮跳过" };
+    }
     if (res.ok) {
       const credit = res.data?.reward_credit ?? 0;
       return { ok: true, action: "claim", credit, msg: `旅行归来领奖成功！获得 ${credit} 积分` };
